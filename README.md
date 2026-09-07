@@ -1,4 +1,4 @@
-# GPT2Feishu
+# Feishu2Agents
 
 一个使用飞书官方 Python SDK 和长连接接收事件的企业自建应用 Bot。
 
@@ -65,13 +65,13 @@ FEISHU_APP_SECRET=your_app_secret
 激活虚拟环境后运行：
 
 ```bash
-gpt2feishu
+feishu2agents
 ```
 
 也可以运行模块：
 
 ```bash
-python -m gpt2feishu.main
+python -m feishu2agents.main
 ```
 
 启动时程序会：

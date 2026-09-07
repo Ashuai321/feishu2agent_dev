@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from gpt2feishu.bot_handler import EchoMessageHandler
-from gpt2feishu.dedupe import DedupeCache
-from gpt2feishu.feishu import FeishuBot
+from feishu2agents.bot_handler import EchoMessageHandler
+from feishu2agents.dedupe import DedupeCache
+from feishu2agents.feishu import FeishuBot
 
 
 def event() -> dict:
