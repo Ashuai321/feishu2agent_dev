@@ -6,6 +6,26 @@
 `收到：hello`。代码将飞书事件转换为独立的 `MessageContext`，以后可以将 Echo
 handler 替换成 ChatGPT/Agent Gateway，而不重写飞书接入层。
 
+## 架构
+
+```mermaid
+flowchart TD
+    U[飞书用户] -->|"@Bot hello"| F[飞书群聊]
+    F -->|im.message.receive_v1| WS[官方 SDK 长连接]
+    WS --> A[Feishu Event Adapter]
+    A --> N[Event Normalizer]
+    N --> C[MessageContext]
+    C --> H[MessageHandler]
+    H -->|第一阶段| E[Echo Handler]
+    E --> R[Feishu Reply API]
+    H -.->|第二阶段替换| G[Agent Gateway]
+    G --> AI[ChatGPT / Agent]
+    AI --> R
+    R --> F
+```
+
+`MessageContext` 是飞书接入层和业务处理层之间的稳定边界。第二阶段只替换 handler，长连接、事件解析、去重和回复适配保持不变。
+
 ## 环境要求
 
 - Python 3.11（项目支持 `>=3.11,<3.13`）
