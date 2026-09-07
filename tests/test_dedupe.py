@@ -1,4 +1,4 @@
-from gpt2feishu.dedupe import DedupeCache
+from feishu2agents.dedupe import DedupeCache
 
 
 class Clock:

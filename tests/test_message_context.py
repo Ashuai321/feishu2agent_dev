@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from gpt2feishu.message_context import MessageNormalizationError, normalize_message_event
+from feishu2agents.message_context import MessageNormalizationError, normalize_message_event
 
 
 def make_event(

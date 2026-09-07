@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gpt2feishu"
+name = "feishu2agents"
 version = "1.0.0"
 description = "A Feishu long-connection echo bot with a clean Agent integration boundary"
 readme = "README.md"
@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-gpt2feishu = "gpt2feishu.main:main"
+feishu2agents = "feishu2agents.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,8 +1,8 @@
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from gpt2feishu.bot_handler import EchoMessageHandler, should_process
-from gpt2feishu.message_context import Mention, MessageContext, SenderIdentifiers
+from feishu2agents.bot_handler import EchoMessageHandler, should_process
+from feishu2agents.message_context import Mention, MessageContext, SenderIdentifiers
 
 
 def context() -> MessageContext:
