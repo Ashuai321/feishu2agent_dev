@@ -49,6 +49,8 @@ class MessageContext:
     mentions: tuple[Mention, ...]
     create_time: datetime | None
     bot_app_id: str
+    # 该消息"引用/回复"的目标消息 id（飞书 parent_id）。非回复消息为 None。
+    reply_to_message_id: str | None = None
 
     @property
     def mentions_bot(self) -> bool:
@@ -158,4 +160,7 @@ def normalize_message_event(
         mentions=mentions,
         create_time=_parse_time(_get(message, "create_time")),
         bot_app_id=bot_app_id,
+        reply_to_message_id=(
+            _get(message, "parent_id") or _get(message, "root_id") or None
+        ),
     )

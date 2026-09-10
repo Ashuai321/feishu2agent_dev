@@ -44,6 +44,18 @@ def make_event(
     }
 
 
+def test_parses_quote_reply_parent_id() -> None:
+    event = make_event()
+    event["event"]["message"]["parent_id"] = "om_replied_to"
+    context = normalize(event)
+    assert context.reply_to_message_id == "om_replied_to"
+
+
+def test_no_quote_means_no_reply_target() -> None:
+    context = normalize(make_event())
+    assert context.reply_to_message_id is None
+
+
 def normalize(event: dict):
     return normalize_message_event(event, bot_app_id="cli_test", bot_open_id="ou_bot")
 

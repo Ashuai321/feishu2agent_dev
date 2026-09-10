@@ -16,6 +16,8 @@ class ConfigurationError(RuntimeError):
 class Settings:
     feishu_app_id: str
     feishu_app_secret: str
+    classify_api_key: str = ""
+    answer_api_key: str = ""
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -31,4 +33,6 @@ class Settings:
         return cls(
             feishu_app_id=values["FEISHU_APP_ID"],
             feishu_app_secret=values["FEISHU_APP_SECRET"],
+            classify_api_key=os.getenv("STEP_ONE_KEY", "").strip(),
+            answer_api_key=os.getenv("STEP_TWO_KEY", "").strip(),
         )

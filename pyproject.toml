@@ -7,10 +7,15 @@ name = "feishu2agents"
 version = "1.0.0"
 description = "A Feishu long-connection echo bot with a clean Agent integration boundary"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11"
 dependencies = [
     "lark-oapi>=1.7.3,<2",
     "python-dotenv>=1.0,<2",
+    "requests>=2.31,<3",
+    "uvicorn>=0.30,<1",
+    # 复用目标项目 workspace-agent-relay-mcp 的 server/store/MCP/配置。
+    # 已以其 editable 方式安装；此处声明以记录依赖来源。
+    "workspace-agent-relay-mcp @ file:///Users/shuai/IdeaProjects/prj/workspace-agent-relay-mcp-main",
 ]
 
 [project.optional-dependencies]

@@ -1,3 +1,7 @@
+> 当前运行入口已切换到 ChatGPT Workspace Agent。填写 `.env` 中的
+> `CHATGPT_AGENT_TOKEN` 后重启；群聊 @ 文本会提交给 Agent，群里返回 ChatGPT 会话链接。
+> 详细说明见 [WORKSPACE_AGENT.md](WORKSPACE_AGENT.md)。以下 Echo 说明保留作原始接入参考。
+
 # Feishu2Agents
 
 一个使用飞书官方 Python SDK 和长连接接收事件的企业自建应用 Bot。
