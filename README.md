@@ -4,7 +4,7 @@
 
 # Feishu2Agents
 
-一个使用飞书官方 Python SDK 和长连接接收事件的企业自建应用 Bot。
+一个使用飞书官方 Python SDK 的企业自建应用 Bot，支持长连接和开发者服务器（Webhook）模式。
 
 第一阶段实现最小 Echo Bot：在群里发送 `@Bot hello`，机器人回复原消息
 `收到：hello`。代码将飞书事件转换为独立的 `MessageContext`，以后可以将 Echo
@@ -36,14 +36,15 @@ flowchart TD
 - 一个已启用机器人能力的飞书企业自建应用
 - 可以访问飞书开放平台的本地网络
 
-长连接模式不需要公网服务器或 webhook URL，但程序必须保持运行。
+长连接模式不需要公网服务器或 webhook URL，但程序必须保持运行。Webhook 模式由本项目的
+ASGI 服务接收事件；Cloudflare Worker 目录提供稳定的公网边缘入口，并将请求转发到该服务。
 
 ## 飞书开放平台配置
 
 在运行程序前确认：
 
 1. 在应用的“添加应用能力”中启用机器人。
-2. 在“事件与回调”中选择“使用长连接接收事件”。
+2. 在“事件与回调”中选择“将事件发送至开发者服务器”，或在本地调试时选择“使用长连接接收事件”。
 3. 添加事件 `im.message.receive_v1`。
 4. 开通该事件页面要求的群聊 @机器人消息读取权限。
 5. 开通回复消息 API 要求的权限。常见 scope 为
@@ -102,12 +103,40 @@ python -m feishu2agents.main
 
 1. 校验 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。
 2. 通过飞书 API 获取当前机器人的 `open_id`，用于准确识别多人 mention 中的 Bot。
-3. 建立长连接并订阅 `im.message.receive_v1`。
+3. 在长连接模式建立连接并订阅 `im.message.receive_v1`；在 Webhook 模式挂载
+   `POST /feishu/events`（并保留 `/feishu/event` 兼容别名）。
 4. 处理群聊中明确 @当前 Bot 的文本消息。
 5. 使用消息回复 API 回复原消息。
 
 日志只输出 message、chat、sender 等诊断标识和错误码，不输出 Secret、token、完整消息正文
 或原始事件。
+
+## Cloudflare Worker 部署
+
+仓库根目录中的 `worker/src/index.ts` 是真正的 Cloudflare Worker 入口，
+`wrangler.jsonc` 已将它配置为部署入口。Worker 负责固定公网地址和边缘转发，
+Python 服务继续负责飞书 Webhook、Relay/MCP、OAuth、存储和建群业务；这样不会改变现有飞书业务逻辑。
+
+先让 Python 服务以 Webhook 模式运行，并确保它有一个公网可访问的 origin（不能是
+`127.0.0.1` 或 `localhost`）。然后在仓库根目录执行：
+
+```bash
+npm install
+npx wrangler login
+npx wrangler secret put PYTHON_ORIGIN
+npx wrangler deploy
+```
+
+在输入 `PYTHON_ORIGIN` 时只填写 Python 服务的 origin，例如
+`https://your-python-origin.example.com`，不要带末尾 `/`。Worker 会把
+`POST /feishu/events` 映射到 Python 的 `/feishu/event`，其他 `/mcp`、`/oauth/*`、
+`/.well-known/*` 和 `/api/*` 路径原样转发。
+
+部署完成后，用 Worker 的 `https://<worker-name>.<account>.workers.dev` 地址配置飞书
+“开发者服务器”事件 URL，并保留 `/feishu/events` 路径。先访问 `/health` 确认 Worker
+本身返回 `ok: true`，再让飞书发送 URL 验证请求；验证通过后才能接收
+`im.message.receive_v1`。如果使用 Cloudflare Dashboard 的 GitHub 部署，生产分支选择
+`main`，部署命令填写 `npx wrangler deploy`，不要再使用静态站点默认流程。
 
 ## 测试
 

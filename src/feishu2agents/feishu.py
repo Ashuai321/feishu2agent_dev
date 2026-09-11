@@ -8,9 +8,6 @@ import logging
 from typing import Any
 
 import lark_oapi as lark
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
 from lark_oapi.api.im.v1 import (
     CreateChatRequest,
     CreateChatRequestBody,
@@ -22,6 +19,9 @@ from lark_oapi.api.im.v1 import (
     UpdateMessageRequestBody,
 )
 from requests_toolbelt import MultipartEncoder
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 
 from .bot_handler import MessageHandler
 from .config import Settings
@@ -81,12 +81,15 @@ class FeishuBot:
             self._bot_open_id = self._fetch_bot_open_id()
         return self._bot_open_id
 
-    def webhook_route(self) -> Route:
-        """Return a Starlette route implementing Feishu's developer-server (push) mode.
+    def webhook_routes(self) -> list[Route]:
+        """Return Starlette routes implementing Feishu developer-server mode.
 
         Handles the URL verification ``challenge`` sent during event-subscription setup
         and forwards ``im.message.receive_v1`` events to the same pipeline as the long
         connection (normalize -> dedupe -> handler.handle -> reply / placeholder).
+
+        ``/feishu/events`` is the public route used by the Cloudflare Worker. The
+        singular ``/feishu/event`` alias remains available for existing deployments.
         """
 
         async def handler(request: Request) -> JSONResponse:
@@ -130,7 +133,14 @@ class FeishuBot:
 
             return JSONResponse({"code": 0})
 
-        return Route("/feishu/event", endpoint=handler, methods=["POST"])
+        return [
+            Route("/feishu/events", endpoint=handler, methods=["POST"]),
+            Route("/feishu/event", endpoint=handler, methods=["POST"]),
+        ]
+
+    def webhook_route(self) -> Route:
+        """Backward-compatible accessor for the singular webhook route."""
+        return self.webhook_routes()[1]
 
     @staticmethod
     async def _read_json(request: Request) -> dict[str, Any] | None:

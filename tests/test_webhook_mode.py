@@ -88,6 +88,15 @@ def test_challenge_echo() -> None:
         assert resp.json() == {"challenge": "xyz-challenge"}
 
 
+def test_plural_webhook_route_is_available() -> None:
+    bot = _make_bot(_StubHandler())
+    app = Starlette(routes=bot.webhook_routes())
+    with TestClient(app) as client:
+        resp = client.post("/feishu/events", json={"challenge": "plural-challenge"})
+        assert resp.status_code == 200
+        assert resp.json() == {"challenge": "plural-challenge"}
+
+
 def test_message_event_ack() -> None:
     """An im.message.receive_v1 push must be acked with code:0."""
     bot = _make_bot(_StubHandler())

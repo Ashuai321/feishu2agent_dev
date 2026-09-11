@@ -101,10 +101,7 @@ def main() -> int:
 
         # In webhook mode, receive Feishu events over HTTP instead of the long
         # connection: mount the event callback on the same relay HTTP app.
-        if settings.feishu_event_mode == "webhook":
-            extra_routes = [bot.webhook_route()]
-        else:
-            extra_routes = None
+        extra_routes = bot.webhook_routes() if settings.feishu_event_mode == "webhook" else None
         app = build_http_app(extra_routes=extra_routes)
 
         def serve_http() -> None:
