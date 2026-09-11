@@ -51,6 +51,8 @@ class MessageContext:
     bot_app_id: str
     # 该消息"引用/回复"的目标消息 id（飞书 parent_id）。非回复消息为 None。
     reply_to_message_id: str | None = None
+    # image 消息 content 里的 image_key 列表。非 image 消息为空元组。
+    image_keys: tuple[str, ...] = ()
 
     @property
     def mentions_bot(self) -> bool:
@@ -118,6 +120,7 @@ def normalize_message_event(
 
     message_type = _get(message, "message_type", "unknown") or "unknown"
     text = ""
+    image_keys: tuple[str, ...] = ()
     if message_type == "text":
         content = _get(message, "content", "")
         try:
@@ -129,6 +132,18 @@ def normalize_message_event(
                 "Text message content does not contain a string text field"
             )
         text = decoded.get("text", "")
+    elif message_type == "image":
+        content = _get(message, "content", "")
+        keys: list[str] = []
+        try:
+            decoded = json.loads(content) if isinstance(content, str) else content
+        except (TypeError, json.JSONDecodeError):
+            decoded = {}
+        if isinstance(decoded, dict):
+            image_key = decoded.get("image_key")
+            if isinstance(image_key, str) and image_key:
+                keys.append(image_key)
+        image_keys = tuple(keys)
 
     normalized_mentions: list[Mention] = []
     for raw_mention in _get(message, "mentions", []) or []:
@@ -163,4 +178,5 @@ def normalize_message_event(
         reply_to_message_id=(
             _get(message, "parent_id") or _get(message, "root_id") or None
         ),
+        image_keys=image_keys,
     )

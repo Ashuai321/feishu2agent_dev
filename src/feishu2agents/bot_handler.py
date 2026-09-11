@@ -20,10 +20,13 @@ class EchoMessageHandler:
 
 def should_process(context: MessageContext) -> bool:
     sender_type = (context.sender_type or "").lower()
-    return (
-        context.chat_type == "group"
-        and context.message_type == "text"
-        and context.mentions_bot
-        and bool(context.text)
-        and sender_type not in {"app", "bot"}
-    )
+    if context.chat_type != "group" or not context.mentions_bot:
+        return False
+    if sender_type in {"app", "bot"}:
+        return False
+    if context.message_type == "text":
+        return bool(context.text)
+    if context.message_type == "image":
+        # 图片必须作为“引用回复”才有语境；无引用直接 @ 发的图片无法归属对话。
+        return bool(context.reply_to_message_id) and bool(context.image_keys)
+    return False

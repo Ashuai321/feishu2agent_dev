@@ -19,6 +19,7 @@ from .config import ConfigurationError, Settings
 from .feishu import FeishuBot
 from .feishu_bridge import FeishuBridge
 from .feishu_mcp import register_feishu_tools
+from .group_draft_store import GroupDraftStore
 from .relay_worker import RelayWorker
 from .requester_registry import RequesterRegistry
 from .trigger_dispatch import FeishuTriggerDispatcher
@@ -67,16 +68,19 @@ def main() -> int:
 
         relay_config.ensure_runtime_directories()
         bridge = FeishuBridge(relay_config.state_dir / "feishu-bridge.sqlite")
+        group_draft_store = GroupDraftStore(relay_config.state_dir / "group-draft.sqlite")
         requester_registry = RequesterRegistry()
         agent_settings = WorkspaceAgentSettings(
             store=relay_store,
             bridge=bridge,
             dispatcher=dispatcher,
             relay_config=relay_config,
+            group_draft_store=group_draft_store,
         )
         handler = WorkspaceAgentMessageHandler(agent_settings)
         bot = FeishuBot(settings, handler)
         handler.post_placeholder = bot._reply
+        handler.download_image = bot.download_message_image
         handler.on_dispatch = lambda ctx, ck: requester_registry.register(
             ck,
             open_id=ctx.sender_ids.open_id or ctx.sender_id,
@@ -93,8 +97,15 @@ def main() -> int:
         )
 
         # Add the Feishu group-creation tools to the shared relay MCP server
-        register_feishu_tools(relay_mcp, bot, requester_registry)
-        app = build_http_app()
+        register_feishu_tools(relay_mcp, bot, requester_registry, group_draft_store)
+
+        # In webhook mode, receive Feishu events over HTTP instead of the long
+        # connection: mount the event callback on the same relay HTTP app.
+        if settings.feishu_event_mode == "webhook":
+            extra_routes = [bot.webhook_route()]
+        else:
+            extra_routes = None
+        app = build_http_app(extra_routes=extra_routes)
 
         def serve_http() -> None:
             uvicorn.run(app, host=relay_config.host, port=relay_config.port, log_config=None)
@@ -104,8 +115,9 @@ def main() -> int:
         logger.info("Relay server listening on %s:%s", relay_config.host, relay_config.port)
 
         worker.start()
-        bot_thread = threading.Thread(target=bot.start, name="feishu-bot", daemon=True)
-        bot_thread.start()
+        if settings.feishu_event_mode != "webhook":
+            bot_thread = threading.Thread(target=bot.start, name="feishu-bot", daemon=True)
+            bot_thread.start()
 
         # Keep the main process alive; signal (Ctrl+C) exits the try/finally.
         threading.Event().wait()

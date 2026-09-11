@@ -16,6 +16,8 @@ class ConfigurationError(RuntimeError):
 class Settings:
     feishu_app_id: str
     feishu_app_secret: str
+    feishu_event_mode: str = "long_connection"
+    feishu_verify_token: str = ""
     classify_api_key: str = ""
     answer_api_key: str = ""
 
@@ -30,9 +32,17 @@ class Settings:
             raise ConfigurationError(
                 "Missing required environment variable(s): " + ", ".join(missing)
             )
+        event_mode = os.getenv("FEISHU_EVENT_MODE", "long_connection").strip().lower()
+        if event_mode not in {"long_connection", "webhook"}:
+            raise ConfigurationError(
+                "Invalid FEISHU_EVENT_MODE: expected 'long_connection' or 'webhook', got "
+                + event_mode
+            )
         return cls(
             feishu_app_id=values["FEISHU_APP_ID"],
             feishu_app_secret=values["FEISHU_APP_SECRET"],
+            feishu_event_mode=event_mode,
+            feishu_verify_token=os.getenv("FEISHU_VERIFY_TOKEN", "").strip(),
             classify_api_key=os.getenv("STEP_ONE_KEY", "").strip(),
             answer_api_key=os.getenv("STEP_TWO_KEY", "").strip(),
         )

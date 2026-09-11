@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
 
 import lark_oapi as lark
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 from lark_oapi.api.im.v1 import (
     CreateChatRequest,
     CreateChatRequestBody,
@@ -17,6 +21,7 @@ from lark_oapi.api.im.v1 import (
     UpdateMessageRequest,
     UpdateMessageRequestBody,
 )
+from requests_toolbelt import MultipartEncoder
 
 from .bot_handler import MessageHandler
 from .config import Settings
@@ -69,6 +74,73 @@ class FeishuBot:
         )
         logger.info("Starting Feishu long connection bot_app_id=%s", self._settings.feishu_app_id)
         ws_client.start()
+
+    def ensure_identity(self) -> str:
+        """Resolve and cache the bot open id (needed by webhook normalization)."""
+        if not self._bot_open_id:
+            self._bot_open_id = self._fetch_bot_open_id()
+        return self._bot_open_id
+
+    def webhook_route(self) -> Route:
+        """Return a Starlette route implementing Feishu's developer-server (push) mode.
+
+        Handles the URL verification ``challenge`` sent during event-subscription setup
+        and forwards ``im.message.receive_v1`` events to the same pipeline as the long
+        connection (normalize -> dedupe -> handler.handle -> reply / placeholder).
+        """
+
+        async def handler(request: Request) -> JSONResponse:
+            try:
+                body = await self._read_json(request)
+            except Exception:
+                logger.exception("Feishu webhook: failed to read request body")
+                return JSONResponse({"code": 0})
+
+            if body is None:
+                return JSONResponse({"code": 0})
+
+            verify_token = self._settings.feishu_verify_token
+            if verify_token:
+                header = body.get("header") if isinstance(body, dict) else None
+                token = header.get("token") if isinstance(header, dict) else None
+                if token != verify_token:
+                    logger.warning("Feishu webhook: verify token mismatch")
+                    return JSONResponse({"code": 1}, status_code=403)
+
+            if isinstance(body, dict) and body.get("challenge"):
+                # URL verification: echo the challenge back verbatim.
+                return JSONResponse({"challenge": body["challenge"]})
+
+            event_type = ""
+            if isinstance(body, dict):
+                header = body.get("header") if isinstance(body, dict) else None
+                if isinstance(header, dict):
+                    event_type = header.get("event_type") or ""
+
+            if event_type == "im.message.receive_v1":
+                try:
+                    self.ensure_identity()
+                    # _on_message already accepts a dict event (header/event), so pass
+                    # the whole pushed body through and reuse the full existing pipeline.
+                    await asyncio.to_thread(self._on_message, body)
+                except Exception:
+                    # Swallow and still ack so Feishu does not retry forever; the same
+                    # message is also protected server-side by dedupe on message_id.
+                    logger.exception("Feishu webhook: failed to process message event")
+
+            return JSONResponse({"code": 0})
+
+        return Route("/feishu/event", endpoint=handler, methods=["POST"])
+
+    @staticmethod
+    async def _read_json(request: Request) -> dict[str, Any] | None:
+        raw = await request.body()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
 
     def _fetch_bot_open_id(self) -> str:
         request = (
@@ -225,6 +297,148 @@ class FeishuBot:
             user_open_id,
         )
         return chat_id
+
+    def download_message_image(self, message_id: str, file_key: str) -> bytes:
+        """Download a message's image resource bytes via a tenant token."""
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.GET)
+            .uri("/open-apis/im/v1/messages/{message_id}/resources/{file_key}")
+            .paths({"message_id": message_id, "file_key": file_key})
+            .queries([("type", "image")])
+            .token_types({lark.AccessTokenType.TENANT})
+            .build()
+        )
+        response = self._api_client.request(request)
+        if not response.success():
+            raise FeishuApiError(self._api_failure("download message image", response))
+        return response.raw.content
+
+    def upload_avatar_image(self, data: bytes) -> str:
+        """Upload an avatar image and return its image_key. ≤10MB enforced."""
+        if len(data) > 10 * 1024 * 1024:
+            raise FeishuApiError("upload avatar image failed: image exceeds the 10MB limit")
+        fields = {
+            "image_type": "avatar",
+            "image": ("avatar.jpg", data, "image/jpeg"),
+        }
+        encoder = MultipartEncoder(fields=fields)
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.POST)
+            .uri("/open-apis/im/v1/images")
+            .headers({"Content-Type": encoder.content_type})
+            .token_types({lark.AccessTokenType.TENANT})
+            .body(encoder)
+            .build()
+        )
+        response = self._api_client.request(request)
+        if not response.success():
+            raise FeishuApiError(self._api_failure("upload avatar image", response))
+        try:
+            payload = json.loads(response.raw.content)
+            image_key = payload["data"]["image_key"]
+        except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise FeishuApiError("upload avatar image returned an invalid response") from exc
+        if not isinstance(image_key, str) or not image_key:
+            raise FeishuApiError("upload avatar image returned no image_key")
+        return image_key
+
+    def create_chat(
+        self,
+        name: str,
+        user_id_list: list[str],
+        avatar_image_key: str | None = None,
+    ) -> str:
+        """Create a general Feishu group and return its chat_id."""
+        body_builder = (
+            CreateChatRequestBody.builder()
+            .name(name)
+            .chat_mode("group")
+            .user_id_list(list(user_id_list))
+        )
+        if avatar_image_key:
+            body_builder.avatar(avatar_image_key)
+        request = (
+            CreateChatRequest.builder()
+            .user_id_type("open_id")
+            .request_body(body_builder.build())
+            .build()
+        )
+        response = self._api_client.im.v1.chat.create(request)
+        if not response.success():
+            raise FeishuApiError(self._api_failure("create chat", response))
+        chat_id = getattr(getattr(response, "data", None), "chat_id", None)
+        if not chat_id:
+            raise FeishuApiError("create chat returned no chat_id")
+        logger.info("Created Feishu group chat_id=%s", chat_id)
+        return chat_id
+
+    def update_chat(
+        self,
+        chat_id: str,
+        *,
+        name: str | None = None,
+        avatar_image_key: str | None = None,
+    ) -> None:
+        """Update a group's name and/or avatar in place."""
+        body: dict[str, str] = {}
+        if name:
+            body["name"] = name
+        if avatar_image_key:
+            body["avatar"] = avatar_image_key
+        if not body:
+            return
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.PUT)
+            .uri("/open-apis/im/v1/chats/{chat_id}")
+            .paths({"chat_id": chat_id})
+            .token_types({lark.AccessTokenType.TENANT})
+            .body(body)
+            .build()
+        )
+        response = self._api_client.request(request)
+        if not response.success():
+            raise FeishuApiError(self._api_failure("update chat", response))
+
+    def search_contacts(self, query: str) -> list[dict[str, Any]]:
+        """Search visible Feishu contacts and return candidate reference cards.
+
+        Each candidate carries ``name``, ``open_id`` and any email fields the
+        API returns, so the agent can show them and the user can confirm the
+        right person before being invited.
+        """
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.POST)
+            .uri("/open-apis/contact/v3/users/search")
+            .token_types({lark.AccessTokenType.TENANT})
+            .body({"query": query})
+            .build()
+        )
+        response = self._api_client.request(request)
+        if not response.success():
+            raise FeishuApiError(self._api_failure("search contacts", response))
+        try:
+            payload = json.loads(response.raw.content)
+            users = (payload.get("data") or {}).get("users") or []
+        except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+            raise FeishuApiError("search contacts returned an invalid response") from exc
+        candidates: list[dict[str, Any]] = []
+        for user in users or []:
+            open_id = user.get("open_id") or ""
+            if not open_id:
+                continue
+            entry: dict[str, Any] = {
+                "name": user.get("name") or "",
+                "open_id": open_id,
+            }
+            for field in ("email", "enterprise_email", "mobile", "department_ids", "title"):
+                if user.get(field) is not None:
+                    entry[field] = user.get(field)
+            candidates.append(entry)
+        return candidates
 
     def _external_requester_reason(
         self, source_chat_id: str, user_open_id: str

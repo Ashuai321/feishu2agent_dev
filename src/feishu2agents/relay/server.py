@@ -372,7 +372,7 @@ def read_local_conversation(
         return {"success": False, "error": {"code": "invalid_request", "message": str(exc)}}
 
 
-def build_http_app():
+def build_http_app(extra_routes: list[Any] | tuple[Any, ...] | None = None):
     streamable_app = mcp.http_app(path="/mcp", transport="streamable-http")
     legacy_sse_app = mcp.http_app(path="/mcp", transport="sse")
     return build_app(
@@ -386,6 +386,7 @@ def build_http_app():
         get_oauth_config=_current_oauth_config,
         get_debug_enabled=_current_debug_mcp_logging,
         instructions=MCP_INSTRUCTIONS,
+        extra_routes=extra_routes or (),
     )
 
 

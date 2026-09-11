@@ -34,6 +34,7 @@ def build_app(
     get_oauth_config: Callable[[], Any],
     get_debug_enabled: Callable[[], bool],
     instructions: str,
+    extra_routes: list[Any] | tuple[Any, ...] = (),
 ) -> Starlette:
     mcp_app = build_http_compat_app(
         streamable_app=streamable_app,
@@ -70,6 +71,9 @@ def build_app(
         routes.append(Route(path, endpoint=handler, methods=methods))
     for path, handler, methods in internal_routes(store):
         routes.append(Route(path, endpoint=handler, methods=methods))
+
+    for route in extra_routes:
+        routes.append(route)
 
     routes.append(Mount("/", app=mcp_app))
 

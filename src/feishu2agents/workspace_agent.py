@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 from uuid import uuid4
 
 from feishu2agents.relay.api.validation import (
@@ -59,6 +60,7 @@ class WorkspaceAgentSettings:
     dispatcher: FeishuTriggerDispatcher
     relay_config: object
     trigger_client: TriggerClient = TriggerClient()
+    group_draft_store: Any | None = None
 
 
 class WorkspaceAgentMessageHandler:
@@ -72,12 +74,40 @@ class WorkspaceAgentMessageHandler:
         self._settings = settings
         self._store = store or settings.store
         self._bridge = bridge or settings.bridge
+        self._group_draft_store = settings.group_draft_store
         # Optional callable(user_message_id, text) -> outbound_message_id, used to
         # post the "processing" placeholder that the final answer overrides in place.
         self.post_placeholder: Callable[[str, str], str] | None = None
+        # Optional callable(message_id, image_key) -> bytes: used to persist an
+        # image quote-reply as the conversation's pending group avatar.
+        self.download_image: Callable[[str, str], bytes] | None = None
         # Optional callable(context, conversation_key): fired once a message is
         # claimed for dispatch, so the caller can record who @'d the bot.
         self.on_dispatch: Callable[[MessageContext, str], None] | None = None
+
+    def _store_avatar_images(self, context: MessageContext, conversation_key: str) -> bool:
+        """Download any image in the message and keep the latest bytes per conversation."""
+        if self._group_draft_store is None or self.download_image is None:
+            return False
+        stored = False
+        for image_key in context.image_keys:
+            try:
+                data = self.download_image(context.message_id, image_key)
+            except Exception:
+                logger.exception(
+                    "Failed to download image image_key=%s message_id=%s",
+                    image_key,
+                    context.message_id,
+                )
+                continue
+            try:
+                self._group_draft_store.save_avatar(conversation_key, data)
+                stored = True
+            except Exception:
+                logger.exception(
+                    "Failed to persist avatar conversation_key=%s", conversation_key
+                )
+        return stored
 
     def _post_processing_placeholder(self, context: MessageContext, request_id: str) -> None:
         if self.post_placeholder is None:
@@ -140,6 +170,19 @@ class WorkspaceAgentMessageHandler:
             except Exception:
                 logger.exception("requester registration failed message_id=%s", context.message_id)
 
+        # Persist any image quote-reply as the conversation's pending avatar and
+        # tell the agent an image is available via a marker line.
+        user_text = context.text
+        if context.message_type == "image":
+            try:
+                has_avatar = self._store_avatar_images(context, conversation_key)
+            except Exception:
+                logger.exception("avatar storage failed message_id=%s", context.message_id)
+                has_avatar = False
+            if has_avatar:
+                marker = "[用户发送了一张图片，已保存为群头像候选]"
+                user_text = (user_text + "\n" + marker).strip() if user_text else marker
+
         try:
             conversation = self._store.get_conversation_by_key(conversation_key)
         except KeyError:
@@ -148,7 +191,7 @@ class WorkspaceAgentMessageHandler:
             conversation = self._store.create_conversation(
                 agent_id=agent_id,
                 workspace_id=workspace_id,
-                name=_conversation_title(context.text),
+                name=_conversation_title(user_text),
                 conversation_key=conversation_key,
             )
         agent = self._find_agent(conversation)
@@ -169,14 +212,14 @@ class WorkspaceAgentMessageHandler:
             agent_id=int(agent["id"]),
             conversation_id=int(conversation["id"]),
             conversation_key=conversation_key,
-            input_markdown=context.text,
+            input_markdown=user_text,
             idempotency_key=idempotency_key,
             request_id=request_id,
         )
         trigger_input = build_trigger_input(
             request_id=request_id,
             conversation_key=conversation_key,
-            user_input=context.text,
+            user_input=user_text,
             is_continuation=is_continuation,
             working_directory=run.get("working_directory_snapshot"),
             local_context=run.get("local_context"),
