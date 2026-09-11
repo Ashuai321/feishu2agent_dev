@@ -1,7 +1,7 @@
 """Submit mentioned group text to a published ChatGPT Workspace Agent.
 
 Every processed Feishu message is routed straight to the Workspace Agent using
-the reference relay protocol (``workspace-agent-relay-mcp``): a trigger injects
+the built-in relay protocol (``feishu2agents.relay``): a trigger injects
 a ``request_id`` + ``conversation_key`` header, the agent finishes by calling
 the relay's MCP ``record_result`` tool, a run is created in the reference
 relay store, and :class:`~feishu2agents.relay_worker.RelayWorker` posts the
@@ -19,12 +19,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import uuid4
 
-from workspace_agent_relay_mcp.api.validation import (
+from feishu2agents.relay.api.validation import (
     resolve_agent_token,
     validate_trigger_url,
 )
-from workspace_agent_relay_mcp.store.relay_store import RelayStore
-from workspace_agent_relay_mcp.trigger import (
+from feishu2agents.relay.store.relay_store import RelayStore
+from feishu2agents.relay.trigger import (
     TriggerClient,
     build_trigger_input,
     generate_request_id,
@@ -49,7 +49,7 @@ class WorkspaceAgentSettings:
     """Relay-side settings required to trigger the Workspace Agent.
 
     The actual trigger URL and access token are resolved per-agent from the
-    reference relay store/config (``resolve_agent_token``), matching the
+    built-in relay store/config (``resolve_agent_token``), matching the
     dashboard's ``/api/conversations/.../runs`` flow. This structure keeps
     construction explicit without re-validating CHATGPT_AGENT_TOKEN.
     """
@@ -75,6 +75,9 @@ class WorkspaceAgentMessageHandler:
         # Optional callable(user_message_id, text) -> outbound_message_id, used to
         # post the "processing" placeholder that the final answer overrides in place.
         self.post_placeholder: Callable[[str, str], str] | None = None
+        # Optional callable(context, conversation_key): fired once a message is
+        # claimed for dispatch, so the caller can record who @'d the bot.
+        self.on_dispatch: Callable[[MessageContext, str], None] | None = None
 
     def _post_processing_placeholder(self, context: MessageContext, request_id: str) -> None:
         if self.post_placeholder is None:
@@ -131,6 +134,11 @@ class WorkspaceAgentMessageHandler:
             )
             return None
         idempotency_key = f"{context.bot_app_id}:{context.message_id}"
+        if self.on_dispatch is not None:
+            try:
+                self.on_dispatch(context, conversation_key)
+            except Exception:
+                logger.exception("requester registration failed message_id=%s", context.message_id)
 
         try:
             conversation = self._store.get_conversation_by_key(conversation_key)

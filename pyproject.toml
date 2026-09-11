@@ -12,16 +12,17 @@ dependencies = [
     "lark-oapi>=1.7.3,<2",
     "python-dotenv>=1.0,<2",
     "requests>=2.31,<3",
+    "certifi>=2025.1.31",
+    "fastmcp>=3.2.4,<4",
     "uvicorn>=0.30,<1",
-    # 复用目标项目 workspace-agent-relay-mcp 的 server/store/MCP/配置。
-    # 已以其 editable 方式安装；此处声明以记录依赖来源。
-    "workspace-agent-relay-mcp @ file:///Users/shuai/IdeaProjects/prj/workspace-agent-relay-mcp-main",
+    # Relay、OAuth、MCP server、存储和 API 已内置于 feishu2agents.relay。
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<9",
     "ruff>=0.9,<1",
+    "httpx>=0.27,<1",
 ]
 
 [project.scripts]
@@ -40,3 +41,6 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.setuptools.package-data]
+feishu2agents = ["frontend/dist/**"]

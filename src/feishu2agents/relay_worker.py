@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from workspace_agent_relay_mcp.store.relay_store import TERMINAL_STATUSES, RelayStore
+from feishu2agents.relay.store.relay_store import TERMINAL_STATUSES, RelayStore
 
 from .feishu_bridge import FeishuBridge
 

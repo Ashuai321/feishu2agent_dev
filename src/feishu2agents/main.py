@@ -1,7 +1,7 @@
 """Application entry point.
 
-Boots the Feishu long-connection bot and the reference relay server
-(``workspace-agent-relay-mcp``) in the same process. The relay server owns the
+Boots the Feishu long-connection bot and the built-in relay server
+(``feishu2agents.relay``) in the same process. The relay server owns the
 MCP ``/mcp`` endpoint (agent callback channel) plus the dashboard/HTTP API and
 its ``RelayStore``; this process adds the Feishu listener and a worker that
 posts completed agent runs back into Feishu threads.
@@ -18,7 +18,9 @@ import uvicorn
 from .config import ConfigurationError, Settings
 from .feishu import FeishuBot
 from .feishu_bridge import FeishuBridge
+from .feishu_mcp import register_feishu_tools
 from .relay_worker import RelayWorker
+from .requester_registry import RequesterRegistry
 from .trigger_dispatch import FeishuTriggerDispatcher
 from .workspace_agent import WorkspaceAgentMessageHandler, WorkspaceAgentSettings
 
@@ -57,13 +59,15 @@ def main() -> int:
     try:
         settings = Settings.from_environment()
 
-        # The reference relay server owns config, store, MCP and the dashboard.
-        from workspace_agent_relay_mcp.server import build_http_app
-        from workspace_agent_relay_mcp.server import config as relay_config
-        from workspace_agent_relay_mcp.server import store as relay_store
+        # The built-in relay owns config, store, MCP and the dashboard.
+        from feishu2agents.relay.server import build_http_app
+        from feishu2agents.relay.server import config as relay_config
+        from feishu2agents.relay.server import mcp as relay_mcp
+        from feishu2agents.relay.server import store as relay_store
 
         relay_config.ensure_runtime_directories()
         bridge = FeishuBridge(relay_config.state_dir / "feishu-bridge.sqlite")
+        requester_registry = RequesterRegistry()
         agent_settings = WorkspaceAgentSettings(
             store=relay_store,
             bridge=bridge,
@@ -72,9 +76,13 @@ def main() -> int:
         )
         handler = WorkspaceAgentMessageHandler(agent_settings)
         bot = FeishuBot(settings, handler)
-        # The "processing" placeholder becomes the single message the final
-        # answer overwrites in place (via bot._update in the worker).
         handler.post_placeholder = bot._reply
+        handler.on_dispatch = lambda ctx, ck: requester_registry.register(
+            ck,
+            open_id=ctx.sender_ids.open_id or ctx.sender_id,
+            name=ctx.sender_ids.open_id or "",
+            source_chat_id=ctx.chat_id,
+        )
         worker = RelayWorker(
             relay_store,
             bridge,
@@ -84,6 +92,8 @@ def main() -> int:
             freshness_ttl_seconds=int(os.getenv("AGENT_WORKER_TTL_SECONDS", "3600")),
         )
 
+        # Add the Feishu group-creation tools to the shared relay MCP server
+        register_feishu_tools(relay_mcp, bot, requester_registry)
         app = build_http_app()
 
         def serve_http() -> None:

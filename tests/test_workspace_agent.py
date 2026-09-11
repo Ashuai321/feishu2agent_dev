@@ -1,8 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from workspace_agent_relay_mcp.store.relay_store import RelayStore
-from workspace_agent_relay_mcp.trigger import build_trigger_input, generate_request_id
+from feishu2agents.relay.store.relay_store import RelayStore
+from feishu2agents.relay.trigger import build_trigger_input, generate_request_id
 
 from feishu2agents.feishu_bridge import FeishuBridge
 from feishu2agents.workspace_agent import WorkspaceAgentMessageHandler, WorkspaceAgentSettings

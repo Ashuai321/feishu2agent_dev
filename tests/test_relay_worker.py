@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from workspace_agent_relay_mcp.store.relay_store import RelayStore
+from feishu2agents.relay.store.relay_store import RelayStore
 
 from feishu2agents.feishu_bridge import FeishuBridge
 from feishu2agents.relay_worker import RelayWorker, format_result_for_feishu

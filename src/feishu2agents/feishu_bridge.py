@@ -1,6 +1,6 @@
 """SQLite bridge linking an agent run to the Feishu message that should reply.
 
-The reference relay store (``workspace_agent_relay_mcp``) does not track which
+The built-in relay store (``feishu2agents.relay``) does not track which
 Feishu message triggered a run, so a small table records that mapping. Delivery
 is **exactly-once per Feishu message**: the table is keyed by
 ``feishu_message_id`` and the claim transitions ``delivered`` atomically, so

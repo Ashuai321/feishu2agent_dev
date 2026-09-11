@@ -15,7 +15,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from workspace_agent_relay_mcp.trigger import TriggerClient
+from feishu2agents.relay.trigger import TriggerClient
 
 logger = logging.getLogger(__name__)
 
