@@ -12,6 +12,32 @@ const json = (body: Record<string, unknown>, status = 200): Response =>
     headers: { "cache-control": "no-store" },
   });
 
+async function handleFeishuChallenge(request: Request, url: URL): Promise<Response | null> {
+  if (request.method !== "POST" || url.pathname !== FEISHU_WEBHOOK_PUBLIC_PATH) {
+    return null;
+  }
+
+  try {
+    const body: unknown = await request.clone().json();
+    if (
+      typeof body === "object" &&
+      body !== null &&
+      "challenge" in body &&
+      typeof body.challenge === "string"
+    ) {
+      // Feishu's developer-server URL verification must complete quickly. Handle
+      // it at the edge so a sleeping or unreachable Python origin cannot cause a
+      // verification timeout.
+      return json({ challenge: body.challenge });
+    }
+  } catch {
+    // Non-JSON requests continue to the normal upstream path and receive its
+    // standard acknowledgement.
+  }
+
+  return null;
+}
+
 function upstreamUrl(requestUrl: URL, originValue: string): URL {
   let origin: URL;
   try {
@@ -56,6 +82,11 @@ export default {
 
     if (url.pathname === "/health" && request.method === "GET") {
       return json({ ok: true, service: "feishu2agents-worker" });
+    }
+
+    const challengeResponse = await handleFeishuChallenge(request, url);
+    if (challengeResponse) {
+      return challengeResponse;
     }
 
     if (!env.PYTHON_ORIGIN?.trim()) {

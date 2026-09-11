@@ -8,6 +8,8 @@ group workflow logic.
 ## Routes
 
 - `GET /health` is served by the Worker itself.
+- Feishu URL-verification `POST /feishu/events` requests containing a `challenge`
+  are answered directly at the edge, without waiting for the Python origin.
 - `POST /feishu/events` is mapped to the Python service's existing
   `POST /feishu/event` route.
 - All other paths, including `/mcp`, `/oauth/*`, `/.well-known/*`, and `/api/*`,
