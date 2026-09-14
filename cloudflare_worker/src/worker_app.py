@@ -1394,7 +1394,12 @@ class Default(WorkerEntrypoint):
             return await relay.mcp(request)
         return _response({"error": "not_found"}, 404)
 
-    async def queue(self, batch: Any, env: Any, ctx: Any) -> None:
+    async def queue(self, batch: Any) -> None:
+        # Python Workers queue handlers receive the batch as their only
+        # argument. Runtime bindings and execution context are available on
+        # the WorkerEntrypoint instance.
+        env = self.env
+        ctx = self.ctx
         state = D1State(env.DB)
         relay = CloudflareRelay(env, ctx, state)
         for message in batch.messages:
