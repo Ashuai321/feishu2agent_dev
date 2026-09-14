@@ -9,8 +9,6 @@
     "d1:migrate": "wrangler d1 migrations apply feishu2agents-state --remote"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260910.1",
-    "typescript": "^5.9.2",
     "wrangler": "^4.131.0"
   }
 }
