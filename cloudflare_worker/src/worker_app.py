@@ -517,8 +517,8 @@ class FeishuAPI:
         """Create a Feishu group with the explicitly supplied members.
 
         The app identity is automatically added by Feishu as the group bot.
-        ``open_ids`` must therefore contain the requester and every member the
-        user has explicitly confirmed.
+        ``open_ids`` is the exact list of user members to invite; the requester
+        is not implicitly added.
         """
         group_name = str(name or "").strip()
         members = [str(open_id).strip() for open_id in open_ids if str(open_id).strip()]
@@ -1101,10 +1101,11 @@ class CloudflareRelay:
             {
                 "name": "create_group",
                 "description": (
-                    "Create a Feishu group containing the requester and the explicitly "
-                    "confirmed member_open_ids. Call search_contacts first, show the "
-                    "candidate(s), and wait for explicit confirmation before this write "
-                    "operation. Returns the new chat_id."
+                    "Create a Feishu group containing exactly the explicitly confirmed "
+                    "member_open_ids. The requester who @mentioned the bot is not added "
+                    "automatically. Call search_contacts first, show the candidate(s), "
+                    "and wait for explicit confirmation before this write operation. "
+                    "Returns the new chat_id."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1348,7 +1349,7 @@ class CloudflareRelay:
                     True,
                 )
             members: list[str] = []
-            for open_id in [row["open_id"], *raw_members]:
+            for open_id in raw_members:
                 value = str(open_id or "").strip()
                 if value and value not in members:
                     members.append(value)

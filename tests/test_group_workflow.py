@@ -274,7 +274,7 @@ def test_create_group_tool_creates_and_persists() -> None:
     out = asyncio.run(captured["create_group"]("ck-1", "项目群", ["ou_friend"]))
     assert out["success"] is True
     assert out["chat_id"] == "oc_created"
-    assert out["member_open_ids"] == ["ou_requester", "ou_friend"]
+    assert out["member_open_ids"] == ["ou_friend"]
     assert store.get_group("ck-1")["chat_id"] == "oc_created"
     assert reg.get("ck-1")["created_group_chat_id"] == "oc_created"
 

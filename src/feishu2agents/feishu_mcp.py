@@ -199,9 +199,10 @@ def register_feishu_tools(
         name="create_group",
         title="Create Feishu Group",
         description=(
-            "Create a Feishu group whose members are the requester (auto) plus the "
-            "explicitly-confirmed member_open_ids. Set set_avatar_from_stored=True only "
-            "when the user sent an image and get_stored_image.confirmed it. Returns chat_id."
+            "Create a Feishu group whose members are exactly the explicitly-confirmed "
+            "member_open_ids. The requester who mentioned the bot is not added "
+            "automatically. Set set_avatar_from_stored=True only when the user sent an "
+            "image and get_stored_image.confirmed it. Returns chat_id."
         ),
     )
     async def create_group(
@@ -211,17 +212,16 @@ def register_feishu_tools(
         set_avatar_from_stored: bool = False,
     ) -> dict[str, Any]:
         info = registry.get(conversation_key)
-        if info is None or not (info.get("open_id") or ""):
+        if info is None:
             return {
                 "success": False,
                 "error": {
                     "code": "requester_not_found",
-                    "message": "requester open_id unavailable",
+                    "message": "no requester registered for this conversation",
                 },
             }
-        requester = info["open_id"]
         members: list[str] = []
-        for m in [requester, *member_open_ids]:
+        for m in member_open_ids:
             if m and m not in members:
                 members.append(m)
         avatar_key: str | None = None

@@ -412,7 +412,7 @@ def test_cloudflare_mcp_exposes_and_dispatches_create_group():
             {
                 "conversation_key": "feishu:app:chat:1",
                 "name": "项目群",
-                "member_open_ids": ["ou_member", "ou_requester", ""],
+                "member_open_ids": ["ou_member", ""],
             },
         )
     )
@@ -423,7 +423,7 @@ def test_cloudflare_mcp_exposes_and_dispatches_create_group():
         "success": True,
         "conversation_key": "feishu:app:chat:1",
         "chat_id": "oc_group",
-        "member_open_ids": ["ou_requester", "ou_member"],
+        "member_open_ids": ["ou_member"],
     }
-    assert feishu.call == ("项目群", ["ou_requester", "ou_member"])
+    assert feishu.call == ("项目群", ["ou_member"])
     assert state.bound == ("feishu:app:chat:1", "oc_group")
