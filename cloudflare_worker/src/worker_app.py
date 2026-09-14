@@ -1409,22 +1409,34 @@ class Default(WorkerEntrypoint):
                     "endpoints": ["/feishu/events", "/mcp", "/oauth/token"],
                 }
             )
-        if path in {"/feishu/events", "/feishu/event"} and request.method == "POST":
-            return await relay.handle_feishu(request)
+        if path in {"/feishu/events", "/feishu/event"}:
+            if request.method == "POST":
+                return await relay.handle_feishu(request)
+            return _response(
+                {
+                    "error": "method_not_allowed",
+                    "message": "Feishu webhook endpoint accepts POST requests only",
+                },
+                status=405,
+                headers={"allow": "POST"},
+            )
         if path.startswith("/.well-known/") or path.startswith("/oauth/"):
             return await relay.oauth(request, path)
         if path == MCP_PATH:
             return await relay.mcp(request)
         return _response({"error": "not_found"}, 404)
 
-    async def queue(self, batch: Any) -> None:
-        # Python Workers queue handlers receive the batch as their only
-        # argument. Runtime bindings and execution context are available on
-        # the WorkerEntrypoint instance.
-        env = self.env
-        ctx = self.ctx
-        state = D1State(env.DB)
-        relay = CloudflareRelay(env, ctx, state)
+    async def queue(self, batch: Any, env: Any = None, ctx: Any = None) -> None:
+        # The deployed Python Workers runtime invokes Queue handlers with
+        # (self, batch, env, ctx).  Some runtime versions leave the explicit
+        # env/ctx arguments as None while still exposing them on the
+        # WorkerEntrypoint instance, so support both forms.
+        runtime_env = env if env is not None else self.env
+        runtime_ctx = ctx if ctx is not None else self.ctx
+        if runtime_env is None:
+            raise RuntimeError("Queue consumer did not receive a Worker environment")
+        state = D1State(runtime_env.DB)
+        relay = CloudflareRelay(runtime_env, runtime_ctx, state)
         for message in batch.messages:
             request_id = ""
             try:
@@ -1440,7 +1452,9 @@ class Default(WorkerEntrypoint):
                     await relay.run_agent_job(body)
                 message.ack()
             except Exception as exc:
-                error = _safe_error(exc, _env(env, "WORKSPACE_AGENT_RELAY_AGENT_TOKEN"))
+                error = _safe_error(
+                    exc, _env(runtime_env, "WORKSPACE_AGENT_RELAY_AGENT_TOKEN")
+                )
                 # Keep the run inspectable if an exception escapes the job
                 # handler itself.  run_agent_job already records its own
                 # failures; this covers queue/runtime errors around it.
