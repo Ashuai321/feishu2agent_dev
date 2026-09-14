@@ -25,7 +25,7 @@ D1 的去重、会话、发起人和 OAuth 状态在 Worker 重启后仍可恢�
 
 ## 环境要求
 
-- Python 3.12 or newer（Cloudflare Python Workers / `pywrangler` requirement）
+- Python 3.11 or newer（Cloudflare Python Workers / `pywrangler` requirement）
 - 一个已启用机器人能力的飞书企业自建应用
 - 可以访问飞书开放平台的本地网络
 

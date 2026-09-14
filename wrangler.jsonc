@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "feishu2agents-state",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "45b634df-226e-42cb-9c1e-cc5311329ade",
       "migrations_dir": "cloudflare_worker/migrations"
     }
   ],
