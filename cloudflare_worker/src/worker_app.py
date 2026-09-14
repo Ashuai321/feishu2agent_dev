@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-import requests
+import httpx
 from workers import Response, WorkerEntrypoint
 
 PUBLIC_BASE_URL = "https://bot.boooe.com"
@@ -410,17 +410,17 @@ class FeishuAPI:
         self._token: str = ""
         self._token_expires = 0
 
-    def _tenant_token(self) -> str:
+    async def _tenant_token(self) -> str:
         if self._token and self._token_expires > _now() + 60:
             return self._token
-        response = requests.post(
-            f"{self.base}/open-apis/auth/v3/tenant_access_token/internal",
-            json={
-                "app_id": _env(self.env, "FEISHU_APP_ID"),
-                "app_secret": _env(self.env, "FEISHU_APP_SECRET"),
-            },
-            timeout=15,
-        )
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                f"{self.base}/open-apis/auth/v3/tenant_access_token/internal",
+                json={
+                    "app_id": _env(self.env, "FEISHU_APP_ID"),
+                    "app_secret": _env(self.env, "FEISHU_APP_SECRET"),
+                },
+            )
         response.raise_for_status()
         payload = response.json()
         token = str(payload.get("tenant_access_token") or "")
@@ -430,13 +430,14 @@ class FeishuAPI:
         self._token_expires = _now() + int(payload.get("expire", 7200))
         return token
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         headers = dict(kwargs.pop("headers", {}) or {})
-        headers["Authorization"] = f"Bearer {self._tenant_token()}"
+        headers["Authorization"] = f"Bearer {await self._tenant_token()}"
         headers.setdefault("Content-Type", "application/json")
-        response = requests.request(
-            method, f"{self.base}{path}", headers=headers, timeout=20, **kwargs
-        )
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.request(
+                method, f"{self.base}{path}", headers=headers, **kwargs
+            )
         try:
             payload = response.json()
         except ValueError:
@@ -446,15 +447,15 @@ class FeishuAPI:
             raise RuntimeError(f"Feishu API {path} failed ({response.status_code}): {message}")
         return payload
 
-    def bot_open_id(self) -> str:
-        payload = self._request("GET", "/open-apis/bot/v3/info")
+    async def bot_open_id(self) -> str:
+        payload = await self._request("GET", "/open-apis/bot/v3/info")
         value = payload.get("bot", {}).get("open_id")
         if not value:
             raise RuntimeError("Feishu bot identity returned no open_id")
         return str(value)
 
-    def reply(self, message_id: str, text: str) -> str:
-        payload = self._request(
+    async def reply(self, message_id: str, text: str) -> str:
+        payload = await self._request(
             "POST",
             f"/open-apis/im/v1/messages/{message_id}/reply",
             params={"user_id_type": "open_id"},
@@ -465,16 +466,16 @@ class FeishuAPI:
             raise RuntimeError("Feishu reply response returned no message_id")
         return str(outbound)
 
-    def update(self, message_id: str, text: str) -> None:
-        self._request(
+    async def update(self, message_id: str, text: str) -> None:
+        await self._request(
             "PATCH",
             f"/open-apis/im/v1/messages/{message_id}",
             params={"user_id_type": "open_id"},
             json={"msg_type": "text", "content": _json({"text": text})},
         )
 
-    def create_private_group(self, open_id: str, name: str | None = None) -> str:
-        payload = self._request(
+    async def create_private_group(self, open_id: str, name: str | None = None) -> str:
+        payload = await self._request(
             "POST",
             "/open-apis/im/v1/chats",
             params={"user_id_type": "open_id"},
@@ -489,13 +490,13 @@ class FeishuAPI:
             raise RuntimeError("Feishu create chat response returned no chat_id")
         return str(chat_id)
 
-    def download_image(self, message_id: str, file_key: str) -> bytes:
-        response = requests.get(
-            f"{self.base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
-            params={"type": "image"},
-            headers={"Authorization": f"Bearer {self._tenant_token()}"},
-            timeout=20,
-        )
+    async def download_image(self, message_id: str, file_key: str) -> bytes:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{self.base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+                params={"type": "image"},
+                headers={"Authorization": f"Bearer {await self._tenant_token()}"},
+            )
         response.raise_for_status()
         return response.content
 
@@ -1100,7 +1101,7 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                chat_id = self.feishu.create_private_group(
+                chat_id = await self.feishu.create_private_group(
                     str(row["open_id"]), args.get("chat_name")
                 )
             except Exception as exc:
@@ -1203,7 +1204,7 @@ class CloudflareRelay:
         for image_key in image_keys[:3]:
             if not isinstance(image_key, str) or not image_key:
                 continue
-            data = self.feishu.download_image(str(run["source_message_id"]), image_key)
+            data = await self.feishu.download_image(str(run["source_message_id"]), image_key)
             object_key = f"{run['conversation_key']}/{run['source_message_id']}/{image_key}"
             await bucket.put(object_key, data)
             await self.state.save_avatar(str(run["conversation_key"]), object_key, len(data))
@@ -1222,23 +1223,28 @@ class CloudflareRelay:
             await self._store_run_images(run)
             placeholder_id = run.get("placeholder_message_id")
             if not placeholder_id:
-                placeholder_id = self.feishu.reply(str(run["source_message_id"]), PLACEHOLDER)
+                placeholder_id = await self.feishu.reply(
+                    str(run["source_message_id"]), PLACEHOLDER
+                )
                 await self.state.update_run(request_id, placeholder_message_id=placeholder_id)
             trigger_url = _env(self.env, "WORKSPACE_AGENT_RELAY_TRIGGER_URL")
             access_token = _env(self.env, "WORKSPACE_AGENT_RELAY_AGENT_TOKEN")
             if not trigger_url or not access_token:
                 raise RuntimeError("Workspace Agent trigger URL or token is not configured")
-            response = requests.post(
-                trigger_url,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "Idempotency-Key": str(body.get("idempotency_key") or request_id),
-                    "User-Agent": f"{MCP_NAME}/3.0",
-                },
-                json={"conversation_key": run["conversation_key"], "input": run["input_markdown"]},
-                timeout=60,
-            )
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    trigger_url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": str(body.get("idempotency_key") or request_id),
+                        "User-Agent": f"{MCP_NAME}/3.0",
+                    },
+                    json={
+                        "conversation_key": run["conversation_key"],
+                        "input": run["input_markdown"],
+                    },
+                )
             if response.status_code < 200 or response.status_code >= 300:
                 raise RuntimeError(
                     f"Workspace Agent trigger failed HTTP {response.status_code}: {_safe_error(response.text, access_token)}"
@@ -1276,10 +1282,10 @@ class CloudflareRelay:
         try:
             placeholder = str(run.get("placeholder_message_id") or "")
             if placeholder:
-                self.feishu.update(placeholder, text)
+                await self.feishu.update(placeholder, text)
                 outbound = placeholder
             else:
-                outbound = self.feishu.reply(str(run["source_message_id"]), text)
+                outbound = await self.feishu.reply(str(run["source_message_id"]), text)
             await _db_run(
                 self.state.db,
                 "UPDATE relay_runs SET delivered = 1, updated_at = ? WHERE request_id = ?",

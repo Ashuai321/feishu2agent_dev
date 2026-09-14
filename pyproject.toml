@@ -9,10 +9,9 @@ description = "Feishu2Agents Cloudflare Python Worker"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    # Runtime dependency of the Cloudflare Python Worker. The Worker entry
-    # point imports only this HTTP client; the local service remains available
-    # through the dev extra below.
-    "requests>=2.32,<3",
+    # Cloudflare Python Workers support asynchronous HTTP clients. Keep this
+    # in the runtime dependency set so Feishu and Relay calls are bundled.
+    "httpx>=0.27,<1",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +23,6 @@ dev = [
     "uvicorn>=0.30,<1",
     "pytest>=8,<9",
     "ruff>=0.9,<1",
-    "httpx>=0.27,<1",
 ]
 
 # Cloudflare Workers Builds runs `uv run pywrangler deploy` without enabling
