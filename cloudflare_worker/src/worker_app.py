@@ -612,14 +612,23 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
             if key:
                 text = re.sub(re.escape(str(key)), "", text)
     text = text.strip()
-    if not mentioned_bot or (not text and not image_keys):
+    parent_id = str(message.get("parent_id") or message.get("root_id") or "")
+    # A reply to one of our messages is itself the continuation signal.  The
+    # handler verifies that the parent belongs to a known relay reply before
+    # enqueueing it, so arbitrary group replies without an @mention remain
+    # ignored.  A direct @mention still starts a new conversation when there
+    # is no known parent mapping.
+    if not mentioned_bot and not parent_id:
+        return None
+    if not text and not image_keys:
         return None
     return {
         "message_id": message_id,
         "chat_id": chat_id,
         "open_id": str(sender_id.get("open_id") or ""),
         "name": str(sender.get("sender_id", {}).get("open_id") or ""),
-        "parent_id": str(message.get("parent_id") or message.get("root_id") or ""),
+        "parent_id": parent_id,
+        "mentioned_bot": mentioned_bot,
         "text": text,
         "image_keys": image_keys,
         "tenant_key": str(header.get("tenant_key") or ""),
@@ -1427,6 +1436,11 @@ class CloudflareRelay:
                 return _response({"code": 0})
             parent = event["parent_id"]
             conversation_key = await self.state.reply_conversation(parent) if parent else None
+            if parent and not conversation_key and not event.get("mentioned_bot"):
+                # Do not treat a reply to an unrelated group message as a bot
+                # request.  The user can explicitly @ the bot to start a new
+                # relay conversation from that message.
+                return _response({"code": 0})
             if not conversation_key:
                 conversation_key = f"feishu:{_env(self.env, 'FEISHU_APP_ID')}:{event['chat_id']}:{secrets.token_hex(6)}"
             request_id = _request_id()
