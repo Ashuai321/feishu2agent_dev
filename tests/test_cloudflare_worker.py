@@ -345,6 +345,38 @@ def test_cloudflare_mcp_exposes_and_dispatches_search_contacts():
     ]
 
 
+def test_cloudflare_mcp_marks_non_mutating_tools_read_only():
+    worker = _load_worker_module()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, SimpleNamespace())
+
+    annotations = {
+        tool["name"]: tool.get("annotations", {}) for tool in relay.tool_definitions()
+    }
+
+    assert {
+        name for name, value in annotations.items() if value.get("readOnlyHint") is True
+    } == {
+        "server_info",
+        "get_run_context",
+        "get_requester_info",
+        "search_contacts",
+        "get_group_status",
+        "get_stored_image",
+    }
+    assert all(
+        not annotations[name].get("readOnlyHint", False)
+        for name in {
+            "record_plan",
+            "record_progress",
+            "record_result",
+            "update_conversation_title",
+            "ask_user",
+            "create_private_group",
+            "create_group",
+        }
+    )
+
+
 def test_cloudflare_mcp_exposes_and_dispatches_create_group():
     worker = _load_worker_module()
 

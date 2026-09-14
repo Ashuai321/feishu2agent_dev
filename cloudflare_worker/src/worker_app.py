@@ -976,11 +976,13 @@ class CloudflareRelay:
 
     def tool_definitions(self) -> list[dict[str, Any]]:
         string = {"type": "string"}
+        read_only = {"readOnlyHint": True}
         return [
             {
                 "name": "server_info",
                 "description": "Return Cloudflare Worker relay information.",
                 "inputSchema": {"type": "object", "properties": {}},
+                "annotations": read_only,
             },
             {
                 "name": "record_plan",
@@ -1060,6 +1062,7 @@ class CloudflareRelay:
                     "required": ["conversation_key"],
                     "properties": {"conversation_key": string, "limit": {"type": "integer"}},
                 },
+                "annotations": read_only,
             },
             {
                 "name": "get_requester_info",
@@ -1069,6 +1072,7 @@ class CloudflareRelay:
                     "required": ["conversation_key"],
                     "properties": {"conversation_key": string},
                 },
+                "annotations": read_only,
             },
             {
                 "name": "create_private_group",
@@ -1092,6 +1096,7 @@ class CloudflareRelay:
                     "required": ["conversation_key", "query"],
                     "properties": {"conversation_key": string, "query": string},
                 },
+                "annotations": read_only,
             },
             {
                 "name": "create_group",
@@ -1119,6 +1124,7 @@ class CloudflareRelay:
                     "required": ["conversation_key"],
                     "properties": {"conversation_key": string},
                 },
+                "annotations": read_only,
             },
             {
                 "name": "get_stored_image",
@@ -1128,6 +1134,7 @@ class CloudflareRelay:
                     "required": ["conversation_key"],
                     "properties": {"conversation_key": string},
                 },
+                "annotations": read_only,
             },
         ]
 
