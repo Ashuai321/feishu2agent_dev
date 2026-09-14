@@ -19,6 +19,80 @@ from .requester_registry import RequesterRegistry
 logger = logging.getLogger(__name__)
 
 
+_GROUP_UPDATE_ENUMS: dict[str, set[str]] = {
+    "add_member_permission": {"all_members", "only_owner"},
+    "share_card_permission": {"allowed", "not_allowed"},
+    "at_all_permission": {"all_members", "only_owner"},
+    "edit_permission": {"all_members", "only_owner"},
+    "join_message_visibility": {"all_members", "only_owner", "not_anyone"},
+    "leave_message_visibility": {"all_members", "only_owner", "not_anyone"},
+    "membership_approval": {"no_approval_required", "approval_required"},
+    "chat_type": {"private", "public"},
+    "group_message_type": {"chat", "thread"},
+    "urgent_setting": {"all_members", "only_owner"},
+    "video_conference_setting": {"all_members", "only_owner"},
+    "pin_manage_setting": {"all_members", "only_owner"},
+    "hide_member_count_setting": {"all_members", "only_owner"},
+}
+
+
+def _validate_group_updates(changes: dict[str, Any]) -> str | None:
+    """Validate the documented Feishu update-chat fields before sending them."""
+    supported = {
+        "name",
+        "avatar_image_key",
+        "description",
+        "i18n_names",
+        "add_member_permission",
+        "share_card_permission",
+        "at_all_permission",
+        "edit_permission",
+        "owner_id",
+        "join_message_visibility",
+        "leave_message_visibility",
+        "membership_approval",
+        "chat_type",
+        "group_message_type",
+        "urgent_setting",
+        "video_conference_setting",
+        "pin_manage_setting",
+        "hide_member_count_setting",
+    }
+    unknown = sorted(set(changes) - supported)
+    if unknown:
+        return f"unsupported group update field(s): {', '.join(unknown)}"
+    name = changes.get("name")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        return "name must be a non-empty string"
+    if isinstance(name, str) and len(name) > 60:
+        return "name must be 60 characters or fewer"
+    description = changes.get("description")
+    if description is not None and not isinstance(description, str):
+        return "description must be a string"
+    if isinstance(description, str) and len(description) > 100:
+        return "description must be 100 characters or fewer"
+    i18n_names = changes.get("i18n_names")
+    if i18n_names is not None and (
+        not isinstance(i18n_names, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in i18n_names.items()
+        )
+    ):
+        return "i18n_names must be an object of language codes to names"
+    for field, allowed in _GROUP_UPDATE_ENUMS.items():
+        value = changes.get(field)
+        if value is not None and value not in allowed:
+            return f"{field} must be one of: {', '.join(sorted(allowed))}"
+    add_permission = changes.get("add_member_permission")
+    share_permission = changes.get("share_card_permission")
+    if add_permission == "only_owner" and share_permission == "allowed":
+        return "share_card_permission must be not_allowed when add_member_permission is only_owner"
+    if add_permission == "all_members" and share_permission == "not_allowed":
+        return "share_card_permission must be allowed when add_member_permission is all_members"
+    return None
+
+
 def register_feishu_tools(
     mcp: Any,
     bot: FeishuBot,
@@ -318,19 +392,16 @@ def register_feishu_tools(
         return {"success": True, "chat_id": chat_id}
 
     @mcp.tool(
-        name="update_group",
-        title="Update Feishu Group",
+        name="get_group_info",
+        title="Get Feishu Group Info",
         description=(
-            "Update an existing group's name and/or avatar. chat_id may be omitted to reuse "
-            "the persisted group. Pass name and/or set_avatar_from_stored=True per the latest "
-            "user quote-reply. Updates the SAME group; never creates a new one."
+            "Read the current settings of an existing Feishu group. chat_id may be omitted "
+            "to reuse the persisted group. Use this before changing permissions or other "
+            "settings; it never creates or changes a group."
         ),
     )
-    async def update_group(
-        conversation_key: str,
-        chat_id: str | None = None,
-        name: str | None = None,
-        set_avatar_from_stored: bool = False,
+    async def get_group_info(
+        conversation_key: str, chat_id: str | None = None
     ) -> dict[str, Any]:
         if group_draft_store is None:
             return {
@@ -351,22 +422,121 @@ def register_feishu_tools(
                     "message": "no created group found; create it first or pass chat_id",
                 },
             }
-        avatar_applied = False
         try:
-            if name:
-                await asyncio.to_thread(bot.update_chat, chat_id, name=name)
-            if set_avatar_from_stored:
-                avatar_key = await _avatar_image_key(conversation_key)
-                if avatar_key is None:
-                    return {
-                        "success": False,
-                        "error": {
-                            "code": "avatar_missing",
-                            "message": "set_avatar_from_stored requested, but no stored avatar",
-                        },
-                    }
-                await asyncio.to_thread(bot.update_chat, chat_id, avatar_image_key=avatar_key)
-                avatar_applied = True
+            data = await asyncio.to_thread(bot.get_chat, chat_id)
+        except FeishuApiError as exc:
+            return {"success": False, "error": {"code": exc.code, "message": exc.message}}
+        except Exception as exc:
+            logger.exception("get_group_info failed conversation_key=%s", conversation_key)
+            return {"success": False, "error": {"code": "read_failed", "message": str(exc)}}
+        return {"success": True, "chat_id": chat_id, "settings": data}
+
+    @mcp.tool(
+        name="update_group",
+        title="Update Feishu Group",
+        description=(
+            "Update the SAME existing group; never create a new one. chat_id may be omitted "
+            "to reuse the persisted group. Supported fields are name (<=60 chars), description "
+            "(<=100), avatar_image_key, i18n_names, add_member_permission, "
+            "share_card_permission, at_all_permission, edit_permission, owner_id, "
+            "join_message_visibility, leave_message_visibility, membership_approval, "
+            "chat_type, group_message_type, urgent_setting, video_conference_setting, "
+            "pin_manage_setting, and hide_member_count_setting. Values are validated against "
+            "Feishu's documented enum values; add_member_permission and share_card_permission "
+            "must be consistent. set_avatar_from_stored=True uses the latest quoted image."
+        ),
+    )
+    async def update_group(
+        conversation_key: str,
+        chat_id: str | None = None,
+        name: str | None = None,
+        avatar_image_key: str | None = None,
+        set_avatar_from_stored: bool = False,
+        description: str | None = None,
+        i18n_names: dict[str, str] | None = None,
+        add_member_permission: str | None = None,
+        share_card_permission: str | None = None,
+        at_all_permission: str | None = None,
+        edit_permission: str | None = None,
+        owner_id: str | None = None,
+        join_message_visibility: str | None = None,
+        leave_message_visibility: str | None = None,
+        membership_approval: str | None = None,
+        chat_type: str | None = None,
+        group_message_type: str | None = None,
+        urgent_setting: str | None = None,
+        video_conference_setting: str | None = None,
+        pin_manage_setting: str | None = None,
+        hide_member_count_setting: str | None = None,
+    ) -> dict[str, Any]:
+        if group_draft_store is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "store_unavailable",
+                    "message": "group draft store is not configured",
+                },
+            }
+        existing = group_draft_store.get_group(conversation_key)
+        if not chat_id:
+            chat_id = existing["chat_id"] if existing else None
+        if not chat_id:
+            return {
+                "success": False,
+                "error": {
+                    "code": "group_missing",
+                    "message": "no created group found; create it first or pass chat_id",
+                },
+            }
+        changes: dict[str, Any] = {
+            key: value
+            for key, value in {
+                "name": name,
+                "avatar_image_key": avatar_image_key,
+                "description": description,
+                "i18n_names": i18n_names,
+                "add_member_permission": add_member_permission,
+                "share_card_permission": share_card_permission,
+                "at_all_permission": at_all_permission,
+                "edit_permission": edit_permission,
+                "owner_id": owner_id,
+                "join_message_visibility": join_message_visibility,
+                "leave_message_visibility": leave_message_visibility,
+                "membership_approval": membership_approval,
+                "chat_type": chat_type,
+                "group_message_type": group_message_type,
+                "urgent_setting": urgent_setting,
+                "video_conference_setting": video_conference_setting,
+                "pin_manage_setting": pin_manage_setting,
+                "hide_member_count_setting": hide_member_count_setting,
+            }.items()
+            if value is not None
+        }
+        if set_avatar_from_stored:
+            avatar_key = await _avatar_image_key(conversation_key)
+            if avatar_key is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "avatar_missing",
+                        "message": "set_avatar_from_stored requested, but no stored avatar",
+                    },
+                }
+            changes["avatar_image_key"] = avatar_key
+        if not changes:
+            return {
+                "success": False,
+                "error": {
+                    "code": "no_updates",
+                    "message": "provide at least one group field to update",
+                },
+            }
+        invalid = _validate_group_updates(changes)
+        if invalid:
+            return {"success": False, "error": {"code": "invalid_setting", "message": invalid}}
+        avatar_from_stored = set_avatar_from_stored
+        try:
+            await asyncio.to_thread(bot.update_chat, chat_id, **changes)
         except FeishuApiError as exc:
             return {"success": False, "error": {"code": exc.code, "message": exc.message}}
         except Exception as exc:
@@ -380,8 +550,13 @@ def register_feishu_tools(
                     group_draft_store.avatar_dir
                     / group_draft_store._avatar_filename(conversation_key)
                 ).as_posix()
-                if avatar_applied
+                if avatar_from_stored
                 else None
             ),
         )
-        return {"success": True, "chat_id": chat_id, "avatar_pending_overwrite": avatar_applied}
+        return {
+            "success": True,
+            "chat_id": chat_id,
+            "updated_fields": sorted(changes),
+            "avatar_pending_overwrite": avatar_from_stored,
+        }

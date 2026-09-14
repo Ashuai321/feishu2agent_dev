@@ -24,6 +24,80 @@ PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
 
 
+_GROUP_UPDATE_ENUMS: dict[str, set[str]] = {
+    "add_member_permission": {"all_members", "only_owner"},
+    "share_card_permission": {"allowed", "not_allowed"},
+    "at_all_permission": {"all_members", "only_owner"},
+    "edit_permission": {"all_members", "only_owner"},
+    "join_message_visibility": {"all_members", "only_owner", "not_anyone"},
+    "leave_message_visibility": {"all_members", "only_owner", "not_anyone"},
+    "membership_approval": {"no_approval_required", "approval_required"},
+    "chat_type": {"private", "public"},
+    "group_message_type": {"chat", "thread"},
+    "urgent_setting": {"all_members", "only_owner"},
+    "video_conference_setting": {"all_members", "only_owner"},
+    "pin_manage_setting": {"all_members", "only_owner"},
+    "hide_member_count_setting": {"all_members", "only_owner"},
+}
+
+
+def _validate_group_updates(changes: dict[str, Any]) -> str | None:
+    """Validate documented Feishu update-chat fields before sending them."""
+    supported = {
+        "name",
+        "avatar_image_key",
+        "description",
+        "i18n_names",
+        "add_member_permission",
+        "share_card_permission",
+        "at_all_permission",
+        "edit_permission",
+        "owner_id",
+        "join_message_visibility",
+        "leave_message_visibility",
+        "membership_approval",
+        "chat_type",
+        "group_message_type",
+        "urgent_setting",
+        "video_conference_setting",
+        "pin_manage_setting",
+        "hide_member_count_setting",
+    }
+    unknown = sorted(set(changes) - supported)
+    if unknown:
+        return f"unsupported group update field(s): {', '.join(unknown)}"
+    name = changes.get("name")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        return "name must be a non-empty string"
+    if isinstance(name, str) and len(name) > 60:
+        return "name must be 60 characters or fewer"
+    description = changes.get("description")
+    if description is not None and not isinstance(description, str):
+        return "description must be a string"
+    if isinstance(description, str) and len(description) > 100:
+        return "description must be 100 characters or fewer"
+    i18n_names = changes.get("i18n_names")
+    if i18n_names is not None and (
+        not isinstance(i18n_names, dict)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in i18n_names.items()
+        )
+    ):
+        return "i18n_names must be an object of language codes to names"
+    for field, allowed in _GROUP_UPDATE_ENUMS.items():
+        value = changes.get(field)
+        if value is not None and value not in allowed:
+            return f"{field} must be one of: {', '.join(sorted(allowed))}"
+    add_permission = changes.get("add_member_permission")
+    share_permission = changes.get("share_card_permission")
+    if add_permission == "only_owner" and share_permission == "allowed":
+        return "share_card_permission must be not_allowed when add_member_permission is only_owner"
+    if add_permission == "all_members" and share_permission == "not_allowed":
+        return "share_card_permission must be allowed when add_member_permission is all_members"
+    return None
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS feishu_events (
     message_id TEXT PRIMARY KEY,
@@ -540,6 +614,33 @@ class FeishuAPI:
         if not chat_id:
             raise RuntimeError("Feishu create group response returned no chat_id")
         return str(chat_id)
+
+    async def get_chat(self, chat_id: str) -> dict[str, Any]:
+        """Read the current settings for a regular group."""
+        payload = await self._request(
+            "GET",
+            f"/open-apis/im/v1/chats/{chat_id}",
+            params={"user_id_type": "open_id"},
+        )
+        data = payload.get("data") or {}
+        return data if isinstance(data, dict) else {}
+
+    async def update_chat(self, chat_id: str, changes: dict[str, Any]) -> None:
+        """Update the supplied fields on an existing regular group."""
+        if not changes:
+            raise RuntimeError("at least one group field is required")
+        body: dict[str, Any] = {}
+        for key, value in changes.items():
+            if key == "avatar_image_key":
+                body["avatar"] = value
+            else:
+                body[key] = value
+        await self._request(
+            "PUT",
+            f"/open-apis/im/v1/chats/{chat_id}",
+            params={"user_id_type": "open_id"},
+            json=body,
+        )
 
     async def search_contacts(self, query: str) -> list[dict[str, Any]]:
         """Resolve Feishu contacts from a mobile number or email address.
@@ -1118,6 +1219,64 @@ class CloudflareRelay:
                 },
             },
             {
+                "name": "get_group_info",
+                "description": (
+                    "Read current settings for an existing regular Feishu group. chat_id may "
+                    "be omitted to reuse the persisted group. Use this before changing group "
+                    "permissions; this tool never creates or changes a group."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["conversation_key"],
+                    "properties": {
+                        "conversation_key": string,
+                        "chat_id": string,
+                    },
+                },
+                "annotations": read_only,
+            },
+            {
+                "name": "update_group",
+                "description": (
+                    "Update the SAME existing regular Feishu group; never create a new one. "
+                    "chat_id may be omitted to reuse the persisted group. Supported fields: "
+                    "name (<=60 chars), description (<=100), avatar_image_key, i18n_names, "
+                    "add_member_permission, share_card_permission, at_all_permission, "
+                    "edit_permission, owner_id, join_message_visibility, "
+                    "leave_message_visibility, membership_approval, chat_type, "
+                    "group_message_type, urgent_setting, video_conference_setting, "
+                    "pin_manage_setting, and hide_member_count_setting. Values are checked "
+                    "against Feishu's documented enum values; add_member_permission and "
+                    "share_card_permission must be consistent."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["conversation_key"],
+                    "properties": {
+                        "conversation_key": string,
+                        "chat_id": string,
+                        "name": string,
+                        "avatar_image_key": string,
+                        "description": string,
+                        "i18n_names": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "add_member_permission": string,
+                        "share_card_permission": string,
+                        "at_all_permission": string,
+                        "edit_permission": string,
+                        "owner_id": string,
+                        "join_message_visibility": string,
+                        "leave_message_visibility": string,
+                        "membership_approval": string,
+                        "chat_type": string,
+                        "group_message_type": string,
+                        "urgent_setting": string,
+                        "video_conference_setting": string,
+                        "pin_manage_setting": string,
+                        "hide_member_count_setting": string,
+                    },
+                },
+            },
+            {
                 "name": "get_group_status",
                 "description": "Read the created group mapping for a conversation.",
                 "inputSchema": {
@@ -1381,6 +1540,113 @@ class CloudflareRelay:
                     "conversation_key": conversation_key,
                     "chat_id": chat_id,
                     "member_open_ids": members,
+                }
+            )
+        if name == "get_group_info":
+            target_chat_id = str(args.get("chat_id") or "").strip()
+            if not target_chat_id:
+                row = await self.state.requester(conversation_key)
+                target_chat_id = str((row or {}).get("group_chat_id") or "").strip()
+            if not target_chat_id:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "group_missing",
+                            "message": "no created group found; create it first or pass chat_id",
+                        },
+                    },
+                    True,
+                )
+            try:
+                settings = await self.feishu.get_chat(target_chat_id)
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "read_failed", "message": _safe_error(exc)},
+                    },
+                    True,
+                )
+            return self._tool_result(
+                {"success": True, "chat_id": target_chat_id, "settings": settings}
+            )
+        if name == "update_group":
+            target_chat_id = str(args.get("chat_id") or "").strip()
+            if not target_chat_id:
+                row = await self.state.requester(conversation_key)
+                target_chat_id = str((row or {}).get("group_chat_id") or "").strip()
+            if not target_chat_id:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "group_missing",
+                            "message": "no created group found; create it first or pass chat_id",
+                        },
+                    },
+                    True,
+                )
+            update_fields = {
+                "name",
+                "avatar_image_key",
+                "description",
+                "i18n_names",
+                "add_member_permission",
+                "share_card_permission",
+                "at_all_permission",
+                "edit_permission",
+                "owner_id",
+                "join_message_visibility",
+                "leave_message_visibility",
+                "membership_approval",
+                "chat_type",
+                "group_message_type",
+                "urgent_setting",
+                "video_conference_setting",
+                "pin_manage_setting",
+                "hide_member_count_setting",
+            }
+            changes = {
+                key: args[key]
+                for key in update_fields
+                if key in args and args[key] is not None
+            }
+            if not changes:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "no_updates",
+                            "message": "provide at least one group field to update",
+                        },
+                    },
+                    True,
+                )
+            invalid = _validate_group_updates(changes)
+            if invalid:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "invalid_setting", "message": invalid},
+                    },
+                    True,
+                )
+            try:
+                await self.feishu.update_chat(target_chat_id, changes)
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "update_failed", "message": _safe_error(exc)},
+                    },
+                    True,
+                )
+            return self._tool_result(
+                {
+                    "success": True,
+                    "chat_id": target_chat_id,
+                    "updated_fields": sorted(changes),
                 }
             )
         if name == "get_group_status":

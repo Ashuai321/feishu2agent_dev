@@ -360,6 +360,7 @@ def test_cloudflare_mcp_marks_non_mutating_tools_read_only():
         "get_run_context",
         "get_requester_info",
         "search_contacts",
+        "get_group_info",
         "get_group_status",
         "get_stored_image",
     }
@@ -373,7 +374,99 @@ def test_cloudflare_mcp_marks_non_mutating_tools_read_only():
             "ask_user",
             "create_private_group",
             "create_group",
+            "update_group",
         }
+    )
+
+
+def test_cloudflare_feishu_update_chat_sends_supported_fields():
+    worker = _load_worker_module()
+
+    class FakeFeishu(worker.FeishuAPI):
+        def __init__(self):
+            super().__init__(SimpleNamespace())
+            self.call = None
+
+        async def _request(self, method, path, **kwargs):
+            self.call = (method, path, kwargs)
+            return {"code": 0, "data": {}}
+
+    api = FakeFeishu()
+    asyncio.run(
+        api.update_chat(
+            "oc_group",
+            {
+                "name": "文帅_测试_0",
+                "description": "测试群",
+                "add_member_permission": "only_owner",
+                "share_card_permission": "not_allowed",
+            },
+        )
+    )
+    assert api.call == (
+        "PUT",
+        "/open-apis/im/v1/chats/oc_group",
+        {
+            "params": {"user_id_type": "open_id"},
+            "json": {
+                "name": "文帅_测试_0",
+                "description": "测试群",
+                "add_member_permission": "only_owner",
+                "share_card_permission": "not_allowed",
+            },
+        },
+    )
+
+
+def test_cloudflare_mcp_dispatches_update_group():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+        async def requester(self, conversation_key):
+            return {"group_chat_id": "oc_persisted"}
+
+    class FakeFeishu:
+        def __init__(self):
+            self.call = None
+
+        async def update_chat(self, chat_id, changes):
+            self.call = (chat_id, changes)
+
+    state = FakeState()
+    feishu = FakeFeishu()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = feishu
+    result = asyncio.run(
+        relay.call_tool(
+            "update_group",
+            {
+                "conversation_key": "feishu:app:chat:1",
+                "name": "文帅_测试_0",
+                "add_member_permission": "only_owner",
+                "share_card_permission": "not_allowed",
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "success": True,
+        "chat_id": "oc_persisted",
+        "updated_fields": [
+            "add_member_permission",
+            "name",
+            "share_card_permission",
+        ],
+    }
+    assert feishu.call == (
+        "oc_persisted",
+        {
+            "name": "文帅_测试_0",
+            "add_member_permission": "only_owner",
+            "share_card_permission": "not_allowed",
+        },
     )
 
 

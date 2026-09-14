@@ -391,13 +391,49 @@ class FeishuBot:
         *,
         name: str | None = None,
         avatar_image_key: str | None = None,
+        description: str | None = None,
+        i18n_names: dict[str, str] | None = None,
+        add_member_permission: str | None = None,
+        share_card_permission: str | None = None,
+        at_all_permission: str | None = None,
+        edit_permission: str | None = None,
+        owner_id: str | None = None,
+        join_message_visibility: str | None = None,
+        leave_message_visibility: str | None = None,
+        membership_approval: str | None = None,
+        chat_type: str | None = None,
+        group_message_type: str | None = None,
+        urgent_setting: str | None = None,
+        video_conference_setting: str | None = None,
+        pin_manage_setting: str | None = None,
+        hide_member_count_setting: str | None = None,
     ) -> None:
         """Update a group's name and/or avatar in place."""
-        body: dict[str, str] = {}
+        body: dict[str, Any] = {}
         if name:
             body["name"] = name
         if avatar_image_key:
             body["avatar"] = avatar_image_key
+        for key, value in (
+            ("description", description),
+            ("i18n_names", i18n_names),
+            ("add_member_permission", add_member_permission),
+            ("share_card_permission", share_card_permission),
+            ("at_all_permission", at_all_permission),
+            ("edit_permission", edit_permission),
+            ("owner_id", owner_id),
+            ("join_message_visibility", join_message_visibility),
+            ("leave_message_visibility", leave_message_visibility),
+            ("membership_approval", membership_approval),
+            ("chat_type", chat_type),
+            ("group_message_type", group_message_type),
+            ("urgent_setting", urgent_setting),
+            ("video_conference_setting", video_conference_setting),
+            ("pin_manage_setting", pin_manage_setting),
+            ("hide_member_count_setting", hide_member_count_setting),
+        ):
+            if value is not None:
+                body[key] = value
         if not body:
             return
         request = (
@@ -412,6 +448,24 @@ class FeishuBot:
         response = self._api_client.request(request)
         if not response.success():
             raise FeishuApiError(self._api_failure("update chat", response))
+
+    def get_chat(self, chat_id: str) -> dict[str, Any]:
+        """Return the current group information using the bot identity."""
+        request = (
+            GetChatRequest.builder()
+            .chat_id(chat_id)
+            .user_id_type("open_id")
+            .build()
+        )
+        response = self._api_client.im.v1.chat.get(request)
+        if not response.success():
+            raise FeishuApiError(self._api_failure("get chat", response))
+        try:
+            payload = json.loads(response.raw.content)
+            data = payload.get("data") or {}
+        except (AttributeError, TypeError, json.JSONDecodeError) as exc:
+            raise FeishuApiError("get chat returned an invalid response") from exc
+        return data if isinstance(data, dict) else {}
 
     def search_contacts(self, query: str) -> list[dict[str, Any]]:
         """Resolve Feishu contacts from a mobile number or email address.
