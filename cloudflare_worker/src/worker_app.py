@@ -602,23 +602,24 @@ def _conversation_input(
     continuation: bool,
     working_directory: str = "",
 ) -> str:
-    turn = "continuation" if continuation else "initial"
-    lines = [
-        f"request_id: {request_id}",
-        f"conversation_key: {conversation_key}",
-        f"relay_mcp: {MCP_NAME}",
-        "protocol: local-agent-shell/v1",
-        f"turn_mode: {turn}",
-        "",
-        "Completion contract:",
-        "The local operator cannot see ChatGPT-side work except through this relay.",
-        "Use workspace-agent-relay-mcp-prd.record_plan, record_progress, and record_result.",
-        "Call record_result exactly once when the turn is complete.",
-    ]
+    # The Workspace Agent trigger endpoint accepts ``input`` as a string, but
+    # the Agent's relay contract expects that string to contain a JSON object
+    # whose protocol fields are at the top level.  Sending a Markdown header
+    # here makes the Agent treat every webhook as an ordinary ChatGPT prompt,
+    # so it never calls record_result and Feishu remains stuck on the
+    # placeholder message.  Keep the transport string JSON-encoded while
+    # preserving the original user text as the untrusted ``user_input`` field.
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "conversation_key": conversation_key,
+        "relay_mcp": MCP_NAME,
+        "protocol": "local-agent-shell/v1",
+        "turn_mode": "continuation" if continuation else "initial",
+        "user_input": text,
+    }
     if working_directory:
-        lines.extend([f"working_directory: {working_directory}", ""])
-    lines.extend(["", "User task:", text])
-    return "\n".join(lines)
+        payload["working_directory"] = working_directory
+    return _json(payload)
 
 
 class CloudflareRelay:

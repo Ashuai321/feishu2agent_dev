@@ -75,6 +75,28 @@ def test_worker_keeps_image_key_for_queued_r2_storage():
     assert "必要文件" in event["text"]
 
 
+def test_agent_input_is_json_relay_envelope():
+    worker = _load_worker_module()
+
+    payload = json.loads(
+        worker._conversation_input(
+            request_id="req_1",
+            conversation_key="feishu:app:chat:1",
+            text="测试",
+            continuation=False,
+        )
+    )
+
+    assert payload == {
+        "request_id": "req_1",
+        "conversation_key": "feishu:app:chat:1",
+        "relay_mcp": "workspace-agent-relay-mcp-prd",
+        "protocol": "local-agent-shell/v1",
+        "turn_mode": "initial",
+        "user_input": "测试",
+    }
+
+
 def test_worker_config_points_directly_to_python_entrypoint():
     config = json.loads((ROOT / "wrangler.jsonc").read_text())
 
