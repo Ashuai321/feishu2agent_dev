@@ -137,7 +137,7 @@ def test_worker_config_points_directly_to_python_entrypoint():
     assert "PYTHON_ORIGIN" not in (ROOT / "wrangler.jsonc").read_text()
 
 
-def test_result_delivery_falls_back_when_placeholder_is_plain_text():
+def test_result_delivery_updates_a_plain_text_placeholder_in_place():
     worker = _load_worker_module()
 
     class FakeState:
@@ -161,13 +161,52 @@ def test_result_delivery_falls_back_when_placeholder_is_plain_text():
 
     class FakeFeishu:
         def __init__(self):
+            self.updates = []
+
+        async def update(self, message_id, text):
+            self.updates.append((message_id, text))
+
+    async def noop_db_run(*args, **kwargs):
+        return None
+
+    worker._db_run = noop_db_run
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = FakeFeishu()
+
+    asyncio.run(relay.deliver_result("req_1"))
+
+    assert relay.feishu.updates == [("om_placeholder", "完成\n结果正文")]
+    assert state.saved == ("om_placeholder", "feishu:app:chat:x")
+
+
+def test_result_delivery_falls_back_to_a_new_reply_when_edit_fails():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "source_message_id": "om_source",
+                "placeholder_message_id": "om_placeholder",
+                "status": "done",
+                "title": "完成",
+                "markdown": "结果正文",
+                "delivered": 0,
+                "conversation_key": "feishu:app:chat:x",
+            }
+
+        async def save_reply(self, outbound_id, conversation_key):
+            self.saved = (outbound_id, conversation_key)
+
+    class FakeFeishu:
+        def __init__(self):
             self.replies = []
 
-        async def update_card(self, message_id, text):
-            raise RuntimeError(
-                "Feishu API failed (400): Your request contains an invalid request parameter, "
-                "ext=This message is NOT a card."
-            )
+        async def update(self, message_id, text):
+            raise RuntimeError("Feishu update temporarily failed")
 
         async def reply(self, message_id, text):
             self.replies.append((message_id, text))
@@ -187,54 +226,26 @@ def test_result_delivery_falls_back_when_placeholder_is_plain_text():
     assert state.saved == ("om_result", "feishu:app:chat:x")
 
 
-def test_result_delivery_updates_the_editable_card_in_place():
+def test_feishu_text_update_uses_put_message_edit_api():
     worker = _load_worker_module()
 
-    class FakeState:
-        db = object()
-
-        async def get_run(self, request_id):
-            return {
-                "request_id": request_id,
-                "source_message_id": "om_source",
-                "placeholder_message_id": "om_card",
-                "status": "done",
-                "title": "完成",
-                "markdown": "结果正文",
-                "delivered": 0,
-                "conversation_key": "feishu:app:chat:x",
-            }
-
-        async def save_reply(self, outbound_id, conversation_key):
-            self.saved = (outbound_id, conversation_key)
-
-    class FakeFeishu:
+    class FakeFeishu(worker.FeishuAPI):
         def __init__(self):
-            self.updates = []
+            super().__init__(SimpleNamespace())
+            self.call = None
 
-        async def update_card(self, message_id, text):
-            self.updates.append((message_id, text))
+        async def _request(self, method, path, **kwargs):
+            self.call = (method, path, kwargs)
+            return {"code": 0}
 
-    async def noop_db_run(*args, **kwargs):
-        return None
+    api = FakeFeishu()
+    asyncio.run(api.update("om_message", "已完成"))
 
-    worker._db_run = noop_db_run
-    state = FakeState()
-    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
-    relay.feishu = FakeFeishu()
-
-    asyncio.run(relay.deliver_result("req_1"))
-
-    assert relay.feishu.updates == [("om_card", "完成\n结果正文")]
-    assert state.saved == ("om_card", "feishu:app:chat:x")
-
-
-def test_feishu_card_content_is_editable_interactive_payload():
-    worker = _load_worker_module()
-
-    payload = json.loads(worker.FeishuAPI._card_content("正在处理"))
-
-    assert payload["config"]["wide_screen_mode"] is True
-    assert payload["elements"] == [
-        {"tag": "div", "text": {"tag": "lark_md", "content": "正在处理"}}
-    ]
+    assert api.call == (
+        "PUT",
+        "/open-apis/im/v1/messages/om_message",
+        {
+            "params": {"user_id_type": "open_id"},
+            "json": {"msg_type": "text", "content": '{"text":"已完成"}'},
+        },
+    )

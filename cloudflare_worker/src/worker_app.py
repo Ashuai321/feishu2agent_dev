@@ -218,17 +218,6 @@ def _safe_error(value: Any, secret: str = "") -> str:
     return text.replace(secret, "[REDACTED]") if secret else text
 
 
-def _is_non_card_update_error(value: Any) -> bool:
-    """Return whether Feishu rejected an update because the message is text.
-
-    Feishu's message update endpoint only accepts card messages.  Older relay
-    runs may still have a normal text placeholder, so a completed Agent result
-    must fall back to a new reply when this error is returned instead of
-    retrying the same impossible PATCH forever.
-    """
-    return "this message is not a card" in str(value or "").lower()
-
-
 class D1State:
     def __init__(self, db: Any) -> None:
         self.db = db
@@ -500,49 +489,12 @@ class FeishuAPI:
             raise RuntimeError("Feishu reply response returned no message_id")
         return str(outbound)
 
-    @staticmethod
-    def _card_content(text: str) -> str:
-        # A card is required because Feishu's message PATCH endpoint cannot
-        # edit ordinary text messages.  lark_md keeps the Agent's markdown
-        # readable while allowing the same card to be updated in place.
-        return _json(
-            {
-                "config": {"wide_screen_mode": True},
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {"tag": "lark_md", "content": text},
-                    }
-                ],
-            }
-        )
-
-    async def reply_card(self, message_id: str, text: str) -> str:
-        payload = await self._request(
-            "POST",
-            f"/open-apis/im/v1/messages/{message_id}/reply",
-            params={"user_id_type": "open_id"},
-            json={"msg_type": "interactive", "content": self._card_content(text)},
-        )
-        outbound = payload.get("data", {}).get("message_id")
-        if not outbound:
-            raise RuntimeError("Feishu card reply response returned no message_id")
-        return str(outbound)
-
     async def update(self, message_id: str, text: str) -> None:
         await self._request(
-            "PATCH",
+            "PUT",
             f"/open-apis/im/v1/messages/{message_id}",
             params={"user_id_type": "open_id"},
             json={"msg_type": "text", "content": _json({"text": text})},
-        )
-
-    async def update_card(self, message_id: str, text: str) -> None:
-        await self._request(
-            "PATCH",
-            f"/open-apis/im/v1/messages/{message_id}",
-            params={"user_id_type": "open_id"},
-            json={"msg_type": "interactive", "content": self._card_content(text)},
         )
 
     async def create_private_group(self, open_id: str, name: str | None = None) -> str:
@@ -1319,7 +1271,7 @@ class CloudflareRelay:
             await self._store_run_images(run)
             placeholder_id = run.get("placeholder_message_id")
             if not placeholder_id:
-                placeholder_id = await self.feishu.reply_card(
+                placeholder_id = await self.feishu.reply(
                     str(run["source_message_id"]), PLACEHOLDER
                 )
                 await self.state.update_run(request_id, placeholder_message_id=placeholder_id)
@@ -1383,20 +1335,15 @@ class CloudflareRelay:
             placeholder = str(run.get("placeholder_message_id") or "")
             if placeholder:
                 try:
-                    await self.feishu.update_card(placeholder, text)
+                    await self.feishu.update(placeholder, text)
                     outbound = placeholder
                 except Exception as exc:
-                    if not _is_non_card_update_error(exc):
-                        raise
-                    # A plain-text Feishu message cannot be edited through the
-                    # update API.  Preserve the visible placeholder and post
-                    # the Agent result as a normal reply instead.
-                    print(
-                        "Feishu placeholder is not a card; falling back to a new reply"
-                    )
-                    outbound = await self.feishu.reply(
-                        str(run["source_message_id"]), text
-                    )
+                    # Keep delivery reliable if an old message is no longer
+                    # editable (for example after Feishu's edit window). New
+                    # messages use the PUT text-edit path above and normally
+                    # stay in place.
+                    print(f"Feishu message update failed; sending a reply: {_safe_error(exc)}")
+                    outbound = await self.feishu.reply(str(run["source_message_id"]), text)
             else:
                 outbound = await self.feishu.reply(str(run["source_message_id"]), text)
             await _db_run(
