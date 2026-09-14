@@ -114,9 +114,10 @@ def register_feishu_tools(
         name="search_contacts",
         title="Search Feishu Contacts",
         description=(
-            "Search visible Feishu contacts by name/email/mobile and return candidate "
-            "cards (name, open_id, email). Read-only. The agent must show these to the "
-            "user and wait for explicit confirmation before inviting anyone."
+            "Resolve a visible Feishu contact by mobile number or email and return candidate "
+            "cards (name, open_id, email). Name-only lookup requires a user token and is "
+            "unavailable here. Read-only; the agent must show candidates to the user and "
+            "wait for explicit confirmation before inviting anyone."
         ),
     )
     async def search_contacts(conversation_key: str, query: str) -> dict[str, Any]:
