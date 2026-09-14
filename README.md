@@ -1,43 +1,36 @@
-> 当前运行入口已切换到 ChatGPT Workspace Agent。填写 `.env` 中的
-> `CHATGPT_AGENT_TOKEN` 后重启；群聊 @ 文本会提交给 Agent，群里返回 ChatGPT 会话链接。
-> 详细说明见 [WORKSPACE_AGENT.md](WORKSPACE_AGENT.md)。以下 Echo 说明保留作原始接入参考。
-
 # Feishu2Agents
 
-一个使用飞书官方 Python SDK 的企业自建应用 Bot，支持长连接和开发者服务器（Webhook）模式。
-
-第一阶段实现最小 Echo Bot：在群里发送 `@Bot hello`，机器人回复原消息
-`收到：hello`。代码将飞书事件转换为独立的 `MessageContext`，以后可以将 Echo
-handler 替换成 ChatGPT/Agent Gateway，而不重写飞书接入层。
+当前生产入口是 Cloudflare Python Worker：飞书事件、MCP/OAuth 和 Agent 回调都在
+Cloudflare 内完成。Worker 使用 D1 保存最小状态，Queue 处理后台任务，Feishu API
+负责重新同步可恢复信息，R2 只保存必要文件。稳定公网域名保持为
+`https://bot.boooe.com`，不使用 `PYTHON_ORIGIN` 或 tunnel。
 
 ## 架构
 
 ```mermaid
 flowchart TD
-    U[飞书用户] -->|"@Bot hello"| F[飞书群聊]
-    F -->|im.message.receive_v1| WS[官方 SDK 长连接]
-    WS --> A[Feishu Event Adapter]
-    A --> N[Event Normalizer]
-    N --> C[MessageContext]
-    C --> H[MessageHandler]
-    H -->|第一阶段| E[Echo Handler]
-    E --> R[Feishu Reply API]
-    H -.->|第二阶段替换| G[Agent Gateway]
-    G --> AI[ChatGPT / Agent]
-    AI --> R
-    R --> F
+    U[飞书用户] -->|@机器人| F[飞书群聊]
+    F -->|开发者服务器 Webhook| W[Cloudflare Python Worker]
+    W --> D1[(D1 最小状态)]
+    W --> Q[Cloudflare Queue]
+    Q --> A[Workspace Agent Trigger]
+    A -->|MCP v3 回调| W
+    W --> API[Feishu API]
+    W -.必要文件.-> R2[(R2)]
+    API --> F
 ```
 
-`MessageContext` 是飞书接入层和业务处理层之间的稳定边界。第二阶段只替换 handler，长连接、事件解析、去重和回复适配保持不变。
+队列让 Webhook 先快速确认，再异步发送占位消息、触发 Agent 和覆盖原占位消息。
+D1 的去重、会话、发起人和 OAuth 状态在 Worker 重启后仍可恢复。
 
 ## 环境要求
 
-- Python 3.11（项目支持 `>=3.11,<3.13`）
+- Python 3.12 or newer（Cloudflare Python Workers / `pywrangler` requirement）
 - 一个已启用机器人能力的飞书企业自建应用
 - 可以访问飞书开放平台的本地网络
 
-长连接模式不需要公网服务器或 webhook URL，但程序必须保持运行。Webhook 模式由本项目的
-ASGI 服务接收事件；Cloudflare Worker 目录提供稳定的公网边缘入口，并将请求转发到该服务。
+本地 ASGI 入口仍可用于回归测试和故障排查；生产部署使用下面的 Cloudflare Python Worker，
+不再把请求转发到另一个 Python 源站。
 
 ## 飞书开放平台配置
 
@@ -59,7 +52,7 @@ ASGI 服务接收事件；Cloudflare Worker 目录提供稳定的公网边缘入
 ## 安装
 
 ```bash
-python3.11 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
@@ -111,39 +104,64 @@ python -m feishu2agents.main
 日志只输出 message、chat、sender 等诊断标识和错误码，不输出 Secret、token、完整消息正文
 或原始事件。
 
-## Cloudflare Worker 部署
+## Cloudflare Python Worker 部署
 
-仓库根目录中的 `worker/src/index.ts` 是真正的 Cloudflare Worker 入口，
-`wrangler.jsonc` 已将它配置为部署入口。Worker 负责固定公网地址和边缘转发，
-Python 服务继续负责飞书 Webhook、Relay/MCP、OAuth、存储和建群业务；这样不会改变现有飞书业务逻辑。
+生产入口是 `cloudflare_worker/src/entry.py`。它把飞书 Webhook、MCP/OAuth 和 Agent 回调都运行在 Cloudflare Python Worker 内部，不再使用 Python 源站，也不需要 `PYTHON_ORIGIN`。现有稳定域名继续使用 `https://bot.boooe.com`。
 
-先让 Python 服务以 Webhook 模式运行，并部署到一个独立、固定的公网域名（不能是
-`127.0.0.1`、`localhost` 或当前 Worker 的 `https://bot.boooe.com`）。本项目约定的
-永久后端域名是 `https://origin.bot.boooe.com`；它必须先解析到正在运行的 Python
-服务，再配置 Worker。然后在仓库根目录执行：
+Worker 使用四类 Cloudflare 绑定：
+
+- D1（`DB`）保存去重键、Relay 运行记录、发起人映射和 OAuth 状态。
+- Queue（`AGENT_QUEUE`）在飞书 Webhook 请求之外处理占位回复、Agent 触发和最终结果回写，避免超过飞书的响应时限。
+- R2（`AVATARS`）只为确实需要跨重启保留的文件预留。
+- Worker Secrets 保存飞书凭证和 Workspace Agent 触发凭证。
+
+首次部署时，在仓库根目录执行以下命令创建资源（先执行 `npx wrangler login`）：
 
 ```bash
-npm install
-npx wrangler login
-npx wrangler secret put PYTHON_ORIGIN
-npx wrangler deploy
+npx wrangler d1 create feishu2agents-state
+npx wrangler queues create feishu2agents-agent-jobs
+npx wrangler r2 bucket create feishu2agents-avatars
 ```
 
-在输入 `PYTHON_ORIGIN` 时填写固定 Python 服务的 origin：
-`https://origin.bot.boooe.com`，不要带末尾 `/`，也不要填写
-`https://bot.boooe.com`。Worker 会把
-`POST /feishu/events` 映射到 Python 的 `/feishu/event`，其他 `/mcp`、`/oauth/*`、
-`/.well-known/*` 和 `/api/*` 路径原样转发。
+把 D1 命令输出的 `database_id` 写入 `wrangler.jsonc`，替换 `REPLACE_WITH_D1_DATABASE_ID`，然后执行：
 
-`https://bot.boooe.com` 是稳定的公网入口；`https://origin.bot.boooe.com` 是稳定的
-Python 后端入口。两者必须是两个不同的地址，否则 Worker 会递归代理自身。不要使用
-Quick Tunnel 生成的 `trycloudflare.com` 地址作为 `PYTHON_ORIGIN`，因为它不是永久地址。
+```bash
+npx wrangler d1 migrations apply feishu2agents-state --remote
+npm install
+uv run pywrangler deploy
+```
 
-部署完成后，用 Worker 的 `https://<worker-name>.<account>.workers.dev` 地址配置飞书
-“开发者服务器”事件 URL，并保留 `/feishu/events` 路径。先访问 `/health` 确认 Worker
-本身返回 `ok: true`，再让飞书发送 URL 验证请求；验证通过后才能接收
-`im.message.receive_v1`。如果使用 Cloudflare Dashboard 的 GitHub 部署，生产分支选择
-`main`，部署命令填写 `npx wrangler deploy`，不要再使用静态站点默认流程。
+再设置 Worker Secrets。下面的命令会逐项提示输入真实值，凭证不要提交到 Git：
+
+```bash
+npx wrangler secret put FEISHU_APP_ID
+npx wrangler secret put FEISHU_APP_SECRET
+npx wrangler secret put FEISHU_BOT_OPEN_ID
+npx wrangler secret put FEISHU_VERIFY_TOKEN
+npx wrangler secret put WORKSPACE_AGENT_RELAY_TRIGGER_URL
+npx wrangler secret put WORKSPACE_AGENT_RELAY_AGENT_TOKEN
+npx wrangler secret put WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN
+```
+
+`WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL` 可不设置，代码默认使用 `https://bot.boooe.com`。
+`WORKSPACE_AGENT_RELAY_TRIGGER_URL` 是已发布 Workspace Agent 的触发地址，不是 Python 服务地址。
+`FEISHU_BOT_OPEN_ID` 是机器人自身的 `open_id`；部署前通过飞书的
+`GET /open-apis/bot/v3/info` 查询一次并保存。Worker 不会在事件请求内临时查询它，
+这样 URL 验证和消息确认不会因冷启动或飞书 API 延迟超过 3 秒。
+
+飞书“开发者服务器”事件请求地址填写：
+
+```text
+https://bot.boooe.com/feishu/events
+```
+
+ChatGPT 连接器的 MCP 地址填写：
+
+```text
+https://bot.boooe.com/mcp
+```
+
+如果使用 Cloudflare 的 GitHub 自动部署，仓库根目录保持 `/`，生产分支使用 `main`，构建命令留空，部署命令填写 `uv run pywrangler deploy`。D1、Queue、R2 资源和 Worker Secrets 仍需在同一个 Cloudflare 账户中准备好。
 
 ## 测试
 

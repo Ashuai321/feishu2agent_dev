@@ -2,10 +2,11 @@
   "name": "feishu2agents-worker",
   "private": true,
   "version": "1.0.0",
-  "description": "Cloudflare Worker edge entrypoint for the Feishu2Agents Python service",
+  "description": "Cloudflare Python Worker for Feishu2Agents",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "dev": "uv run pywrangler dev",
+    "deploy": "uv run pywrangler deploy",
+    "d1:migrate": "wrangler d1 migrations apply feishu2agents-state --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260910.1",

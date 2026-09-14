@@ -1,10 +1,41 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "feishu2agents",
-  "main": "worker/src/index.ts",
+  "main": "cloudflare_worker/src/entry.py",
   "compatibility_date": "2026-09-11",
+  "compatibility_flags": ["python_workers"],
   "workers_dev": true,
   "observability": {
     "enabled": true
-  }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "feishu2agents-state",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "cloudflare_worker/migrations"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "AGENT_QUEUE",
+        "queue": "feishu2agents-agent-jobs"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "feishu2agents-agent-jobs",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3
+      }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "AVATARS",
+      "bucket_name": "feishu2agents-avatars"
+    }
+  ]
 }
