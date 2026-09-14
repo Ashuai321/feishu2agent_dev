@@ -218,6 +218,17 @@ def _safe_error(value: Any, secret: str = "") -> str:
     return text.replace(secret, "[REDACTED]") if secret else text
 
 
+def _is_non_card_update_error(value: Any) -> bool:
+    """Return whether Feishu rejected an update because the message is text.
+
+    Feishu's message update endpoint only accepts card messages.  The relay
+    placeholder is intentionally a normal text reply for compatibility, so a
+    completed Agent result must fall back to a new reply when this error is
+    returned instead of retrying the same impossible PATCH forever.
+    """
+    return "this message is not a card" in str(value or "").lower()
+
+
 class D1State:
     def __init__(self, db: Any) -> None:
         self.db = db
@@ -1305,8 +1316,21 @@ class CloudflareRelay:
         try:
             placeholder = str(run.get("placeholder_message_id") or "")
             if placeholder:
-                await self.feishu.update(placeholder, text)
-                outbound = placeholder
+                try:
+                    await self.feishu.update(placeholder, text)
+                    outbound = placeholder
+                except Exception as exc:
+                    if not _is_non_card_update_error(exc):
+                        raise
+                    # A plain-text Feishu message cannot be edited through the
+                    # update API.  Preserve the visible placeholder and post
+                    # the Agent result as a normal reply instead.
+                    print(
+                        "Feishu placeholder is not a card; falling back to a new reply"
+                    )
+                    outbound = await self.feishu.reply(
+                        str(run["source_message_id"]), text
+                    )
             else:
                 outbound = await self.feishu.reply(str(run["source_message_id"]), text)
             await _db_run(
