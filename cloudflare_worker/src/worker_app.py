@@ -513,6 +513,33 @@ class FeishuAPI:
             raise RuntimeError("Feishu create chat response returned no chat_id")
         return str(chat_id)
 
+    async def search_contacts(self, query: str) -> list[dict[str, Any]]:
+        """Search tenant-visible Feishu contacts by name, email, or mobile."""
+        payload = await self._request(
+            "POST",
+            "/open-apis/contact/v3/users/search",
+            json={"query": query},
+        )
+        users = payload.get("data", {}).get("users", [])
+        if not isinstance(users, list):
+            raise RuntimeError("Feishu contact search returned an invalid users list")
+        candidates: list[dict[str, Any]] = []
+        for user in users:
+            if not isinstance(user, dict):
+                continue
+            open_id = str(user.get("open_id") or "")
+            if not open_id:
+                continue
+            candidate: dict[str, Any] = {
+                "name": str(user.get("name") or ""),
+                "open_id": open_id,
+            }
+            for field in ("email", "enterprise_email", "mobile", "department_ids", "title"):
+                if user.get(field) is not None:
+                    candidate[field] = user[field]
+            candidates.append(candidate)
+        return candidates
+
     async def download_image(self, message_id: str, file_key: str) -> bytes:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(
@@ -1006,6 +1033,19 @@ class CloudflareRelay:
                 },
             },
             {
+                "name": "search_contacts",
+                "description": (
+                    "Search tenant-visible Feishu contacts by name, email, or mobile and "
+                    "return candidate names and open_ids. Show candidates and obtain "
+                    "explicit user confirmation before inviting anyone."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["conversation_key", "query"],
+                    "properties": {"conversation_key": string, "query": string},
+                },
+            },
+            {
                 "name": "get_group_status",
                 "description": "Read the created group mapping for a conversation.",
                 "inputSchema": {
@@ -1167,6 +1207,37 @@ class CloudflareRelay:
                     "conversation_key": conversation_key,
                     "chat_id": chat_id,
                     "user_open_id": row["open_id"],
+                }
+            )
+        if name == "search_contacts":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_query",
+                            "message": "contact search query is required",
+                        },
+                    },
+                    True,
+                )
+            try:
+                candidates = await self.feishu.search_contacts(query)
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "search_failed", "message": _safe_error(exc)},
+                    },
+                    True,
+                )
+            return self._tool_result(
+                {
+                    "success": True,
+                    "conversation_key": conversation_key,
+                    "query": query,
+                    "candidates": candidates,
                 }
             )
         if name == "get_group_status":

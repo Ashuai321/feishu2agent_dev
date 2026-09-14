@@ -249,3 +249,65 @@ def test_feishu_text_update_uses_put_message_edit_api():
             "json": {"msg_type": "text", "content": '{"text":"已完成"}'},
         },
     )
+
+
+def test_feishu_contact_search_uses_tenant_contact_search_api():
+    worker = _load_worker_module()
+
+    class FakeFeishu(worker.FeishuAPI):
+        def __init__(self):
+            super().__init__(SimpleNamespace())
+            self.call = None
+
+        async def _request(self, method, path, **kwargs):
+            self.call = (method, path, kwargs)
+            return {
+                "code": 0,
+                "data": {
+                    "users": [
+                        {
+                            "name": "张三",
+                            "open_id": "ou_z",
+                            "email": "z@example.com",
+                        }
+                    ]
+                },
+            }
+
+    api = FakeFeishu()
+    candidates = asyncio.run(api.search_contacts("张三"))
+
+    assert candidates == [{"name": "张三", "open_id": "ou_z", "email": "z@example.com"}]
+    assert api.call == (
+        "POST",
+        "/open-apis/contact/v3/users/search",
+        {"json": {"query": "张三"}},
+    )
+
+
+def test_cloudflare_mcp_exposes_and_dispatches_search_contacts():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+    class FakeFeishu:
+        async def search_contacts(self, query):
+            assert query == "张三"
+            return [{"name": "张三", "open_id": "ou_z"}]
+
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, FakeState())
+    relay.feishu = FakeFeishu()
+    names = {tool["name"] for tool in relay.tool_definitions()}
+    result = asyncio.run(
+        relay.call_tool(
+            "search_contacts",
+            {"conversation_key": "feishu:app:chat:1", "query": "张三"},
+        )
+    )
+
+    assert "search_contacts" in names
+    assert result["isError"] is False
+    assert result["structuredContent"]["candidates"] == [
+        {"name": "张三", "open_id": "ou_z"}
+    ]
