@@ -14,7 +14,7 @@ flowchart TD
     W --> D1[(D1 最小状态)]
     W --> Q[Cloudflare Queue]
     Q --> A[Workspace Agent Trigger]
-    A -->|MCP v3 回调| W
+    A -->|MCP prd 回调| W
     W --> API[Feishu API]
     W -.必要文件.-> R2[(R2)]
     API --> F

@@ -19,7 +19,7 @@ from workers import Response, WorkerEntrypoint
 PUBLIC_BASE_URL = "https://bot.boooe.com"
 MCP_PATH = "/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-MCP_NAME = "workspace-agent-relay-mcp-v3"
+MCP_NAME = "workspace-agent-relay-mcp-prd"
 PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
 
@@ -578,7 +578,7 @@ def _conversation_input(
         "",
         "Completion contract:",
         "The local operator cannot see ChatGPT-side work except through this relay.",
-        "Use workspace-agent-relay-mcp-v3.record_plan, record_progress, and record_result.",
+        "Use workspace-agent-relay-mcp-prd.record_plan, record_progress, and record_result.",
         "Call record_result exactly once when the turn is complete.",
     ]
     if working_directory:
@@ -821,7 +821,7 @@ class CloudflareRelay:
                     "serverInfo": {"name": MCP_NAME, "version": "3.0.0"},
                     "instructions": (
                         "Use record_plan, record_progress and record_result for every relay turn. "
-                        "The relay name is workspace-agent-relay-mcp-v3."
+                        "The relay name is workspace-agent-relay-mcp-prd."
                     ),
                 }
             elif method == "ping":
