@@ -82,29 +82,27 @@ def test_worker_keeps_image_key_for_queued_r2_storage():
     assert "必要文件" in event["text"]
 
 
-def test_worker_accepts_a_reply_to_a_bot_message_without_a_new_mention():
+def test_worker_requires_an_mention_even_when_replying_to_a_bot_message():
     worker = _load_worker_module()
     event = worker._normalize_event(
         _event("text", {"text": "继续刚才的问题"}, text_mention=False, parent_id="om_bot_card"),
         "ou_bot",
     )
 
-    assert event is not None
-    assert event["text"] == "继续刚才的问题"
-    assert event["parent_id"] == "om_bot_card"
-    assert event["mentioned_bot"] is False
+    assert event is None
 
 
-def test_worker_passes_parent_for_handler_to_validate():
+def test_worker_keeps_parent_for_an_mentioned_reply():
     worker = _load_worker_module()
 
     event = worker._normalize_event(
-        _event("text", {"text": "普通群聊回复"}, text_mention=False, parent_id="om_user"),
+        _event("text", {"text": "继续刚才的问题"}, text_mention=True, parent_id="om_bot_card"),
         "ou_bot",
     )
 
     assert event is not None
-    assert event["mentioned_bot"] is False
+    assert event["parent_id"] == "om_bot_card"
+    assert event["mentioned_bot"] is True
 
 
 def test_agent_input_uses_text_relay_envelope():
