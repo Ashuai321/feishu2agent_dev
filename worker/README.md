@@ -20,12 +20,28 @@ group workflow logic.
 Add a Worker secret named `PYTHON_ORIGIN` containing the absolute public origin
 of the Python service, without a trailing slash. Do not use `127.0.0.1` or
 `localhost`; a Cloudflare Worker cannot reach the developer machine directly.
+Do not set it to the Worker public origin (`https://bot.boooe.com`) either:
+that would make the Worker proxy to itself.
 
 Example:
 
 ```text
-PYTHON_ORIGIN=https://your-python-origin.example.com
+PYTHON_ORIGIN=https://origin.bot.boooe.com
 ```
 
 The origin must be reachable from the public Internet and must keep the Python
 service running with `FEISHU_EVENT_MODE=webhook`.
+
+`origin.bot.boooe.com` is intended to be a permanent backend hostname. It must
+resolve to the independent Python deployment (for example, a VPS or a managed
+container service) before the Worker secret is changed. A Quick Tunnel URL is
+not suitable here because it changes or disappears when the tunnel process
+stops.
+
+The public addresses remain stable and separate:
+
+```text
+Feishu event URL: https://bot.boooe.com/feishu/events
+MCP URL:          https://bot.boooe.com/mcp
+Python origin:    https://origin.bot.boooe.com
+```
