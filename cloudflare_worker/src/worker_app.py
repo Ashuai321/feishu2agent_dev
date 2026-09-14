@@ -24,6 +24,35 @@ PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
 
 
+def _image_upload_metadata(data: bytes) -> tuple[str, str]:
+    """Return a filename and MIME type matching the actual image bytes.
+
+    Feishu validates the multipart metadata against the image data. Sending
+    PNG bytes as ``avatar.jpg``/``image/jpeg`` produces a 400 parameter error.
+    """
+    signatures: tuple[tuple[bytes, str, str], ...] = (
+        (b"\x89PNG\r\n\x1a\n", "avatar.png", "image/png"),
+        (b"GIF87a", "avatar.gif", "image/gif"),
+        (b"GIF89a", "avatar.gif", "image/gif"),
+        (b"BM", "avatar.bmp", "image/bmp"),
+    )
+    for signature, filename, content_type in signatures:
+        if data.startswith(signature):
+            return filename, content_type
+    if data.startswith(b"\xff\xd8\xff"):
+        return "avatar.jpg", "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "avatar.webp", "image/webp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return "avatar.tiff", "image/tiff"
+    if data.startswith(b"\x00\x00\x01\x00"):
+        return "avatar.ico", "image/x-icon"
+    raise RuntimeError(
+        "avatar image format is unsupported or cannot be detected; "
+        "send a JPEG, PNG, WEBP, GIF, TIFF, BMP, or ICO image"
+    )
+
+
 _GROUP_UPDATE_ENUMS: dict[str, set[str]] = {
     "add_member_permission": {"all_members", "only_owner"},
     "share_card_permission": {"allowed", "not_allowed"},
@@ -674,12 +703,13 @@ class FeishuAPI:
             raise RuntimeError("cannot upload an empty avatar image")
         if len(data) > 10 * 1024 * 1024:
             raise RuntimeError("avatar image exceeds Feishu's 10MB limit")
+        filename, content_type = _image_upload_metadata(data)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 f"{self.base}/open-apis/im/v1/images",
                 headers={"Authorization": f"Bearer {await self._tenant_token()}"},
                 data={"image_type": "avatar"},
-                files={"image": ("avatar.jpg", data, "image/jpeg")},
+                files={"image": (filename, data, content_type)},
             )
         try:
             payload = response.json()
@@ -689,7 +719,7 @@ class FeishuAPI:
             message = payload.get("msg") or payload.get("message") or response.text
             raise RuntimeError(
                 f"Feishu API /open-apis/im/v1/images failed "
-                f"({response.status_code}): {message}"
+                f"({response.status_code}, code={payload.get('code', 'unknown')}): {message}"
             )
         image_key = str((payload.get("data") or {}).get("image_key") or "")
         if not image_key:

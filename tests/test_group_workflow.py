@@ -216,10 +216,19 @@ def test_download_message_image_returns_bytes() -> None:
 def test_upload_avatar_image_returns_image_key() -> None:
     resp = _success_response(json.dumps({"data": {"image_key": "im_avatar"}}).encode())
     bot = _bot(_FakeApiClient(request_response=resp))
-    key = bot.upload_avatar_image(b"imgbytes")
+    key = bot.upload_avatar_image(b"\xff\xd8\xffimgbytes")
     assert key == "im_avatar"
     req = bot._api_client.last_request
     assert req.headers.get("Content-Type", "").startswith("multipart/form-data")
+
+
+def test_upload_avatar_image_preserves_png_mime_and_filename() -> None:
+    from feishu2agents.feishu import _image_upload_metadata
+
+    assert _image_upload_metadata(b"\x89PNG\r\n\x1a\nimage") == (
+        "avatar.png",
+        "image/png",
+    )
 
 
 def test_update_chat_sends_put() -> None:

@@ -36,6 +36,30 @@ class FeishuApiError(RuntimeError):
     """A sanitized failure returned by a Feishu API."""
 
 
+def _image_upload_metadata(data: bytes) -> tuple[str, str]:
+    """Return a filename and MIME type matching the actual image bytes."""
+    signatures: tuple[tuple[bytes, str, str], ...] = (
+        (b"\x89PNG\r\n\x1a\n", "avatar.png", "image/png"),
+        (b"GIF87a", "avatar.gif", "image/gif"),
+        (b"GIF89a", "avatar.gif", "image/gif"),
+        (b"BM", "avatar.bmp", "image/bmp"),
+    )
+    for signature, filename, content_type in signatures:
+        if data.startswith(signature):
+            return filename, content_type
+    if data.startswith(b"\xff\xd8\xff"):
+        return "avatar.jpg", "image/jpeg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "avatar.webp", "image/webp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return "avatar.tiff", "image/tiff"
+    if data.startswith(b"\x00\x00\x01\x00"):
+        return "avatar.ico", "image/x-icon"
+    raise FeishuApiError(
+        "upload avatar image failed: image format is unsupported or cannot be detected"
+    )
+
+
 class FeishuBot:
     def __init__(
         self,
@@ -327,11 +351,14 @@ class FeishuBot:
 
     def upload_avatar_image(self, data: bytes) -> str:
         """Upload an avatar image and return its image_key. ≤10MB enforced."""
+        if not data:
+            raise FeishuApiError("upload avatar image failed: image is empty")
         if len(data) > 10 * 1024 * 1024:
             raise FeishuApiError("upload avatar image failed: image exceeds the 10MB limit")
+        filename, content_type = _image_upload_metadata(data)
         fields = {
             "image_type": "avatar",
-            "image": ("avatar.jpg", data, "image/jpeg"),
+            "image": (filename, data, content_type),
         }
         encoder = MultipartEncoder(fields=fields)
         request = (

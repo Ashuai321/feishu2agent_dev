@@ -82,6 +82,19 @@ def test_worker_keeps_image_key_for_queued_r2_storage():
     assert "必要文件" in event["text"]
 
 
+def test_worker_detects_actual_image_format_for_avatar_upload():
+    worker = _load_worker_module()
+
+    assert worker._image_upload_metadata(b"\x89PNG\r\n\x1a\nbytes") == (
+        "avatar.png",
+        "image/png",
+    )
+    assert worker._image_upload_metadata(b"\xff\xd8\xffbytes") == (
+        "avatar.jpg",
+        "image/jpeg",
+    )
+
+
 def test_worker_parses_caption_and_image_post_message():
     worker = _load_worker_module()
     content = {
