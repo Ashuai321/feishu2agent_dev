@@ -602,24 +602,42 @@ def _conversation_input(
     continuation: bool,
     working_directory: str = "",
 ) -> str:
-    # The Workspace Agent trigger endpoint accepts ``input`` as a string, but
-    # the Agent's relay contract expects that string to contain a JSON object
-    # whose protocol fields are at the top level.  Sending a Markdown header
-    # here makes the Agent treat every webhook as an ordinary ChatGPT prompt,
-    # so it never calls record_result and Feishu remains stuck on the
-    # placeholder message.  Keep the transport string JSON-encoded while
-    # preserving the original user text as the untrusted ``user_input`` field.
-    payload: dict[str, Any] = {
-        "request_id": request_id,
-        "conversation_key": conversation_key,
-        "relay_mcp": MCP_NAME,
-        "protocol": "local-agent-shell/v1",
-        "turn_mode": "continuation" if continuation else "initial",
-        "user_input": text,
-    }
+    # The trigger API accepts ``input`` as a string. The Agent's protocol
+    # parser expects the established text envelope: protocol header,
+    # completion contract, and then the untrusted user task. A JSON string is
+    # displayed as an ordinary chat prompt and does not enter Relay mode.
+    turn_mode = "continuation" if continuation else "initial"
+    header = [
+        f"request_id: {request_id}",
+        f"conversation_key: {conversation_key}",
+        f"relay_mcp: {MCP_NAME}",
+        "protocol: local-agent-shell/v1",
+        f"turn_mode: {turn_mode}",
+    ]
     if working_directory:
-        payload["working_directory"] = working_directory
-    return _json(payload)
+        header.append(f"working_directory: {working_directory.strip()}")
+    if continuation:
+        body = [
+            "Same relay protocol as before: record_plan → record_progress(step_updates) → record_result, using the request_id above.",
+            "Keep record_plan user-visible. If the relay tool is unavailable, still call record_progress/record_result so the operator is informed.",
+            "",
+            "User task:",
+            text.strip(),
+        ]
+    else:
+        body = [
+            "Completion contract:",
+            "The local operator CANNOT see your ChatGPT-side plan, tool calls, or reasoning. This relay is their only view of your work.",
+            "This trigger starts ONE turn (one request_id scope). If the user corrects your direction mid-turn, revise the plan and do not use record_result to signal a plan change.",
+            "After reading the user task, call update_conversation_title once for a new conversation, then record_plan with a user-visible step plan.",
+            "After completing several steps, call record_progress with step_updates.",
+            "Call record_result exactly once when this turn is truly over: status=done when delivered, status=failed on an execution error, status=blocked only for an external hard blocker.",
+            "Do not only answer in the ChatGPT conversation.",
+            "",
+            "User task:",
+            text.strip(),
+        ]
+    return "\n".join([*header, "", *body])
 
 
 class CloudflareRelay:
