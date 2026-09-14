@@ -133,7 +133,7 @@ def test_result_delivery_falls_back_when_placeholder_is_plain_text():
         def __init__(self):
             self.replies = []
 
-        async def update(self, message_id, text):
+        async def update_card(self, message_id, text):
             raise RuntimeError(
                 "Feishu API failed (400): Your request contains an invalid request parameter, "
                 "ext=This message is NOT a card."
@@ -155,3 +155,56 @@ def test_result_delivery_falls_back_when_placeholder_is_plain_text():
 
     assert relay.feishu.replies == [("om_source", "完成\n结果正文")]
     assert state.saved == ("om_result", "feishu:app:chat:x")
+
+
+def test_result_delivery_updates_the_editable_card_in_place():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "source_message_id": "om_source",
+                "placeholder_message_id": "om_card",
+                "status": "done",
+                "title": "完成",
+                "markdown": "结果正文",
+                "delivered": 0,
+                "conversation_key": "feishu:app:chat:x",
+            }
+
+        async def save_reply(self, outbound_id, conversation_key):
+            self.saved = (outbound_id, conversation_key)
+
+    class FakeFeishu:
+        def __init__(self):
+            self.updates = []
+
+        async def update_card(self, message_id, text):
+            self.updates.append((message_id, text))
+
+    async def noop_db_run(*args, **kwargs):
+        return None
+
+    worker._db_run = noop_db_run
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = FakeFeishu()
+
+    asyncio.run(relay.deliver_result("req_1"))
+
+    assert relay.feishu.updates == [("om_card", "完成\n结果正文")]
+    assert state.saved == ("om_card", "feishu:app:chat:x")
+
+
+def test_feishu_card_content_is_editable_interactive_payload():
+    worker = _load_worker_module()
+
+    payload = json.loads(worker.FeishuAPI._card_content("正在处理"))
+
+    assert payload["config"]["wide_screen_mode"] is True
+    assert payload["elements"] == [
+        {"tag": "div", "text": {"tag": "lark_md", "content": "正在处理"}}
+    ]
