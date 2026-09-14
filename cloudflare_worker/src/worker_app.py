@@ -513,6 +513,34 @@ class FeishuAPI:
             raise RuntimeError("Feishu create chat response returned no chat_id")
         return str(chat_id)
 
+    async def create_group(self, name: str, open_ids: list[str]) -> str:
+        """Create a Feishu group with the explicitly supplied members.
+
+        The app identity is automatically added by Feishu as the group bot.
+        ``open_ids`` must therefore contain the requester and every member the
+        user has explicitly confirmed.
+        """
+        group_name = str(name or "").strip()
+        members = [str(open_id).strip() for open_id in open_ids if str(open_id).strip()]
+        if not group_name:
+            raise RuntimeError("group name is required")
+        if not members:
+            raise RuntimeError("at least one group member open_id is required")
+        payload = await self._request(
+            "POST",
+            "/open-apis/im/v1/chats",
+            params={"user_id_type": "open_id"},
+            json={
+                "name": group_name,
+                "chat_mode": "group",
+                "user_id_list": members,
+            },
+        )
+        chat_id = payload.get("data", {}).get("chat_id")
+        if not chat_id:
+            raise RuntimeError("Feishu create group response returned no chat_id")
+        return str(chat_id)
+
     async def search_contacts(self, query: str) -> list[dict[str, Any]]:
         """Resolve Feishu contacts from a mobile number or email address.
 
@@ -1066,6 +1094,24 @@ class CloudflareRelay:
                 },
             },
             {
+                "name": "create_group",
+                "description": (
+                    "Create a Feishu group containing the requester and the explicitly "
+                    "confirmed member_open_ids. Call search_contacts first, show the "
+                    "candidate(s), and wait for explicit confirmation before this write "
+                    "operation. Returns the new chat_id."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["conversation_key", "name", "member_open_ids"],
+                    "properties": {
+                        "conversation_key": string,
+                        "name": string,
+                        "member_open_ids": {"type": "array", "items": string},
+                    },
+                },
+            },
+            {
                 "name": "get_group_status",
                 "description": "Read the created group mapping for a conversation.",
                 "inputSchema": {
@@ -1258,6 +1304,75 @@ class CloudflareRelay:
                     "conversation_key": conversation_key,
                     "query": query,
                     "candidates": candidates,
+                }
+            )
+        if name == "create_group":
+            group_name = str(args.get("name") or "").strip()
+            raw_members = args.get("member_open_ids")
+            if not group_name:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "invalid_name", "message": "group name is required"},
+                    },
+                    True,
+                )
+            if not isinstance(raw_members, list):
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_members",
+                            "message": "member_open_ids must be an array",
+                        },
+                    },
+                    True,
+                )
+            row = await self.state.requester(conversation_key)
+            if not row or not row.get("open_id"):
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "requester_not_found",
+                            "message": "requester open_id unavailable",
+                        },
+                    },
+                    True,
+                )
+            members: list[str] = []
+            for open_id in [row["open_id"], *raw_members]:
+                value = str(open_id or "").strip()
+                if value and value not in members:
+                    members.append(value)
+            if not members:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_members",
+                            "message": "at least one member open_id is required",
+                        },
+                    },
+                    True,
+                )
+            try:
+                chat_id = await self.feishu.create_group(group_name, members)
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "create_failed", "message": _safe_error(exc)},
+                    },
+                    True,
+                )
+            await self.state.bind_group(conversation_key, chat_id)
+            return self._tool_result(
+                {
+                    "success": True,
+                    "conversation_key": conversation_key,
+                    "chat_id": chat_id,
+                    "member_open_ids": members,
                 }
             )
         if name == "get_group_status":

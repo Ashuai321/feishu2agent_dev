@@ -287,6 +287,36 @@ def test_feishu_contact_search_uses_tenant_contact_search_api():
     )
 
 
+def test_feishu_create_group_uses_tenant_chat_api():
+    worker = _load_worker_module()
+
+    class FakeFeishu(worker.FeishuAPI):
+        def __init__(self):
+            super().__init__(SimpleNamespace())
+            self.call = None
+
+        async def _request(self, method, path, **kwargs):
+            self.call = (method, path, kwargs)
+            return {"code": 0, "data": {"chat_id": "oc_group"}}
+
+    api = FakeFeishu()
+    chat_id = asyncio.run(api.create_group("项目群", ["ou_requester", "ou_member"]))
+
+    assert chat_id == "oc_group"
+    assert api.call == (
+        "POST",
+        "/open-apis/im/v1/chats",
+        {
+            "params": {"user_id_type": "open_id"},
+            "json": {
+                "name": "项目群",
+                "chat_mode": "group",
+                "user_id_list": ["ou_requester", "ou_member"],
+            },
+        },
+    )
+
+
 def test_cloudflare_mcp_exposes_and_dispatches_search_contacts():
     worker = _load_worker_module()
 
@@ -313,3 +343,55 @@ def test_cloudflare_mcp_exposes_and_dispatches_search_contacts():
     assert result["structuredContent"]["candidates"] == [
         {"name": "张三", "open_id": "ou_z"}
     ]
+
+
+def test_cloudflare_mcp_exposes_and_dispatches_create_group():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+        def __init__(self):
+            self.bound = None
+
+        async def requester(self, conversation_key):
+            assert conversation_key == "feishu:app:chat:1"
+            return {"open_id": "ou_requester"}
+
+        async def bind_group(self, conversation_key, chat_id):
+            self.bound = (conversation_key, chat_id)
+
+    class FakeFeishu:
+        def __init__(self):
+            self.call = None
+
+        async def create_group(self, name, member_open_ids):
+            self.call = (name, member_open_ids)
+            return "oc_group"
+
+    state = FakeState()
+    feishu = FakeFeishu()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = feishu
+    names = {tool["name"] for tool in relay.tool_definitions()}
+    result = asyncio.run(
+        relay.call_tool(
+            "create_group",
+            {
+                "conversation_key": "feishu:app:chat:1",
+                "name": "项目群",
+                "member_open_ids": ["ou_member", "ou_requester", ""],
+            },
+        )
+    )
+
+    assert "create_group" in names
+    assert result["isError"] is False
+    assert result["structuredContent"] == {
+        "success": True,
+        "conversation_key": "feishu:app:chat:1",
+        "chat_id": "oc_group",
+        "member_open_ids": ["ou_requester", "ou_member"],
+    }
+    assert feishu.call == ("项目群", ["ou_requester", "ou_member"])
+    assert state.bound == ("feishu:app:chat:1", "oc_group")
