@@ -117,8 +117,10 @@ python -m feishu2agents.main
 `wrangler.jsonc` 已将它配置为部署入口。Worker 负责固定公网地址和边缘转发，
 Python 服务继续负责飞书 Webhook、Relay/MCP、OAuth、存储和建群业务；这样不会改变现有飞书业务逻辑。
 
-先让 Python 服务以 Webhook 模式运行，并确保它有一个公网可访问的 origin（不能是
-`127.0.0.1` 或 `localhost`）。然后在仓库根目录执行：
+先让 Python 服务以 Webhook 模式运行，并部署到一个独立、固定的公网域名（不能是
+`127.0.0.1`、`localhost` 或当前 Worker 的 `https://bot.boooe.com`）。本项目约定的
+永久后端域名是 `https://origin.bot.boooe.com`；它必须先解析到正在运行的 Python
+服务，再配置 Worker。然后在仓库根目录执行：
 
 ```bash
 npm install
@@ -127,10 +129,15 @@ npx wrangler secret put PYTHON_ORIGIN
 npx wrangler deploy
 ```
 
-在输入 `PYTHON_ORIGIN` 时只填写 Python 服务的 origin，例如
-`https://your-python-origin.example.com`，不要带末尾 `/`。Worker 会把
+在输入 `PYTHON_ORIGIN` 时填写固定 Python 服务的 origin：
+`https://origin.bot.boooe.com`，不要带末尾 `/`，也不要填写
+`https://bot.boooe.com`。Worker 会把
 `POST /feishu/events` 映射到 Python 的 `/feishu/event`，其他 `/mcp`、`/oauth/*`、
 `/.well-known/*` 和 `/api/*` 路径原样转发。
+
+`https://bot.boooe.com` 是稳定的公网入口；`https://origin.bot.boooe.com` 是稳定的
+Python 后端入口。两者必须是两个不同的地址，否则 Worker 会递归代理自身。不要使用
+Quick Tunnel 生成的 `trycloudflare.com` 地址作为 `PYTHON_ORIGIN`，因为它不是永久地址。
 
 部署完成后，用 Worker 的 `https://<worker-name>.<account>.workers.dev` 地址配置飞书
 “开发者服务器”事件 URL，并保留 `/feishu/events` 路径。先访问 `/health` 确认 Worker

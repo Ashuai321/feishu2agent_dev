@@ -112,6 +112,21 @@ export default {
       );
     }
 
+    // The Worker is the public edge entrypoint. Pointing PYTHON_ORIGIN back at
+    // this same origin would make the Worker fetch itself recursively instead
+    // of reaching the Python service. Fail early with a configuration error so
+    // this cannot become an opaque 530/504 loop in production.
+    if (target.origin === url.origin) {
+      return json(
+        {
+          ok: false,
+          error:
+            "PYTHON_ORIGIN must be a separate Python service origin; it cannot be the Worker public origin",
+        },
+        500,
+      );
+    }
+
     try {
       return await fetch(forwardedRequest(request, target));
     } catch (error) {
