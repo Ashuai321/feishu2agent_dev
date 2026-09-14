@@ -114,6 +114,29 @@ def _native(value: Any) -> Any:
     return value
 
 
+def _queue_payload(value: Any) -> dict[str, Any] | None:
+    """Normalize a Queue message body across Python Workers runtimes.
+
+    Depending on the Workers runtime version, a JSON body sent by ``queue.send``
+    can arrive as a normal mapping, a JsProxy, or an encoded JSON string/bytes.
+    Treating the latter as a non-dict silently acknowledges the message and
+    leaves its D1 run permanently queued, so decode all supported forms here.
+    """
+    value = _native(value)
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    value = _native(value)
+    return value if isinstance(value, dict) else None
+
+
 def _env(env: Any, name: str, default: str = "") -> str:
     value = getattr(env, name, default)
     return str(_native(value) or default).strip()
@@ -1403,16 +1426,32 @@ class Default(WorkerEntrypoint):
         state = D1State(env.DB)
         relay = CloudflareRelay(env, ctx, state)
         for message in batch.messages:
+            request_id = ""
             try:
-                body = _native(message.body)
-                if not isinstance(body, dict):
+                body = _queue_payload(message.body)
+                if body is None:
+                    print("Queue message ignored: body is not a JSON object")
                     message.ack()
                     continue
+                request_id = str(body.get("request_id") or "")
                 if body.get("kind") == "deliver_result":
-                    await relay.deliver_result(str(body.get("request_id") or ""))
+                    await relay.deliver_result(request_id)
                 else:
                     await relay.run_agent_job(body)
                 message.ack()
             except Exception as exc:
-                print(f"Queue job failed: {_safe_error(exc)}")
+                error = _safe_error(exc, _env(env, "WORKSPACE_AGENT_RELAY_AGENT_TOKEN"))
+                # Keep the run inspectable if an exception escapes the job
+                # handler itself.  run_agent_job already records its own
+                # failures; this covers queue/runtime errors around it.
+                if request_id:
+                    try:
+                        await state.update_run(
+                            request_id,
+                            trigger_status=0,
+                            trigger_error=f"queue consumer: {error}",
+                        )
+                    except Exception as db_exc:
+                        print(f"Queue diagnostic write failed: {_safe_error(db_exc)}")
+                print(f"Queue job failed: {error}")
                 message.retry()
