@@ -27,6 +27,8 @@ def should_process(context: MessageContext) -> bool:
     if context.message_type == "text":
         return bool(context.text)
     if context.message_type == "image":
-        # 图片必须作为“引用回复”才有语境；无引用直接 @ 发的图片无法归属对话。
-        return bool(context.reply_to_message_id) and bool(context.image_keys)
+        # 图片消息可直接 @ 开启新会话，也可在引用回复中继续已有会话。
+        return bool(context.image_keys)
+    if context.message_type == "post":
+        return bool(context.image_keys) or bool(context.text)
     return False

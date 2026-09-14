@@ -51,7 +51,7 @@ class MessageContext:
     bot_app_id: str
     # 该消息"引用/回复"的目标消息 id（飞书 parent_id）。非回复消息为 None。
     reply_to_message_id: str | None = None
-    # image 消息 content 里的 image_key 列表。非 image 消息为空元组。
+    # image/post 消息 content 里的 image_key 列表。其他消息为空元组。
     image_keys: tuple[str, ...] = ()
 
     @property
@@ -97,6 +97,58 @@ def _clean_bot_mentions(text: str, mentions: tuple[Mention, ...]) -> str:
     return text.strip()
 
 
+def _message_parts(message_type: str, content: Any) -> tuple[str, tuple[str, ...]]:
+    """Extract text and image keys from Feishu text/image/post payloads."""
+    try:
+        decoded = json.loads(content) if isinstance(content, str) else content
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MessageNormalizationError("Invalid JSON in message content") from exc
+    if not isinstance(decoded, dict):
+        raise MessageNormalizationError("Message content must be an object")
+    if message_type == "text":
+        text = decoded.get("text", "")
+        if not isinstance(text, str):
+            raise MessageNormalizationError(
+                "Text message content does not contain a string text field"
+            )
+        return text, ()
+    if message_type == "image":
+        image_key = decoded.get("image_key")
+        return "", (image_key,) if isinstance(image_key, str) and image_key else ()
+    if message_type != "post":
+        return "", ()
+
+    # A caption plus an image is delivered as a localized rich-text post.
+    payload: dict[str, Any] = decoded
+    for value in decoded.values():
+        if isinstance(value, dict) and isinstance(value.get("content"), list):
+            payload = value
+            break
+    text_parts: list[str] = []
+    image_keys: list[str] = []
+    title = payload.get("title")
+    if isinstance(title, str) and title.strip():
+        text_parts.append(title)
+    rows = payload.get("content")
+    if not isinstance(rows, list):
+        return "", ()
+    for row in rows:
+        elements = row if isinstance(row, list) else [row]
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            tag = str(element.get("tag") or "")
+            if tag in {"text", "a", "at"}:
+                value = element.get("text") or element.get("user_name") or ""
+                if isinstance(value, str):
+                    text_parts.append(value)
+            elif tag == "img":
+                image_key = element.get("image_key")
+                if isinstance(image_key, str) and image_key:
+                    image_keys.append(image_key)
+    return "".join(text_parts), tuple(image_keys)
+
+
 def normalize_message_event(
     event: Any,
     *,
@@ -119,31 +171,7 @@ def normalize_message_event(
         raise MessageNormalizationError("Missing required event field(s): " + ", ".join(missing))
 
     message_type = _get(message, "message_type", "unknown") or "unknown"
-    text = ""
-    image_keys: tuple[str, ...] = ()
-    if message_type == "text":
-        content = _get(message, "content", "")
-        try:
-            decoded = json.loads(content)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise MessageNormalizationError("Invalid JSON in message content") from exc
-        if not isinstance(decoded, dict) or not isinstance(decoded.get("text", ""), str):
-            raise MessageNormalizationError(
-                "Text message content does not contain a string text field"
-            )
-        text = decoded.get("text", "")
-    elif message_type == "image":
-        content = _get(message, "content", "")
-        keys: list[str] = []
-        try:
-            decoded = json.loads(content) if isinstance(content, str) else content
-        except (TypeError, json.JSONDecodeError):
-            decoded = {}
-        if isinstance(decoded, dict):
-            image_key = decoded.get("image_key")
-            if isinstance(image_key, str) and image_key:
-                keys.append(image_key)
-        image_keys = tuple(keys)
+    text, image_keys = _message_parts(message_type, _get(message, "content", ""))
 
     normalized_mentions: list[Mention] = []
     for raw_mention in _get(message, "mentions", []) or []:

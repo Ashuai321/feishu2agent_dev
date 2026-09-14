@@ -103,8 +103,31 @@ def test_image_quote_reply_is_processed() -> None:
     assert should_process(image_context()) is True
 
 
-def test_image_without_quote_is_ignored() -> None:
-    assert should_process(image_context(reply_to=None)) is False
+def test_image_without_quote_starts_a_new_mentioned_conversation() -> None:
+    assert should_process(image_context(reply_to=None)) is True
+
+
+def test_caption_and_image_post_is_processed() -> None:
+    event = make_image_event()
+    event["event"]["message"]["message_type"] = "post"
+    event["event"]["message"]["content"] = json.dumps(
+        {
+            "zh_cn": {
+                "title": "",
+                "content": [
+                    [
+                        {"tag": "text", "text": "@_user_1 将群头像改成这个："},
+                        {"tag": "img", "image_key": "img_v3_rocket"},
+                    ]
+                ],
+            }
+        }
+    )
+    context = normalize_message_event(event, bot_app_id="cli_test", bot_open_id="ou_bot")
+
+    assert context.text == "将群头像改成这个："
+    assert context.image_keys == ("img_v3_rocket",)
+    assert should_process(context) is True
 
 
 # --- GroupDraftStore ---

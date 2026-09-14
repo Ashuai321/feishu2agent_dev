@@ -82,6 +82,26 @@ def test_worker_keeps_image_key_for_queued_r2_storage():
     assert "必要文件" in event["text"]
 
 
+def test_worker_parses_caption_and_image_post_message():
+    worker = _load_worker_module()
+    content = {
+        "zh_cn": {
+            "title": "",
+            "content": [
+                [
+                    {"tag": "text", "text": "@_user_bot 将群头像改成这个："},
+                    {"tag": "img", "image_key": "img_v3_rocket"},
+                ]
+            ],
+        }
+    }
+    event = worker._normalize_event(_event("post", content), "ou_bot")
+
+    assert event is not None
+    assert event["text"].startswith("将群头像改成这个")
+    assert event["image_keys"] == ["img_v3_rocket"]
+
+
 def test_worker_requires_an_mention_even_when_replying_to_a_bot_message():
     worker = _load_worker_module()
     event = worker._normalize_event(
@@ -468,6 +488,52 @@ def test_cloudflare_mcp_dispatches_update_group():
             "share_card_permission": "not_allowed",
         },
     )
+
+
+def test_cloudflare_mcp_updates_group_avatar_from_latest_image_without_r2():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+        async def requester(self, conversation_key):
+            return {"group_chat_id": "oc_persisted"}
+
+        async def latest_image_run(self, conversation_key):
+            return {
+                "source_message_id": "om_image",
+                "image_keys": ["img_v3_rocket"],
+            }
+
+    class FakeFeishu:
+        async def download_image(self, message_id, image_key):
+            assert (message_id, image_key) == ("om_image", "img_v3_rocket")
+            return b"image-bytes"
+
+        async def upload_avatar_image(self, data):
+            assert data == b"image-bytes"
+            return "img_avatar"
+
+        async def update_chat(self, chat_id, changes):
+            self.call = (chat_id, changes)
+
+    state = FakeState()
+    feishu = FakeFeishu()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = feishu
+    result = asyncio.run(
+        relay.call_tool(
+            "update_group",
+            {
+                "conversation_key": "feishu:app:chat:1",
+                "set_avatar_from_stored": True,
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["updated_fields"] == ["avatar_image_key"]
+    assert feishu.call == ("oc_persisted", {"avatar_image_key": "img_avatar"})
 
 
 def test_cloudflare_mcp_exposes_and_dispatches_create_group():

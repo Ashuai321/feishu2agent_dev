@@ -475,6 +475,32 @@ class D1State:
         )
         return row is not None
 
+    async def latest_image_run(self, conversation_key: str) -> dict[str, Any] | None:
+        """Return the newest relay run that contains a Feishu image key.
+
+        R2 is optional on the free Worker deployment.  Keeping the original
+        message id and image key in D1 lets the group-avatar operation fetch
+        the image directly from Feishu later, so an image request is still
+        actionable when no R2 binding is present.
+        """
+        row = await _db_first(
+            self.db,
+            "SELECT request_id, source_message_id, image_keys_json, created_at "
+            "FROM relay_runs WHERE conversation_key = ? "
+            "AND image_keys_json != '[]' ORDER BY created_at DESC LIMIT 1",
+            conversation_key,
+        )
+        if not row:
+            return None
+        try:
+            image_keys = json.loads(row.get("image_keys_json") or "[]")
+        except (TypeError, json.JSONDecodeError):
+            image_keys = []
+        if not isinstance(image_keys, list):
+            image_keys = []
+        row["image_keys"] = [str(value) for value in image_keys if str(value)]
+        return row if row["image_keys"] else None
+
     async def save_avatar(self, conversation_key: str, object_key: str, size: int) -> None:
         await _db_run(
             self.db,
@@ -642,6 +668,34 @@ class FeishuAPI:
             json=body,
         )
 
+    async def upload_avatar_image(self, data: bytes) -> str:
+        """Upload image bytes to Feishu and return the avatar image_key."""
+        if not data:
+            raise RuntimeError("cannot upload an empty avatar image")
+        if len(data) > 10 * 1024 * 1024:
+            raise RuntimeError("avatar image exceeds Feishu's 10MB limit")
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.base}/open-apis/im/v1/images",
+                headers={"Authorization": f"Bearer {await self._tenant_token()}"},
+                data={"image_type": "avatar"},
+                files={"image": ("avatar.jpg", data, "image/jpeg")},
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if response.status_code >= 400 or payload.get("code", 0) != 0:
+            message = payload.get("msg") or payload.get("message") or response.text
+            raise RuntimeError(
+                f"Feishu API /open-apis/im/v1/images failed "
+                f"({response.status_code}): {message}"
+            )
+        image_key = str((payload.get("data") or {}).get("image_key") or "")
+        if not image_key:
+            raise RuntimeError("Feishu avatar upload returned no image_key")
+        return image_key
+
     async def search_contacts(self, query: str) -> list[dict[str, Any]]:
         """Resolve Feishu contacts from a mobile number or email address.
 
@@ -699,6 +753,60 @@ class FeishuAPI:
         return response.content
 
 
+def _message_parts(message_type: str, content: Any) -> tuple[str, list[str]] | None:
+    """Extract text and image keys from text, image, and rich-text messages.
+
+    Feishu sends a message containing a caption plus an image as ``post``.  It
+    is easy to mistake that for an unsupported message type because a pure
+    image is sent as ``image``.  The two formats carry the same image key, but
+    ``post`` nests blocks under a locale (usually ``zh_cn``).
+    """
+    try:
+        parsed = json.loads(content) if isinstance(content, str) else content
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if message_type == "text":
+        text = parsed.get("text", "")
+        return (text, []) if isinstance(text, str) else None
+    if message_type == "image":
+        image_key = parsed.get("image_key")
+        return ("", [image_key]) if isinstance(image_key, str) and image_key else ("", [])
+    if message_type != "post":
+        return None
+
+    # Rich-text content is localized: {"zh_cn": {"title": "", "content": [...]}}.
+    payload: dict[str, Any] = parsed
+    for value in parsed.values():
+        if isinstance(value, dict) and isinstance(value.get("content"), list):
+            payload = value
+            break
+    text_parts: list[str] = []
+    image_keys: list[str] = []
+    title = payload.get("title")
+    if isinstance(title, str) and title.strip():
+        text_parts.append(title)
+    rows = payload.get("content")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        elements = row if isinstance(row, list) else [row]
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            tag = str(element.get("tag") or "")
+            if tag in {"text", "a", "at"}:
+                value = element.get("text") or element.get("user_name") or ""
+                if isinstance(value, str):
+                    text_parts.append(value)
+            elif tag == "img":
+                image_key = element.get("image_key")
+                if isinstance(image_key, str) and image_key:
+                    image_keys.append(image_key)
+    return ("".join(text_parts), image_keys)
+
+
 def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] | None:
     event = body.get("event") if isinstance(body.get("event"), dict) else {}
     header = body.get("header") if isinstance(body.get("header"), dict) else {}
@@ -709,26 +817,17 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
     chat_id = str(message.get("chat_id") or "")
     if not message_id or not chat_id:
         return None
-    if message.get("chat_type") != "group" or message.get("message_type") not in {"text", "image"}:
+    message_type = str(message.get("message_type") or "")
+    if message.get("chat_type") != "group" or message_type not in {"text", "image", "post"}:
         return None
     if str(sender.get("sender_type") or "").lower() in {"app", "bot"}:
         return None
-    content = message.get("content") or "{}"
-    try:
-        parsed_content = json.loads(content) if isinstance(content, str) else content
-    except (TypeError, json.JSONDecodeError):
+    parts = _message_parts(message_type, message.get("content") or "{}")
+    if parts is None:
         return None
-    if not isinstance(parsed_content, dict):
-        return None
-    text = parsed_content.get("text", "")
-    image_keys = []
-    if message.get("message_type") == "image":
-        image_key = parsed_content.get("image_key")
-        if isinstance(image_key, str) and image_key:
-            image_keys.append(image_key)
-        text = "[用户发送了一张图片，已保存为必要文件]"
-    if not isinstance(text, str):
-        return None
+    text, image_keys = parts
+    if image_keys:
+        text = f"{text}\n[用户发送了一张图片，已保存为必要文件]"
     mentions = message.get("mentions") or []
     mentioned_bot = False
     for mention in mentions:
@@ -1240,7 +1339,8 @@ class CloudflareRelay:
                 "description": (
                     "Update the SAME existing regular Feishu group; never create a new one. "
                     "chat_id may be omitted to reuse the persisted group. Supported fields: "
-                    "name (<=60 chars), description (<=100), avatar_image_key, i18n_names, "
+                    "name (<=60 chars), description (<=100), avatar_image_key, "
+                    "set_avatar_from_stored, i18n_names, "
                     "add_member_permission, share_card_permission, at_all_permission, "
                     "edit_permission, owner_id, join_message_visibility, "
                     "leave_message_visibility, membership_approval, chat_type, "
@@ -1257,6 +1357,7 @@ class CloudflareRelay:
                         "chat_id": string,
                         "name": string,
                         "avatar_image_key": string,
+                        "set_avatar_from_stored": {"type": "boolean"},
                         "description": string,
                         "i18n_names": {"type": "object", "additionalProperties": {"type": "string"}},
                         "add_member_permission": string,
@@ -1607,11 +1708,40 @@ class CloudflareRelay:
                 "pin_manage_setting",
                 "hide_member_count_setting",
             }
+            use_latest_image = bool(args.get("set_avatar_from_stored"))
             changes = {
                 key: args[key]
                 for key in update_fields
                 if key in args and args[key] is not None
             }
+            if use_latest_image:
+                latest = await self.state.latest_image_run(conversation_key)
+                image_keys = (latest or {}).get("image_keys") if latest else []
+                source_message_id = str((latest or {}).get("source_message_id") or "")
+                if not image_keys or not source_message_id:
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "avatar_image_missing",
+                                "message": "no image is stored for this conversation; ask the user to send an image",
+                            },
+                        },
+                        True,
+                    )
+                try:
+                    image_data = await self.feishu.download_image(
+                        source_message_id, str(image_keys[-1])
+                    )
+                    changes["avatar_image_key"] = await self.feishu.upload_avatar_image(image_data)
+                except Exception as exc:
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {"code": "avatar_upload_failed", "message": _safe_error(exc)},
+                        },
+                        True,
+                    )
             if not changes:
                 return self._tool_result(
                     {
@@ -1661,8 +1791,14 @@ class CloudflareRelay:
             )
         if name == "get_stored_image":
             row = await self.state.avatar(conversation_key)
+            latest = await self.state.latest_image_run(conversation_key)
             return self._tool_result(
-                {"success": True, "has_avatar": bool(row), "size": row.get("size") if row else None}
+                {
+                    "success": True,
+                    "has_avatar": bool(row or latest),
+                    "size": row.get("size") if row else None,
+                    "source_message_id": (latest or {}).get("source_message_id"),
+                }
             )
         return self._tool_result(
             {
