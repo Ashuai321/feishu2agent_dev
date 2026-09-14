@@ -80,5 +80,5 @@ def test_worker_config_points_directly_to_python_entrypoint():
     assert "python_workers" in config["compatibility_flags"]
     assert {item["binding"] for item in config["d1_databases"]} == {"DB"}
     assert config["queues"]["producers"][0]["binding"] == "AGENT_QUEUE"
-    assert config["r2_buckets"][0]["binding"] == "AVATARS"
+    assert "r2_buckets" not in config
     assert "PYTHON_ORIGIN" not in (ROOT / "wrangler.jsonc").read_text()

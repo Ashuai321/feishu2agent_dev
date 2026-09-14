@@ -31,11 +31,5 @@
         "max_retries": 3
       }
     ]
-  },
-  "r2_buckets": [
-    {
-      "binding": "AVATARS",
-      "bucket_name": "feishu2agents-avatars"
-    }
-  ]
+  }
 }

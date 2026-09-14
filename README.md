@@ -112,7 +112,7 @@ Worker 使用四类 Cloudflare 绑定：
 
 - D1（`DB`）保存去重键、Relay 运行记录、发起人映射和 OAuth 状态。
 - Queue（`AGENT_QUEUE`）在飞书 Webhook 请求之外处理占位回复、Agent 触发和最终结果回写，避免超过飞书的响应时限。
-- R2（`AVATARS`）只为确实需要跨重启保留的文件预留。
+- R2（`AVATARS`）只为确实需要跨重启保留的文件预留；当前部署暂不绑定 R2，避免开通需要付款方式的订阅。
 - Worker Secrets 保存飞书凭证和 Workspace Agent 触发凭证。
 
 首次部署时，在仓库根目录执行以下命令创建资源（先执行 `npx wrangler login`）：
@@ -120,7 +120,7 @@ Worker 使用四类 Cloudflare 绑定：
 ```bash
 npx wrangler d1 create feishu2agents-state
 npx wrangler queues create feishu2agents-agent-jobs
-npx wrangler r2 bucket create feishu2agents-avatars
+# R2 需要先在 Cloudflare 账户中激活订阅并绑定付款方式，当前部署可跳过。
 ```
 
 把 D1 命令输出的 `database_id` 写入 `wrangler.jsonc`，替换 `REPLACE_WITH_D1_DATABASE_ID`，然后执行：
@@ -161,7 +161,7 @@ ChatGPT 连接器的 MCP 地址填写：
 https://bot.boooe.com/mcp
 ```
 
-如果使用 Cloudflare 的 GitHub 自动部署，仓库根目录保持 `/`，生产分支使用 `main`，构建命令留空，部署命令填写 `uv run pywrangler deploy`。D1、Queue、R2 资源和 Worker Secrets 仍需在同一个 Cloudflare 账户中准备好。
+如果使用 Cloudflare 的 GitHub 自动部署，仓库根目录保持 `/`，生产分支使用 `main`，构建命令留空，部署命令填写 `uv run pywrangler deploy`。D1、Queue 资源和 Worker Secrets 仍需在同一个 Cloudflare 账户中准备好；以后激活 R2 后再把 `AVATARS` 绑定加入配置。
 
 ## 测试
 
