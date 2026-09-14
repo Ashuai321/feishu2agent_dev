@@ -218,10 +218,14 @@ def test_create_chat_returns_chat_id() -> None:
 
 
 def test_search_contacts_parses_candidates() -> None:
-    payload = {"data": {"users": [{"name": "张三", "open_id": "ou_z", "email": "z@example.com"}]}}
+    payload = {"data": {"user_list": [{"user_id": "ou_z", "mobile": "13812345678"}]}}
     bot = _bot(_FakeApiClient(request_response=_success_response(json.dumps(payload).encode())))
-    candidates = bot.search_contacts("张")
-    assert candidates == [{"name": "张三", "open_id": "ou_z", "email": "z@example.com"}]
+    candidates = bot.search_contacts("张三，手机号：13812345678")
+    assert candidates == [{"name": "", "open_id": "ou_z", "mobile": "13812345678"}]
+    req = bot._api_client.last_request
+    assert req.uri == "/open-apis/contact/v3/users/batch_get_id"
+    assert req.queries == [("user_id_type", "open_id")]
+    assert req.body == {"emails": [], "mobiles": ["13812345678"]}
 
 
 # --- feishu_mcp new tools ---

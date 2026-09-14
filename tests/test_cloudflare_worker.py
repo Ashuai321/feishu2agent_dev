@@ -264,24 +264,26 @@ def test_feishu_contact_search_uses_tenant_contact_search_api():
             return {
                 "code": 0,
                 "data": {
-                    "users": [
+                    "user_list": [
                         {
-                            "name": "张三",
-                            "open_id": "ou_z",
-                            "email": "z@example.com",
+                            "user_id": "ou_z",
+                            "mobile": "13812345678",
                         }
                     ]
                 },
             }
 
     api = FakeFeishu()
-    candidates = asyncio.run(api.search_contacts("张三"))
+    candidates = asyncio.run(api.search_contacts("姓名：张三，手机号：13812345678"))
 
-    assert candidates == [{"name": "张三", "open_id": "ou_z", "email": "z@example.com"}]
+    assert candidates == [{"name": "", "open_id": "ou_z", "mobile": "13812345678"}]
     assert api.call == (
         "POST",
-        "/open-apis/contact/v3/users/search",
-        {"json": {"query": "张三"}},
+        "/open-apis/contact/v3/users/batch_get_id",
+        {
+            "params": {"user_id_type": "open_id"},
+            "json": {"emails": [], "mobiles": ["13812345678"]},
+        },
     )
 
 

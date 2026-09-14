@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 import lark_oapi as lark
@@ -413,18 +414,32 @@ class FeishuBot:
             raise FeishuApiError(self._api_failure("update chat", response))
 
     def search_contacts(self, query: str) -> list[dict[str, Any]]:
-        """Search visible Feishu contacts and return candidate reference cards.
+        """Resolve Feishu contacts from a mobile number or email address.
 
-        Each candidate carries ``name``, ``open_id`` and any email fields the
-        API returns, so the agent can show them and the user can confirm the
-        right person before being invited.
+        The tenant-supported ``batch_get_id`` endpoint is used because the
+        legacy name-search endpoint requires a user access token.  The group
+        workflow therefore asks for a mobile number or email when it needs to
+        identify a member.
         """
+        text = str(query or "").strip()
+        emails = sorted(
+            set(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+        )
+        mobiles = sorted(
+            set(re.findall(r"(?<!\d)(?:\+?86[\s-]*)?(1\d{10})(?!\d)", text))
+        )
+        if not emails and not mobiles:
+            raise FeishuApiError(
+                "Feishu contact lookup requires a mobile number or email; "
+                "name-only search is not available with the tenant token"
+            )
         request = (
             lark.BaseRequest.builder()
             .http_method(lark.HttpMethod.POST)
-            .uri("/open-apis/contact/v3/users/search")
+            .uri("/open-apis/contact/v3/users/batch_get_id")
+            .queries([("user_id_type", "open_id")])
             .token_types({lark.AccessTokenType.TENANT})
-            .body({"query": query})
+            .body({"emails": emails, "mobiles": mobiles})
             .build()
         )
         response = self._api_client.request(request)
@@ -432,12 +447,12 @@ class FeishuBot:
             raise FeishuApiError(self._api_failure("search contacts", response))
         try:
             payload = json.loads(response.raw.content)
-            users = (payload.get("data") or {}).get("users") or []
+            users = (payload.get("data") or {}).get("user_list") or []
         except (AttributeError, TypeError, json.JSONDecodeError) as exc:
             raise FeishuApiError("search contacts returned an invalid response") from exc
         candidates: list[dict[str, Any]] = []
         for user in users or []:
-            open_id = user.get("open_id") or ""
+            open_id = user.get("user_id") or user.get("open_id") or ""
             if not open_id:
                 continue
             entry: dict[str, Any] = {

@@ -514,20 +514,39 @@ class FeishuAPI:
         return str(chat_id)
 
     async def search_contacts(self, query: str) -> list[dict[str, Any]]:
-        """Search tenant-visible Feishu contacts by name, email, or mobile."""
+        """Resolve Feishu contacts from a mobile number or email address.
+
+        Feishu's legacy name-search endpoint requires a user access token.  The
+        Worker only has a tenant access token, so use the tenant-supported
+        ``batch_get_id`` endpoint instead.  The Agent's group workflow asks for
+        a mobile number or email when it needs to identify a member.
+        """
+        text = str(query or "").strip()
+        emails = sorted(
+            set(re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+        )
+        mobiles = sorted(
+            set(re.findall(r"(?<!\d)(?:\+?86[\s-]*)?(1\d{10})(?!\d)", text))
+        )
+        if not emails and not mobiles:
+            raise RuntimeError(
+                "Feishu contact lookup requires a mobile number or email; "
+                "name-only search is not available with the tenant token"
+            )
         payload = await self._request(
             "POST",
-            "/open-apis/contact/v3/users/search",
-            json={"query": query},
+            "/open-apis/contact/v3/users/batch_get_id",
+            params={"user_id_type": "open_id"},
+            json={"emails": emails, "mobiles": mobiles},
         )
-        users = payload.get("data", {}).get("users", [])
+        users = payload.get("data", {}).get("user_list", [])
         if not isinstance(users, list):
             raise RuntimeError("Feishu contact search returned an invalid users list")
         candidates: list[dict[str, Any]] = []
         for user in users:
             if not isinstance(user, dict):
                 continue
-            open_id = str(user.get("open_id") or "")
+            open_id = str(user.get("user_id") or user.get("open_id") or "")
             if not open_id:
                 continue
             candidate: dict[str, Any] = {
@@ -1035,9 +1054,10 @@ class CloudflareRelay:
             {
                 "name": "search_contacts",
                 "description": (
-                    "Search tenant-visible Feishu contacts by name, email, or mobile and "
-                    "return candidate names and open_ids. Show candidates and obtain "
-                    "explicit user confirmation before inviting anyone."
+                    "Resolve a Feishu contact by mobile number or email and return candidate "
+                    "open_ids. Name-only lookup requires a user token and is unavailable "
+                    "here. Show candidates and obtain explicit user confirmation before "
+                    "inviting anyone."
                 ),
                 "inputSchema": {
                     "type": "object",
