@@ -869,6 +869,7 @@ def _conversation_input(
     conversation_key: str,
     text: str,
     continuation: bool,
+    image_keys: list[str] | None = None,
     working_directory: str = "",
 ) -> str:
     # The trigger API accepts ``input`` as a string. The Agent's protocol
@@ -906,6 +907,14 @@ def _conversation_input(
             "User task:",
             text.strip(),
         ]
+    if image_keys:
+        body.extend(
+            [
+                "",
+                "The Feishu message includes an image. If the user asks to use it as a group avatar, "
+                "call update_group with set_avatar_from_stored=true; do not ask the user to resend it.",
+            ]
+        )
     return "\n".join([*header, "", *body])
 
 
@@ -2016,6 +2025,7 @@ class CloudflareRelay:
                 conversation_key=conversation_key,
                 text=event["text"],
                 continuation=continuation,
+                image_keys=event.get("image_keys") or [],
             )
             await self.state.create_run(
                 request_id=request_id,

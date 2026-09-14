@@ -146,6 +146,19 @@ def test_agent_input_uses_text_relay_envelope():
     assert "User task:\n测试" in input_text
 
 
+def test_agent_input_tells_agent_how_to_use_attached_image():
+    worker = _load_worker_module()
+    input_text = worker._conversation_input(
+        request_id="req_1",
+        conversation_key="feishu:app:chat:1",
+        text="将群头像改成这个",
+        continuation=True,
+        image_keys=["img_v3_rocket"],
+    )
+
+    assert "set_avatar_from_stored=true" in input_text
+
+
 def test_worker_config_points_directly_to_python_entrypoint():
     config = json.loads((ROOT / "wrangler.jsonc").read_text())
 
