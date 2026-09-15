@@ -43,6 +43,18 @@ def _image_upload_metadata(data: bytes) -> tuple[str, str]:
         return "avatar.jpg", "image/jpeg"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "avatar.webp", "image/webp"
+    # HEIC/HEIF files use the ISO-BMFF container.  Feishu accepts these for
+    # image uploads and converts them to JPEG, so do not reject them merely
+    # because they do not have a JPEG/PNG magic header.
+    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in {
+        b"heic",
+        b"heix",
+        b"hevc",
+        b"hevx",
+        b"mif1",
+        b"msf1",
+    }:
+        return "avatar.heic", "image/heic"
     if data.startswith((b"II*\x00", b"MM\x00*")):
         return "avatar.tiff", "image/tiff"
     if data.startswith(b"\x00\x00\x01\x00"):
@@ -704,22 +716,43 @@ class FeishuAPI:
         if len(data) > 10 * 1024 * 1024:
             raise RuntimeError("avatar image exceeds Feishu's 10MB limit")
         filename, content_type = _image_upload_metadata(data)
+        token = await self._tenant_token()
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{self.base}/open-apis/im/v1/images",
-                headers={"Authorization": f"Bearer {await self._tenant_token()}"},
-                data={"image_type": "avatar"},
-                files={"image": (filename, data, content_type)},
-            )
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
+            async def send(file_content_type: str) -> httpx.Response:
+                return await client.post(
+                    f"{self.base}/open-apis/im/v1/images",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={"image_type": "avatar"},
+                    files={"image": (filename, data, file_content_type)},
+                )
+
+            response = await send(content_type)
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+
+            # Feishu's parser occasionally rejects an otherwise valid image
+            # when a proxy rewrites the per-file MIME type.  The documented
+            # Python example uses application/octet-stream, so retry only for
+            # parameter/format errors while retaining the real filename.
+            error_code = payload.get("code")
+            if (
+                response.status_code >= 400 or error_code not in (None, 0)
+            ) and str(error_code) in {"234001", "234011"}:
+                response = await send("application/octet-stream")
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
         if response.status_code >= 400 or payload.get("code", 0) != 0:
             message = payload.get("msg") or payload.get("message") or response.text
+            log_id = response.headers.get("X-Tt-Logid", "")
+            suffix = f", logid={log_id}" if log_id else ""
             raise RuntimeError(
                 f"Feishu API /open-apis/im/v1/images failed "
-                f"({response.status_code}, code={payload.get('code', 'unknown')}): {message}"
+                f"({response.status_code}, code={payload.get('code', 'unknown')}{suffix}; "
+                f"filename={filename}, content_type={content_type}): {message}"
             )
         image_key = str((payload.get("data") or {}).get("image_key") or "")
         if not image_key:
