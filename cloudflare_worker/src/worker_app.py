@@ -682,6 +682,46 @@ class FeishuAPI:
             raise RuntimeError("Feishu create group response returned no chat_id")
         return str(chat_id)
 
+    async def add_group_members(
+        self, chat_id: str, member_open_ids: list[str]
+    ) -> dict[str, Any]:
+        """Add explicitly confirmed Open IDs to an existing Feishu group."""
+        group_id = str(chat_id or "").strip()
+        members: list[str] = []
+        for open_id in member_open_ids:
+            value = str(open_id or "").strip()
+            if value and value not in members:
+                members.append(value)
+        if not group_id:
+            raise RuntimeError("chat_id is required")
+        if not members:
+            raise RuntimeError("at least one member_open_id is required")
+        if len(members) > 50:
+            raise RuntimeError("Feishu allows at most 50 members per request")
+        payload = await self._request(
+            "POST",
+            f"/open-apis/im/v1/chats/{group_id}/members",
+            params={"member_id_type": "open_id", "succeed_type": 2},
+            json={"id_list": members},
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        result: dict[str, Any] = {
+            "chat_id": group_id,
+            "requested_member_open_ids": members,
+        }
+        for key in ("invalid_id_list", "not_existed_id_list", "pending_approval_id_list"):
+            value = data.get(key, payload.get(key, []))
+            result[key] = value if isinstance(value, list) else []
+        result["added_member_open_ids"] = [
+            open_id
+            for open_id in members
+            if open_id
+            not in set(result["invalid_id_list"])
+            and open_id not in set(result["not_existed_id_list"])
+            and open_id not in set(result["pending_approval_id_list"])
+        ]
+        return result
+
     async def get_chat(self, chat_id: str) -> dict[str, Any]:
         """Read the current settings for a regular group."""
         payload = await self._request(
@@ -1417,6 +1457,25 @@ class CloudflareRelay:
                 },
             },
             {
+                "name": "add_group_members",
+                "description": (
+                    "Add exactly the explicitly confirmed member_open_ids to an existing "
+                    "Feishu group. chat_id may be omitted to reuse the persisted group. "
+                    "Do not add the requester or any other person automatically; resolve "
+                    "contacts first and obtain explicit confirmation. Uses open_id values "
+                    "and returns added, invalid, and pending-approval IDs."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["conversation_key", "member_open_ids"],
+                    "properties": {
+                        "conversation_key": string,
+                        "chat_id": string,
+                        "member_open_ids": {"type": "array", "items": string},
+                    },
+                },
+            },
+            {
                 "name": "get_group_info",
                 "description": (
                     "Read current settings for an existing regular Feishu group. chat_id may "
@@ -1740,6 +1799,80 @@ class CloudflareRelay:
                     "conversation_key": conversation_key,
                     "chat_id": chat_id,
                     "member_open_ids": members,
+                }
+            )
+        if name == "add_group_members":
+            target_chat_id = str(args.get("chat_id") or "").strip()
+            if not target_chat_id:
+                row = await self.state.requester(conversation_key)
+                target_chat_id = str((row or {}).get("group_chat_id") or "").strip()
+            if not target_chat_id:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "group_missing",
+                            "message": "no existing group found; pass chat_id or create it first",
+                        },
+                    },
+                    True,
+                )
+            raw_members = args.get("member_open_ids")
+            if not isinstance(raw_members, list):
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_members",
+                            "message": "member_open_ids must be an array of confirmed open_id values",
+                        },
+                    },
+                    True,
+                )
+            members: list[str] = []
+            for open_id in raw_members:
+                value = str(open_id or "").strip()
+                if value and value not in members:
+                    members.append(value)
+            if not members:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_members",
+                            "message": "member_open_ids must contain at least one confirmed open_id",
+                        },
+                    },
+                    True,
+                )
+            if len(members) > 50:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "invalid_members",
+                            "message": "at most 50 members can be added in one request",
+                        },
+                    },
+                    True,
+                )
+            try:
+                result = await self.feishu.add_group_members(target_chat_id, members)
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "chat_id": target_chat_id,
+                        "requested_member_open_ids": members,
+                        "error": {"code": "add_members_failed", "message": _safe_error(exc)},
+                    },
+                    True,
+                )
+            return self._tool_result(
+                {
+                    "success": True,
+                    "conversation_key": conversation_key,
+                    **result,
                 }
             )
         if name == "get_group_info":
