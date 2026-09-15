@@ -806,13 +806,40 @@ class FeishuAPI:
         return candidates
 
     async def download_image(self, message_id: str, file_key: str) -> bytes:
+        """Download an image attached to a Feishu message.
+
+        The message-resource endpoint returns a JSON error body for permission
+        and resource mismatches, even though its HTTP status is 400. Do not
+        use ``raise_for_status`` here: preserving Feishu's code, message, and
+        log id is necessary to distinguish a missing ``im:message`` scope from
+        a bad message/resource pair.
+        """
+        token = await self._tenant_token()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(
                 f"{self.base}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
                 params={"type": "image"},
-                headers={"Authorization": f"Bearer {await self._tenant_token()}"},
+                headers={"Authorization": f"Bearer {token}"},
             )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            message = payload.get("msg") or payload.get("message") or response.text
+            code = payload.get("code", "unknown")
+            log_id = response.headers.get("X-Tt-Logid", "")
+            suffix = f", logid={log_id}" if log_id else ""
+            raise RuntimeError(
+                "Feishu message resource download failed "
+                f"({response.status_code}, code={code}{suffix}; "
+                f"message_id={message_id}, file_key={file_key}, type=image): {message}"
+            )
+        if not response.content:
+            raise RuntimeError(
+                "Feishu message resource download returned an empty image "
+                f"(message_id={message_id}, file_key={file_key}, type=image)"
+            )
         return response.content
 
 
@@ -1805,6 +1832,18 @@ class CloudflareRelay:
                     image_data = await self.feishu.download_image(
                         source_message_id, str(image_keys[-1])
                     )
+                except Exception as exc:
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "avatar_source_download_failed",
+                                "message": _safe_error(exc),
+                            },
+                        },
+                        True,
+                    )
+                try:
                     changes["avatar_image_key"] = await self.feishu.upload_avatar_image(image_data)
                 except Exception as exc:
                     return self._tool_result(
