@@ -61,6 +61,22 @@ class FeishuBridge:
                     "ALTER TABLE feishu_run_bridge "
                     "ADD COLUMN outbound_message_id TEXT"
                 )
+            # A single incoming Feishu message may fan out to several selected
+            # Workspace Agents. Keep the historical bridge row for the first
+            # run, and store additional run targets in a separate table so old
+            # databases and exactly-once claims remain backward compatible.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feishu_run_targets (
+                    request_id TEXT PRIMARY KEY,
+                    feishu_message_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    delivered_at INTEGER,
+                    outbound_message_id TEXT
+                )
+                """
+            )
             conn.commit()
 
     def claim(self, *, feishu_message_id: str, request_id: str) -> bool:
@@ -91,7 +107,11 @@ class FeishuBridge:
                 "SELECT feishu_message_id, request_id, created_at, outbound_message_id "
                 "FROM feishu_run_bridge WHERE delivered = 0 ORDER BY created_at"
             ).fetchall()
-        return [dict(row) for row in rows]
+            target_rows = conn.execute(
+                "SELECT feishu_message_id, request_id, created_at, outbound_message_id "
+                "FROM feishu_run_targets WHERE delivered = 0 ORDER BY created_at"
+            ).fetchall()
+        return [dict(row) for row in (*rows, *target_rows)]
 
     def record_outbound_message(self, request_id: str, outbound_message_id: str) -> None:
         """Remember which bot message is the placeholder for a run's answer."""
@@ -101,6 +121,25 @@ class FeishuBridge:
             conn.execute(
                 "UPDATE feishu_run_bridge SET outbound_message_id = ? WHERE request_id = ?",
                 (outbound_message_id, request_id),
+            )
+            conn.execute(
+                "UPDATE feishu_run_targets SET outbound_message_id = ? WHERE request_id = ?",
+                (outbound_message_id, request_id),
+            )
+            conn.commit()
+
+    def register_run(self, *, feishu_message_id: str, request_id: str) -> None:
+        """Attach an additional fan-out run to an already claimed message."""
+        if not feishu_message_id or not request_id:
+            raise ValueError("feishu_message_id and request_id must not be empty")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO feishu_run_targets
+                    (request_id, feishu_message_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (request_id, feishu_message_id, int(time.time())),
             )
             conn.commit()
 
@@ -113,6 +152,11 @@ class FeishuBridge:
                 "SELECT outbound_message_id FROM feishu_run_bridge WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT outbound_message_id FROM feishu_run_targets WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
         value = row["outbound_message_id"] if row else None
         return str(value) if value else None
 
@@ -131,6 +175,12 @@ class FeishuBridge:
                 "WHERE request_id = ? AND delivered = 0",
                 (int(time.time()), request_id),
             )
+            if cur.rowcount == 0:
+                cur = conn.execute(
+                    "UPDATE feishu_run_targets SET delivered = 1, delivered_at = ? "
+                    "WHERE request_id = ? AND delivered = 0",
+                    (int(time.time()), request_id),
+                )
             conn.commit()
             return cur.rowcount == 1
 

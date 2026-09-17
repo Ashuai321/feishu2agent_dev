@@ -28,6 +28,111 @@ from .workspace_agent import WorkspaceAgentMessageHandler, WorkspaceAgentSetting
 logger = logging.getLogger(__name__)
 
 
+def _bootstrap_env_agents(relay_config: object, relay_store: object) -> None:
+    """Register optional Agent definitions declared only in ``.env``.
+
+    Existing database agents and settings are left untouched. Each definition
+    uses a dedicated env-backed token reference, so switching test targets is
+    a matter of changing the appended .env selection values and restarting.
+    """
+    prefix = "WORKSPACE_AGENT_RELAY_AGENT_"
+    token_prefix = "WORKSPACE_AGENT_RELAY_AGENT_TOKEN_"
+    for key, trigger_url in os.environ.items():
+        if not key.startswith(prefix) or not key.endswith("_TRIGGER_URL"):
+            continue
+        suffix = key[len(prefix) : -len("_TRIGGER_URL")]
+        if not suffix or suffix in {"TOKEN", "SELECTION_MODE"}:
+            continue
+        trigger_url = str(trigger_url or "").strip()
+        token_var = f"{token_prefix}{suffix}"
+        token_ref = f"env:{token_var}"
+        if not trigger_url or not os.environ.get(token_var, "").strip():
+            logger.warning("Skipping env Agent %s: trigger URL or token is missing", suffix)
+            continue
+        name = os.environ.get(f"{prefix}NAME_{suffix}", "").strip()
+        if not name:
+            name = suffix.replace("_", " ").title()
+        try:
+            relay_store.upsert_agent(name=name, trigger_url=trigger_url, token_ref=token_ref)
+        except Exception:
+            logger.exception("Could not register env Agent name=%s", name)
+
+    activated_urls = tuple(getattr(relay_config, "activated_agent_urls", ()) or ())
+    if activated_urls:
+        if len(activated_urls) == 1 and activated_urls[0].strip().lower() == "all":
+            try:
+                relay_store.update_settings(agent_selection_mode="all")
+            except (KeyError, ValueError):
+                logger.exception("Could not activate all Agents from activated_agents")
+            return
+        selected_ids: list[int] = []
+        for trigger_url in activated_urls:
+            match = next(
+                (agent for agent in relay_store.list_agents() if agent.get("trigger_url") == trigger_url),
+                None,
+            )
+            if match is None:
+                # A URL not yet in the database is accepted only when its
+                # companion env definition supplies the token. This keeps old
+                # DB agents untouched while allowing a new test Agent to be
+                # selected with one .env field.
+                trigger_id = trigger_url.rstrip("/").rsplit("/", 2)[-2]
+                suffix = ""
+                for env_key, env_url in os.environ.items():
+                    if env_key.startswith(prefix) and env_key.endswith("_TRIGGER_URL") and env_url.strip() == trigger_url:
+                        suffix = env_key[len(prefix) : -len("_TRIGGER_URL")]
+                        break
+                token_var = f"{token_prefix}{suffix}" if suffix else ""
+                if not token_var or not os.environ.get(token_var, "").strip():
+                    logger.warning("activated_agents URL is not configured with a token: %s", trigger_id)
+                    continue
+                name = os.environ.get(f"{prefix}NAME_{suffix}", "").strip() or f"Activated {trigger_id}"
+                try:
+                    match = relay_store.upsert_agent(
+                        name=name,
+                        trigger_url=trigger_url,
+                        token_ref=f"env:{token_var}",
+                    )
+                except Exception:
+                    logger.exception("Could not register activated Agent name=%s", name)
+                    continue
+            selected_ids.append(int(match["id"]))
+        if selected_ids:
+            try:
+                relay_store.update_settings(
+                    agent_selection_mode="single" if len(selected_ids) == 1 else "multi",
+                    enabled_agent_ids=selected_ids,
+                )
+            except (KeyError, ValueError) as exc:
+                logger.warning("Could not apply activated_agents: %s", exc)
+        return
+
+    mode = str(getattr(relay_config, "agent_selection_mode", "") or "").strip().lower()
+    names = tuple(getattr(relay_config, "enabled_agent_names", ()) or ())
+    if not mode and not names:
+        return
+    if mode not in {"single", "multi", "all"}:
+        logger.warning("Ignoring invalid WORKSPACE_AGENT_RELAY_AGENT_SELECTION_MODE=%s", mode)
+        return
+    try:
+        if mode == "all":
+            relay_store.update_settings(agent_selection_mode="all")
+            return
+        if not names:
+            logger.warning("Agent selection names are required for mode=%s", mode)
+            return
+        ids = [int(relay_store.get_agent_by_name(name)["id"]) for name in names]
+        if mode == "single" and len(ids) != 1:
+            logger.warning("Single-agent mode requires exactly one enabled agent")
+            return
+        relay_store.update_settings(
+            agent_selection_mode=mode,
+            enabled_agent_ids=ids,
+        )
+    except (KeyError, ValueError) as exc:
+        logger.warning("Could not apply env Agent selection: %s", exc)
+
+
 def configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -67,6 +172,7 @@ def main() -> int:
         from feishu2agents.relay.server import store as relay_store
 
         relay_config.ensure_runtime_directories()
+        _bootstrap_env_agents(relay_config, relay_store)
         bridge = FeishuBridge(relay_config.state_dir / "feishu-bridge.sqlite")
         group_draft_store = GroupDraftStore(relay_config.state_dir / "group-draft.sqlite")
         requester_registry = RequesterRegistry()

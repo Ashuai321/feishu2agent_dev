@@ -47,6 +47,9 @@ RUN_PUBLIC_COLUMNS = (
 )
 APP_SETTING_CURRENT_AGENT_ID = "current_agent_id"
 APP_SETTING_CURRENT_WORKSPACE_ID = "current_workspace_id"
+APP_SETTING_AGENT_SELECTION_MODE = "agent_selection_mode"
+APP_SETTING_ENABLED_AGENT_IDS = "enabled_agent_ids"
+VALID_AGENT_SELECTION_MODES = {"single", "multi", "all"}
 _UNSET = object()
 
 
@@ -478,9 +481,38 @@ class RelayStore:
             if candidate and self._workspace_exists_conn(conn, candidate):
                 current_workspace_id = candidate
 
+        raw_mode = self._setting_value_conn(conn, APP_SETTING_AGENT_SELECTION_MODE)
+        mode = str(raw_mode or "single").strip().lower()
+        if mode not in VALID_AGENT_SELECTION_MODES:
+            mode = "single"
+        raw_enabled = self._setting_value_conn(conn, APP_SETTING_ENABLED_AGENT_IDS)
+        enabled: list[int] = []
+        if isinstance(raw_enabled, list):
+            for value in raw_enabled:
+                try:
+                    agent_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if agent_id > 0 and agent_id not in enabled and self._agent_exists_conn(conn, agent_id):
+                    enabled.append(agent_id)
+        if mode == "all":
+            rows = conn.execute("SELECT id FROM agents ORDER BY name, id").fetchall()
+            enabled = [int(row["id"]) for row in rows]
+        elif mode == "single":
+            # An explicit activated_agents selection is stored separately from
+            # current_agent_id, so changing test targets never rewrites the
+            # historical current-agent setting.
+            if not enabled and current_agent_id is not None:
+                enabled = [current_agent_id]
+        elif not enabled and current_agent_id is not None:
+            # A newly migrated database keeps the previous single-agent behavior.
+            enabled = [current_agent_id]
+
         return {
             "current_agent_id": current_agent_id,
             "current_workspace_id": current_workspace_id,
+            "agent_selection_mode": mode,
+            "enabled_agent_ids": enabled,
         }
 
     def get_settings(self) -> dict[str, Any]:
@@ -492,6 +524,8 @@ class RelayStore:
         *,
         current_agent_id: Any = _UNSET,
         current_workspace_id: Any = _UNSET,
+        agent_selection_mode: Any = _UNSET,
+        enabled_agent_ids: Any = _UNSET,
     ) -> dict[str, Any]:
         now = _now()
         with self._lock, self._connect(immediate=True) as conn:
@@ -515,6 +549,26 @@ class RelayStore:
                         "UPDATE workspaces SET last_used_at = ? WHERE id = ?",
                         (now, workspace_id),
                     )
+            if agent_selection_mode is not _UNSET:
+                mode = str(agent_selection_mode or "").strip().lower()
+                if mode not in VALID_AGENT_SELECTION_MODES:
+                    raise ValueError("agent_selection_mode must be one of: single, multi, all")
+                self._set_setting_conn(conn, APP_SETTING_AGENT_SELECTION_MODE, mode)
+            if enabled_agent_ids is not _UNSET:
+                if not isinstance(enabled_agent_ids, (list, tuple)):
+                    raise ValueError("enabled_agent_ids must be a list")
+                normalized_ids: list[int] = []
+                for value in enabled_agent_ids:
+                    try:
+                        agent_id = int(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("enabled_agent_ids must contain integers") from exc
+                    if agent_id <= 0 or agent_id in normalized_ids:
+                        raise ValueError("enabled_agent_ids must contain unique positive agent ids")
+                    if not self._agent_exists_conn(conn, agent_id):
+                        raise KeyError(f"Agent not found: {agent_id}")
+                    normalized_ids.append(agent_id)
+                self._set_setting_conn(conn, APP_SETTING_ENABLED_AGENT_IDS, normalized_ids)
             return self._get_settings_conn(conn)
 
     def resolve_default_agent_id(self) -> int:
@@ -523,6 +577,18 @@ class RelayStore:
         if agent_id is None:
             raise ValueError("No Workspace Agent backend is configured.")
         return int(agent_id)
+
+    def resolve_enabled_agent_ids(self) -> list[int]:
+        """Return the configured Agent ids in dispatch order.
+
+        With no selection setting, this resolves to the historical current
+        Agent, so existing installations keep exactly one target.
+        """
+        settings = self.get_settings()
+        values = settings.get("enabled_agent_ids")
+        if isinstance(values, list) and values:
+            return [int(value) for value in values]
+        return [self.resolve_default_agent_id()]
 
     def resolve_default_workspace_id(self) -> int | None:
         settings = self.get_settings()

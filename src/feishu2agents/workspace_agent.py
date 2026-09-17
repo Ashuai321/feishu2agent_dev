@@ -146,99 +146,136 @@ class WorkspaceAgentMessageHandler:
                 return agent
         raise KeyError("conversation agent was not found")
 
+    @staticmethod
+    def _agent_conversation_key(base_key: str, agent_id: int, *, fanout: bool) -> str:
+        """Keep the old key unchanged for one Agent; isolate fan-out histories."""
+        if not fanout:
+            return base_key
+        # A quoted reply may already contain the suffix from a prior fan-out.
+        base = base_key.split("|agent:", 1)[0]
+        return f"{base}|agent:{agent_id}"
+
     def handle(self, context: MessageContext) -> str | None:
         if not should_process(context):
             return None
-        conversation_key = self._conversation_key(context)
-        request_id = generate_request_id("feishu")
+        base_conversation_key = self._conversation_key(context)
+        first_request_id = generate_request_id("feishu")
 
         # Exactly-once gate per Feishu message: only the first handler call owns
         # the message. Redeliveries (WS reconnect, duplicate instances) skip.
         if not self._bridge.claim(
             feishu_message_id=context.message_id,
-            request_id=request_id,
+            request_id=first_request_id,
         ):
             logger.info(
                 "skip already-claimed feishu message message_id=%s",
                 context.message_id,
             )
             return None
-        idempotency_key = f"{context.bot_app_id}:{context.message_id}"
-        if self.on_dispatch is not None:
-            try:
-                self.on_dispatch(context, conversation_key)
-            except Exception:
-                logger.exception("requester registration failed message_id=%s", context.message_id)
-
         # Persist any image quote-reply as the conversation's pending avatar and
         # tell the agent an image is available via a marker line.
         user_text = context.text
         if context.message_type == "image":
+            marker = "[用户发送了一张图片，已保存为群头像候选]"
+            user_text = (user_text + "\n" + marker).strip() if user_text else marker
+
+        try:
+            selected_ids = self._store.resolve_enabled_agent_ids()
+        except (KeyError, ValueError) as exc:
+            logger.error("Agent selection invalid: %s", exc)
+            return "Agent 触发配置无效，请先配置可用的 Agent。"
+        if not selected_ids:
+            return "Agent 触发配置无效，请先配置可用的 Agent。"
+        fanout = len(selected_ids) > 1
+        workspace_id = self._store.resolve_default_workspace_id()
+        idempotency_base = f"{context.bot_app_id}:{context.message_id}"
+
+        # Validate every selected target before creating any run. This prevents
+        # a partial fan-out when one selected Agent has a bad URL/token.
+        targets: list[tuple[dict[str, Any], str]] = []
+        for agent_id in selected_ids:
             try:
-                has_avatar = self._store_avatar_images(context, conversation_key)
-            except Exception:
-                logger.exception("avatar storage failed message_id=%s", context.message_id)
-                has_avatar = False
-            if has_avatar:
-                marker = "[用户发送了一张图片，已保存为群头像候选]"
-                user_text = (user_text + "\n" + marker).strip() if user_text else marker
+                agent = self._store.get_agent(int(agent_id))
+                trigger_url = str(agent["trigger_url"])
+                validate_trigger_url(trigger_url)
+                access_token = resolve_agent_token(
+                    self._settings.relay_config, self._store, str(agent["token_ref"])
+                )
+            except (KeyError, ValueError) as exc:
+                logger.error("Agent trigger config invalid: %s", exc)
+                return "Agent 触发配置无效，请检查后重试。"
+            targets.append((agent, access_token))
 
-        try:
-            conversation = self._store.get_conversation_by_key(conversation_key)
-        except KeyError:
-            agent_id = self._store.resolve_default_agent_id()
-            workspace_id = self._store.resolve_default_workspace_id()
-            conversation = self._store.create_conversation(
-                agent_id=agent_id,
-                workspace_id=workspace_id,
-                name=_conversation_title(user_text),
+        dispatched_request_ids: list[str] = []
+        for index, (agent, access_token) in enumerate(targets):
+            request_id = first_request_id if index == 0 else generate_request_id("feishu")
+            conversation_key = self._agent_conversation_key(
+                base_conversation_key, int(agent["id"]), fanout=fanout
+            )
+            if self.on_dispatch is not None:
+                try:
+                    self.on_dispatch(context, conversation_key)
+                except Exception:
+                    logger.exception(
+                        "requester registration failed message_id=%s", context.message_id
+                    )
+            if context.message_type == "image":
+                self._store_avatar_images(context, conversation_key)
+            try:
+                conversation = self._store.get_conversation_by_key(conversation_key)
+            except KeyError:
+                conversation = self._store.create_conversation(
+                    agent_id=int(agent["id"]),
+                    workspace_id=workspace_id,
+                    name=_conversation_title(user_text),
+                    conversation_key=conversation_key,
+                )
+            is_continuation = bool(
+                self._store.list_runs_for_conversation(int(conversation["id"]))
+            )
+            idempotency_key = (
+                idempotency_base if not fanout else f"{idempotency_base}:{int(agent['id'])}"
+            )
+            run = self._store.create_run(
+                agent_id=int(agent["id"]),
+                conversation_id=int(conversation["id"]),
                 conversation_key=conversation_key,
+                input_markdown=user_text,
+                idempotency_key=idempotency_key,
+                request_id=request_id,
             )
-        agent = self._find_agent(conversation)
-        trigger_url = str(agent["trigger_url"])
-        try:
-            validate_trigger_url(trigger_url)
-            access_token = resolve_agent_token(
-                self._settings.relay_config, self._store, str(agent["token_ref"])
+            if index > 0:
+                self._bridge.register_run(
+                    feishu_message_id=context.message_id,
+                    request_id=request_id,
+                )
+            trigger_input = build_trigger_input(
+                request_id=request_id,
+                conversation_key=conversation_key,
+                user_input=user_text,
+                is_continuation=is_continuation,
+                working_directory=run.get("working_directory_snapshot"),
+                local_context=run.get("local_context"),
             )
-        except ValueError as exc:
-            logger.error("Agent trigger config invalid: %s", exc)
-            return "Agent 触发配置无效，请检查后重试。"
-
-        is_continuation = (
-            len(self._store.list_runs_for_conversation(int(conversation["id"]))) > 0
-        )
-        run = self._store.create_run(
-            agent_id=int(agent["id"]),
-            conversation_id=int(conversation["id"]),
-            conversation_key=conversation_key,
-            input_markdown=user_text,
-            idempotency_key=idempotency_key,
-            request_id=request_id,
-        )
-        trigger_input = build_trigger_input(
-            request_id=request_id,
-            conversation_key=conversation_key,
-            user_input=user_text,
-            is_continuation=is_continuation,
-            working_directory=run.get("working_directory_snapshot"),
-            local_context=run.get("local_context"),
-        )
-        self._store.mark_run_trigger_sent(request_id)
-        self._settings.dispatcher.dispatch(
-            store=self._store,
-            trigger_client=self._settings.trigger_client,
-            trigger_url=trigger_url,
-            access_token=access_token,
-            conversation_key=conversation_key,
-            input_text=trigger_input,
-            idempotency_key=idempotency_key,
-            request_id=request_id,
-        )
-        logger.info(
-            "Workspace Agent trigger scheduled message_id=%s request_id=%s",
-            context.message_id,
-            request_id,
-        )
-        self._post_processing_placeholder(context, request_id)
+            self._store.mark_run_trigger_sent(request_id)
+            self._settings.dispatcher.dispatch(
+                store=self._store,
+                trigger_client=self._settings.trigger_client,
+                trigger_url=str(agent["trigger_url"]),
+                access_token=access_token,
+                conversation_key=conversation_key,
+                input_text=trigger_input,
+                idempotency_key=idempotency_key,
+                request_id=request_id,
+            )
+            dispatched_request_ids.append(request_id)
+            logger.info(
+                "Workspace Agent trigger scheduled message_id=%s request_id=%s agent_id=%s",
+                context.message_id,
+                request_id,
+                agent["id"],
+            )
+        # One processing placeholder is enough for a fan-out message; the
+        # worker replies with each selected Agent's terminal result.
+        self._post_processing_placeholder(context, dispatched_request_ids[0])
         return None

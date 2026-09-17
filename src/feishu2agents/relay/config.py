@@ -102,6 +102,11 @@ class RelayConfig:
     # list_configured_token_refs() read from this snapshot instead of live
     # os.environ, so token resolution is deterministic and test-isolated.
     agent_tokens: dict[str, str] = field(default_factory=dict)
+    # Optional .env-only bootstrap for additional agents. Empty values keep
+    # the historical database-selected single-agent behavior unchanged.
+    agent_selection_mode: str = ""
+    enabled_agent_names: tuple[str, ...] = ()
+    activated_agent_urls: tuple[str, ...] = ()
 
     @property
     def database_path(self) -> Path:
@@ -159,4 +164,18 @@ def load_config() -> RelayConfig:
         default_trigger_url=os.environ.get("WORKSPACE_AGENT_RELAY_TRIGGER_URL", "").strip(),
         default_agent_token=default_agent_token,
         agent_tokens=agent_tokens,
+        agent_selection_mode=os.environ.get("WORKSPACE_AGENT_RELAY_AGENT_SELECTION_MODE", "").strip().lower(),
+        enabled_agent_names=tuple(
+            name.strip()
+            for name in os.environ.get("WORKSPACE_AGENT_RELAY_ENABLED_AGENT_NAMES", "").split(",")
+            if name.strip()
+        ),
+        activated_agent_urls=tuple(
+            url.strip()
+            for url in (
+                os.environ.get("activated_agents", "")
+                or os.environ.get("ACTIVATED_AGENTS", "")
+            ).split(",")
+            if url.strip()
+        ),
     )

@@ -78,6 +78,15 @@ FEISHU_APP_SECRET=your_app_secret
 
 进程环境变量优先于 `.env`，因此部署环境可以直接注入同名变量。
 
+### Feishu 测试时切换 Workspace Agent
+
+在 `.env` 末尾追加 `activated_agents` 即可切换目标：填一个 Workspace Agent
+触发 URL 表示单选；多个 URL 用英文逗号分隔表示多选；填写 `all` 表示启用
+relay 数据库中已登记的全部 Agent。未设置该字段时，程序继续使用原来的当前
+Agent。新 URL 需要同时配置对应的
+`WORKSPACE_AGENT_RELAY_AGENT_TOKEN_<NAME>` 与
+`WORKSPACE_AGENT_RELAY_AGENT_<NAME>_TRIGGER_URL`，令牌只保存在本地环境变量中。
+
 ## 本地运行
 
 激活虚拟环境后运行：
