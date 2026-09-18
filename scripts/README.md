@@ -4,7 +4,7 @@
 
 ## 1. 在固定群聊中 @文帅
 
-先确保项目根目录 `.env` 中有 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`，然后运行：
+项目根目录 `.env` 中已有 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET` 即可；即使从其他目录用绝对路径启动，脚本也会自动读取该项目的 `.env`。运行：
 
 ```bash
 python -m scripts.xiaoc_send_mention --text "小C测试：请确认收到。"

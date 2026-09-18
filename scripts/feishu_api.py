@@ -25,9 +25,18 @@ class FeishuScriptError(RuntimeError):
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
-    """Load simple KEY=VALUE entries without overriding real environment vars."""
-    dotenv = Path(path)
-    if not dotenv.exists():
+    """Load simple KEY=VALUE entries without overriding real environment vars.
+
+    The scripts are often started from the user's home directory.  When the
+    default path is used, also check the project root next to this scripts
+    package so ``python /absolute/path/scripts/...`` behaves like a command run
+    after ``cd`` into the project.
+    """
+    candidates = [Path(path)]
+    if str(path) == ".env":
+        candidates.append(Path(__file__).resolve().parents[1] / ".env")
+    dotenv = next((candidate for candidate in candidates if candidate.exists()), None)
+    if dotenv is None:
         return
     for raw_line in dotenv.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
