@@ -12,13 +12,13 @@ dependencies = [
     # Cloudflare Python Workers support asynchronous HTTP clients. Keep this
     # in the runtime dependency set so Feishu and Relay calls are bundled.
     "httpx>=0.27,<1",
+    "certifi>=2025.1.31",
 ]
 
 [project.optional-dependencies]
 dev = [
     "lark-oapi>=1.7.3,<2",
     "python-dotenv>=1.0,<2",
-    "certifi>=2025.1.31",
     "fastmcp>=3.2.4,<4",
     "uvicorn>=0.30,<1",
     "pytest>=8,<9",

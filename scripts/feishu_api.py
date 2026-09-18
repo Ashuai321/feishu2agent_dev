@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,15 @@ FEISHU_OAUTH_REDIRECT_URI = "https://bot.boooe.com/feishu/oauth/callback"
 
 class FeishuScriptError(RuntimeError):
     """A safe, user-facing error from a standalone Feishu script."""
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Build a verified TLS context from the bundled CA certificate set."""
+    try:
+        import certifi
+    except ImportError:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -81,7 +91,9 @@ def _request_json(
         headers["Content-Type"] = "application/json; charset=utf-8"
     request = urllib.request.Request(url, data=body, headers=headers, method=method.upper())
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(
+            request, timeout=timeout, context=_ssl_context()
+        ) as response:
             raw = response.read()
             status = response.status
     except urllib.error.HTTPError as exc:
@@ -139,7 +151,9 @@ def exchange_user_access_token(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(
+            request, timeout=20, context=_ssl_context()
+        ) as response:
             raw = response.read()
             status = response.status
     except urllib.error.HTTPError as exc:
