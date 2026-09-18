@@ -17,6 +17,7 @@ import httpx
 from workers import Response, WorkerEntrypoint
 
 PUBLIC_BASE_URL = "https://bot.boooe.com"
+FEISHU_AUTH_BASE_URL = "https://accounts.feishu.cn"
 MCP_PATH = "/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_NAME = "workspace-agent-relay-mcp-prd"
@@ -1117,7 +1118,19 @@ class CloudflareRelay:
         return "oauth" if _env(self.env, "WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN") else "none"
 
     def feishu_oauth_scope(self) -> str:
-        return _env(self.env, "FEISHU_OAUTH_SCOPE", "bitable:app") or "bitable:app"
+        # The test scripts resolve the supplied Wiki URL to a Bitable app
+        # token before reading/writing records.  Request the Bitable write
+        # permission and the Wiki node read permission up front.  The
+        # optional offline_access scope lets the returned token include a
+        # refresh token when the app has enabled it.
+        return (
+            _env(
+                self.env,
+                "FEISHU_OAUTH_SCOPE",
+                "bitable:app wiki:wiki:readonly offline_access",
+            )
+            or "bitable:app wiki:wiki:readonly offline_access"
+        )
 
     def feishu_oauth_ttl(self) -> int:
         try:
@@ -1167,7 +1180,7 @@ class CloudflareRelay:
             expires_at = _now() + self.feishu_oauth_ttl()
             await self.state.save_feishu_oauth_state(state, callback_uri, expires_at)
             location = (
-                f"{self.feishu.base}/open-apis/authen/v1/authorize?"
+                f"{FEISHU_AUTH_BASE_URL}/open-apis/authen/v1/authorize?"
                 + urlencode(
                     {
                         "app_id": _env(self.env, "FEISHU_APP_ID"),
@@ -1186,6 +1199,7 @@ class CloudflareRelay:
                 return _response(
                     {"success": False, "error": "missing_code"}, status=400
                 )
+            redirect_uri = ""
             if state:
                 await self.state.ensure_feishu_oauth_schema()
                 record = await self.state.consume_feishu_oauth_state(state)
@@ -1201,21 +1215,30 @@ class CloudflareRelay:
                     return _response(
                         {"success": False, "error": "expired_state"}, status=400
                     )
+                redirect_uri = str(record.get("redirect_uri") or "").strip()
+            if not redirect_uri:
+                redirect_uri = _env(
+                    self.env,
+                    "FEISHU_OAUTH_REDIRECT_URI",
+                    self.base_url() + "/feishu/oauth/callback",
+                ).strip()
 
             payload = {
                 "grant_type": "authorization_code",
                 "code": code,
                 "client_id": _env(self.env, "FEISHU_APP_ID"),
                 "client_secret": _env(self.env, "FEISHU_APP_SECRET"),
+                "redirect_uri": redirect_uri,
             }
-            if state:
-                payload["state"] = state
             try:
                 async with httpx.AsyncClient(timeout=20) as client:
                     response = await client.post(
-                        f"{self.feishu.base}/open-apis/authen/v2/oauth/token",
-                        json=payload,
-                        headers={"Content-Type": "application/json; charset=utf-8"},
+                        "https://accounts.feishu.cn/oauth/v3/token",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json",
+                        },
                     )
             except httpx.HTTPError as exc:
                 return _response(
@@ -1227,10 +1250,19 @@ class CloudflareRelay:
             except ValueError:
                 body = {}
             data = body.get("data") if isinstance(body, dict) else None
-            if not isinstance(data, dict) or not data.get("access_token"):
+            # OAuth v3 returns token fields at the top level;
+            # keep the nested form for compatibility with older gateways.
+            if not isinstance(data, dict):
+                data = body if isinstance(body, dict) else {}
+            if not data.get("access_token"):
                 message = "Feishu did not return an access_token"
                 if isinstance(body, dict):
-                    message = str(body.get("msg") or body.get("message") or message)
+                    message = str(
+                        body.get("error_description")
+                        or body.get("msg")
+                        or body.get("message")
+                        or message
+                    )
                 return _response(
                     {"success": False, "error": "token_exchange_failed", "message": message},
                     status=502,

@@ -214,7 +214,7 @@ class FeishuBot:
             }
         )
         authorize_url = (
-            "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+            "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
             + authorize_query
         )
         logger.info("OAuth authorize: state=%s target=%s", state, callback_uri)
@@ -229,6 +229,7 @@ class FeishuBot:
                 {"success": False, "error": "missing 'code' parameter"}, status_code=400
             )
 
+        redirect_uri = None
         if state:
             record = self._oauth_states.pop(state, None)
             if record is None:
@@ -241,11 +242,15 @@ class FeishuBot:
                     {"success": False, "error": "expired 'state'"},
                     status_code=400,
                 )
+            redirect_uri = str(record.get("target") or "").strip() or None
         else:
             logger.warning("OAuth callback received no state nonce")
 
         token = await asyncio.to_thread(
-            self.exchange_user_access_token, code, state=state or None
+            self.exchange_user_access_token,
+            code,
+            state=state or None,
+            redirect_uri=redirect_uri,
         )
         if not token:
             return JSONResponse(
@@ -259,7 +264,11 @@ class FeishuBot:
         return JSONResponse({"success": True, "token": token})
 
     def exchange_user_access_token(
-        self, code: str, *, state: str | None = None
+        self,
+        code: str,
+        *,
+        state: str | None = None,
+        redirect_uri: str | None = None,
     ) -> dict[str, Any] | None:
         """Exchange a user-authorization ``code`` for ``user_access_token``.
 
@@ -273,13 +282,17 @@ class FeishuBot:
             "client_id": settings.feishu_app_id,
             "client_secret": settings.feishu_app_secret,
         }
-        if state:
-            payload["state"] = state
+        payload["redirect_uri"] = (
+            redirect_uri or settings.feishu_oauth_redirect_uri
+        )
         try:
             response = requests.post(
-                "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
-                json=payload,
-                headers={"Content-Type": "application/json; charset=utf-8"},
+                "https://accounts.feishu.cn/oauth/v3/token",
+                data=payload,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "application/json",
+                },
                 timeout=20,
             )
         except requests.RequestException:
@@ -294,7 +307,11 @@ class FeishuBot:
             return None
         try:
             body = response.json()
-            data = body.get("data") or {}
+            data = body.get("data") if isinstance(body, dict) else None
+            # authen/v3/oauth/token returns token fields at the top level;
+            # accept the older nested form as a compatibility fallback.
+            if not isinstance(data, dict):
+                data = body if isinstance(body, dict) else {}
         except (ValueError, AttributeError):
             logger.exception("OAuth token exchange returned invalid JSON")
             return None

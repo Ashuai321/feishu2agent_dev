@@ -25,7 +25,7 @@ class Settings:
     # to after the user authorizes; it MUST be registered in the developer
     # console's redirect-url allowlist.
     feishu_oauth_redirect_uri: str = ""
-    feishu_oauth_scope: str = "bitable:app"
+    feishu_oauth_scope: str = "bitable:app wiki:wiki:readonly offline_access"
     feishu_oauth_state_ttl_seconds: int = 600
 
     @classmethod
@@ -53,8 +53,11 @@ class Settings:
             classify_api_key=os.getenv("STEP_ONE_KEY", "").strip(),
             answer_api_key=os.getenv("STEP_TWO_KEY", "").strip(),
             feishu_oauth_redirect_uri=os.getenv("FEISHU_OAUTH_REDIRECT_URI", "").strip(),
-            feishu_oauth_scope=os.getenv("FEISHU_OAUTH_SCOPE", "bitable:app").strip()
-            or "bitable:app",
+            feishu_oauth_scope=os.getenv(
+                "FEISHU_OAUTH_SCOPE",
+                "bitable:app wiki:wiki:readonly offline_access",
+            ).strip()
+            or "bitable:app wiki:wiki:readonly offline_access",
             feishu_oauth_state_ttl_seconds=max(
                 int(os.getenv("FEISHU_OAUTH_STATE_TTL_SECONDS", "600")), 60
             ),

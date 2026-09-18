@@ -734,7 +734,7 @@ def test_cloudflare_feishu_oauth_authorize_persists_state(monkeypatch):
 
     assert result["status"] == 302
     assert result["headers"]["Location"].startswith(
-        "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+        "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
     )
     assert "app_id=cli_test" in result["headers"]["Location"]
     assert state.saved[1] == "https://bot.boooe.com/feishu/oauth/callback"
@@ -761,10 +761,9 @@ def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
         def json(self):
             return {
                 "code": 0,
-                "data": {
-                    "access_token": "u-xxx",
-                    "refresh_token": "r-xxx",
-                },
+                "access_token": "u-xxx",
+                "refresh_token": "r-xxx",
+                "scope": "bitable:app",
             }
 
     class FakeClient:
@@ -805,5 +804,6 @@ def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
     assert result["status"] == 200
     assert result["payload"]["success"] is True
     assert result["payload"]["token"]["access_token"] == "u-xxx"
-    assert client.call[0].endswith("/open-apis/authen/v2/oauth/token")
-    assert client.call[1]["json"]["client_secret"] == "secret"
+    assert client.call[0] == "https://accounts.feishu.cn/oauth/v3/token"
+    assert client.call[1]["data"]["client_secret"] == "secret"
+    assert client.call[1]["data"]["redirect_uri"] == "https://example.com/callback"

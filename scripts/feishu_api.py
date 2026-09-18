@@ -18,6 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 FEISHU_BASE_URL = "https://open.feishu.cn"
+FEISHU_OAUTH_REDIRECT_URI = "https://bot.boooe.com/feishu/oauth/callback"
 
 
 class FeishuScriptError(RuntimeError):
@@ -114,22 +115,53 @@ def get_tenant_access_token(app_id: str, app_secret: str) -> str:
 
 
 def exchange_user_access_token(
-    app_id: str, app_secret: str, code: str, state: str = ""
+    app_id: str,
+    app_secret: str,
+    code: str,
+    state: str = "",
+    redirect_uri: str = FEISHU_OAUTH_REDIRECT_URI,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "grant_type": "authorization_code",
         "code": code,
         "client_id": app_id,
         "client_secret": app_secret,
+        "redirect_uri": redirect_uri,
     }
-    if state:
-        payload["state"] = state
-    data = _request_json(
-        "POST",
-        "/open-apis/authen/v2/oauth/token",
-        payload=payload,
+    url = "https://accounts.feishu.cn/oauth/v3/token"
+    request = urllib.request.Request(
+        url,
+        data=urllib.parse.urlencode(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST",
     )
-    result = data.get("data")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read()
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        status = exc.code
+    except urllib.error.URLError as exc:
+        raise FeishuScriptError(f"请求飞书失败：{exc.reason}") from exc
+    try:
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FeishuScriptError(f"飞书返回了无法解析的响应（HTTP {status}）") from exc
+    if not isinstance(data, dict):
+        raise FeishuScriptError(f"飞书返回格式不正确（HTTP {status}）")
+    if status >= 400 or data.get("code", 0) not in (0, None):
+        message = (
+            data.get("error_description")
+            or data.get("msg")
+            or data.get("message")
+            or "未知错误"
+        )
+        raise FeishuScriptError(f"飞书 API 错误 code={data.get('code', status)}: {message}")
+    result = data.get("data") if isinstance(data.get("data"), dict) else data
     if not isinstance(result, dict) or not result.get("access_token"):
         raise FeishuScriptError("飞书没有返回 user_access_token")
     return result

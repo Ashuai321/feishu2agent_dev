@@ -18,7 +18,7 @@ python -m scripts.xiaoc_send_mention --text "小C测试：请确认收到。"
 在飞书应用的重定向地址白名单中加入：
 
 ```text
-http://127.0.0.1:8765/callback
+https://bot.boooe.com/feishu/oauth/callback
 ```
 
 然后运行：
@@ -27,8 +27,9 @@ http://127.0.0.1:8765/callback
 python -m scripts.xiaoc_bitable_oauth
 ```
 
-浏览器会打开飞书授权页。授权完成后脚本接收 `code`，换取当前登录账号的
-`user_access_token`，保存到 `.feishu-user-token.json`（权限为 0600）。不要把这个文件提交到 Git。
+浏览器会打开飞书授权页，公开 Worker 回调会用当前应用凭证把 `code` 换成
+`user_access_token`，并在回调页返回 JSON。保存其中的 `token.access_token` 后，
+可通过 `FEISHU_USER_ACCESS_TOKEN` 传给写入脚本；不要把 token 提交到 Git。
 
 ## 3. 查看「测试」表并创建一行记录
 

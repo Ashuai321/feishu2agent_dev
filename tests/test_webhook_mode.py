@@ -148,7 +148,7 @@ def test_oauth_authorize_redirects_with_state(monkeypatch) -> None:
         assert resp.status_code == 302
         location = resp.headers["location"]
         assert location.startswith(
-            "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+            "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
         )
         assert "app_id=cli_test" in location
         assert "scope=bitable%3Aapp" in location
@@ -186,7 +186,11 @@ def test_oauth_callback_exchanges_code(monkeypatch) -> None:
         "scope": "bitable:app",
         "open_id": "ou_user",
     }
-    monkeypatch.setattr(bot, "exchange_user_access_token", lambda code, state=None: token_payload)
+    monkeypatch.setattr(
+        bot,
+        "exchange_user_access_token",
+        lambda code, state=None, redirect_uri=None: token_payload,
+    )
 
     app = Starlette(routes=bot.oauth_routes())
     with TestClient(app) as client:

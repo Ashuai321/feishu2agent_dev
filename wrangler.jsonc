@@ -5,6 +5,10 @@
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["python_workers"],
   "workers_dev": true,
+  "vars": {
+    "FEISHU_OAUTH_REDIRECT_URI": "https://bot.boooe.com/feishu/oauth/callback",
+    "FEISHU_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access"
+  },
   "observability": {
     "enabled": true
   },
