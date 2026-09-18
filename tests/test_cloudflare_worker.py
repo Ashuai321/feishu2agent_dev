@@ -130,6 +130,55 @@ def test_bitable_automation_formatter_preserves_arbitrary_json():
     assert '"status": "ok"' in text
 
 
+def test_bitable_automation_webhook_reads_request_body_once(monkeypatch):
+    worker = _load_worker_module()
+    responses = []
+    monkeypatch.setattr(
+        worker,
+        "_response",
+        lambda payload, status=200, headers=None: responses.append(
+            (payload, status, headers)
+        )
+        or responses[-1],
+    )
+
+    class Request:
+        method = "POST"
+        headers = {}
+
+        def __init__(self):
+            self.reads = 0
+
+        async def text(self):
+            self.reads += 1
+            return json.dumps({"text": "来自 AI 分析"}, ensure_ascii=False)
+
+        async def json(self):
+            raise AssertionError("the single-use body must not be read as JSON first")
+
+    class FakeFeishu:
+        async def send_text(self, chat_id, text):
+            assert chat_id == worker.BITABLE_WORKFLOW_GROUP_CHAT_ID
+            assert text == "[多维表格 AI 分析]\n来自 AI 分析"
+            return "om_forwarded"
+
+    relay = worker.CloudflareRelay(
+        SimpleNamespace(
+            BITABLE_WORKFLOW_GROUP_CHAT_ID=worker.BITABLE_WORKFLOW_GROUP_CHAT_ID,
+            BITABLE_AUTOMATION_WEBHOOK_TOKEN="",
+        ),
+        None,
+        SimpleNamespace(),
+    )
+    relay.feishu = FakeFeishu()
+    request = Request()
+
+    result = asyncio.run(relay.bitable_automation_webhook(request))
+
+    assert request.reads == 1
+    assert result == ({"success": True, "chat_id": worker.BITABLE_WORKFLOW_GROUP_CHAT_ID, "message_id": "om_forwarded"}, 200, None)
+
+
 def test_worker_parses_caption_and_image_post_message():
     worker = _load_worker_module()
     content = {

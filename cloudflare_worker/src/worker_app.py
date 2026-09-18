@@ -2280,14 +2280,15 @@ class CloudflareRelay:
                 )
 
         try:
+            # Cloudflare Request bodies are single-use streams.  Reading
+            # ``json()`` and then falling back to ``text()`` can raise
+            # ``Body already used`` even when the original payload is valid.
+            # Read the stream once and decode it locally instead.
+            raw = await request.text()
             try:
-                body = await request.json()
-            except Exception:
-                raw = await request.text()
-                try:
-                    body = json.loads(raw)
-                except (TypeError, ValueError):
-                    body = raw
+                body = json.loads(raw)
+            except (TypeError, ValueError):
+                body = raw
             if body in (None, "", [], {}):
                 return _response(
                     {
