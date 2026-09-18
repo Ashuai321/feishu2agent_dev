@@ -125,3 +125,95 @@ def test_normalize_accepts_push_body_dict() -> None:
     assert context.message_id == "om_1"
     assert context.sender_id == "ou_user"
     assert context.mentions_bot is True
+
+
+def _make_oauth_bot():
+    settings = Settings(
+        feishu_app_id="cli_test",
+        feishu_app_secret="secret",
+        feishu_event_mode="webhook",
+        feishu_oauth_redirect_uri="https://example.com/feishu/oauth/callback",
+        feishu_oauth_scope="bitable:app",
+    )
+    bot = FeishuBot(settings, _StubHandler())
+    bot._bot_open_id = "ou_bot"
+    return bot
+
+
+def test_oauth_authorize_redirects_with_state(monkeypatch) -> None:
+    bot = _make_oauth_bot()
+    app = Starlette(routes=bot.oauth_routes())
+    with TestClient(app) as client:
+        resp = client.get("/feishu/oauth/authorize", follow_redirects=False)
+        assert resp.status_code == 302
+        location = resp.headers["location"]
+        assert location.startswith(
+            "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+        )
+        assert "app_id=cli_test" in location
+        assert "scope=bitable%3Aapp" in location
+        assert "state=" in location
+        assert "redirect_uri=" in location
+        assert bot._oauth_states, "a state nonce should be recorded"
+        captured_state = next(iter(bot._oauth_states))
+        assert captured_state in location
+
+
+def test_oauth_authorize_requires_target() -> None:
+    bot = _make_oauth_bot()
+    bot._settings = Settings(
+        feishu_app_id="cli_test",
+        feishu_app_secret="secret",
+        feishu_event_mode="webhook",
+    )
+    app = Starlette(routes=bot.oauth_routes())
+    with TestClient(app) as client:
+        resp = client.get("/feishu/oauth/authorize")
+        assert resp.status_code == 400
+
+
+def test_oauth_callback_exchanges_code(monkeypatch) -> None:
+    bot = _make_oauth_bot()
+    # Simulate a fresh, valid state issued by the authorize endpoint.
+    bot._oauth_states["abc123"] = {
+        "target": "https://example.com/feishu/oauth/callback",
+        "expiry": __import__("time").time() + 300,
+    }
+    token_payload = {
+        "access_token": "u-xxx",
+        "refresh_token": "r-xxx",
+        "expires_in": 7200,
+        "scope": "bitable:app",
+        "open_id": "ou_user",
+    }
+    monkeypatch.setattr(bot, "exchange_user_access_token", lambda code, state=None: token_payload)
+
+    app = Starlette(routes=bot.oauth_routes())
+    with TestClient(app) as client:
+        resp = client.get(
+            "/feishu/oauth/callback", params={"code": "code-1", "state": "abc123"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["token"]["access_token"] == "u-xxx"
+    # state must be consumed
+    assert "abc123" not in bot._oauth_states
+
+
+def test_oauth_callback_rejects_unknown_state() -> None:
+    bot = _make_oauth_bot()
+    app = Starlette(routes=bot.oauth_routes())
+    with TestClient(app) as client:
+        resp = client.get(
+            "/feishu/oauth/callback", params={"code": "code-1", "state": "nope"}
+        )
+        assert resp.status_code == 400
+
+
+def test_oauth_callback_requires_code() -> None:
+    bot = _make_oauth_bot()
+    app = Starlette(routes=bot.oauth_routes())
+    with TestClient(app) as client:
+        resp = client.get("/feishu/oauth/callback")
+        assert resp.status_code == 400

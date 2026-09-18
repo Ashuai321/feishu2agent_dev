@@ -6,9 +6,13 @@ import asyncio
 import json
 import logging
 import re
+import secrets
+import time
 from typing import Any
+from urllib.parse import urlencode
 
 import lark_oapi as lark
+import requests
 from lark_oapi.api.im.v1 import (
     CreateChatRequest,
     CreateChatRequestBody,
@@ -21,7 +25,7 @@ from lark_oapi.api.im.v1 import (
 )
 from requests_toolbelt import MultipartEncoder
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from .bot_handler import MessageHandler
@@ -81,6 +85,8 @@ class FeishuBot:
             .build()
         )
         self._bot_open_id = ""
+        # Pending OAuth state nonces: state -> {"target": str, "expiry": float}
+        self._oauth_states: dict[str, dict[str, Any]] = {}
 
     def start(self) -> None:
         self._bot_open_id = self._fetch_bot_open_id()
@@ -166,6 +172,136 @@ class FeishuBot:
     def webhook_route(self) -> Route:
         """Backward-compatible accessor for the singular webhook route."""
         return self.webhook_routes()[1]
+
+    def oauth_routes(self) -> list[Route]:
+        """Routes for user-identity OAuth used to act on Bitable with the
+        authorizing user's own permissions (not the bot's).
+
+        - ``GET /feishu/oauth/authorize`` builds a Feishu authorization link
+          (with a fresh ``state`` nonce) and redirects the user to it.
+        - ``GET /feishu/oauth/callback`` exchanges the returned ``code`` for a
+          ``user_access_token`` and renders the token (plus refresh token) so
+          it can be wired into Bitable calls.
+        """
+        return [
+            Route("/feishu/oauth/authorize", endpoint=self._oauth_authorize, methods=["GET"]),
+            Route("/feishu/oauth/callback", endpoint=self._oauth_callback, methods=["GET"]),
+        ]
+
+    def _oauth_authorize(self, request: Request) -> RedirectResponse:
+        settings = self._settings
+        callback_uri = (request.query_params.get("callback_uri") or "").strip()
+        default_redirect = settings.feishu_oauth_redirect_uri.strip()
+        if not callback_uri:
+            callback_uri = default_redirect
+        if not callback_uri:
+            msg = (
+                "Missing OAuth redirect target. Pass ?callback_uri=... or set "
+                "FEISHU_OAUTH_REDIRECT_URI in the environment."
+            )
+            return HTMLResponse(msg, status_code=400)
+
+        state = secrets.token_urlsafe(32)
+        expires_at = time.time() + settings.feishu_oauth_state_ttl_seconds
+        self._oauth_states[state] = {"target": callback_uri, "expiry": expires_at}
+
+        authorize_query = urlencode(
+            {
+                "app_id": settings.feishu_app_id,
+                "redirect_uri": callback_uri,
+                "scope": settings.feishu_oauth_scope,
+                "state": state,
+            }
+        )
+        authorize_url = (
+            "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+            + authorize_query
+        )
+        logger.info("OAuth authorize: state=%s target=%s", state, callback_uri)
+        return RedirectResponse(authorize_url, status_code=302)
+
+    async def _oauth_callback(self, request: Request) -> JSONResponse:
+        params = request.query_params
+        code = (params.get("code") or "").strip()
+        state = (params.get("state") or "").strip()
+        if not code:
+            return JSONResponse(
+                {"success": False, "error": "missing 'code' parameter"}, status_code=400
+            )
+
+        if state:
+            record = self._oauth_states.pop(state, None)
+            if record is None:
+                return JSONResponse(
+                    {"success": False, "error": "unknown or already-consumed 'state'"},
+                    status_code=400,
+                )
+            if record.get("expiry", 0) < time.time():
+                return JSONResponse(
+                    {"success": False, "error": "expired 'state'"},
+                    status_code=400,
+                )
+        else:
+            logger.warning("OAuth callback received no state nonce")
+
+        token = await asyncio.to_thread(
+            self.exchange_user_access_token, code, state=state or None
+        )
+        if not token:
+            return JSONResponse(
+                {"success": False, "error": "failed to exchange authorization code"},
+                status_code=502,
+            )
+        logger.info(
+            "OAuth callback: issued user_access_token open_id=%s",
+            token.get("open_id"),
+        )
+        return JSONResponse({"success": True, "token": token})
+
+    def exchange_user_access_token(
+        self, code: str, *, state: str | None = None
+    ) -> dict[str, Any] | None:
+        """Exchange a user-authorization ``code`` for ``user_access_token``.
+
+        Returns the raw token payload (``access_token``, ``refresh_token``,
+        ``expires_in``, ``scope``, ``open_id`` ...) or ``None`` on failure.
+        """
+        settings = self._settings
+        payload: dict[str, Any] = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": settings.feishu_app_id,
+            "client_secret": settings.feishu_app_secret,
+        }
+        if state:
+            payload["state"] = state
+        try:
+            response = requests.post(
+                "https://open.feishu.cn/open-apis/authen/v2/oauth/token",
+                json=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                timeout=20,
+            )
+        except requests.RequestException:
+            logger.exception("OAuth token exchange network failure")
+            return None
+        if response.status_code != 200:
+            logger.error(
+                "OAuth token exchange failed status=%s body=%s",
+                response.status_code,
+                response.text[:1000],
+            )
+            return None
+        try:
+            body = response.json()
+            data = body.get("data") or {}
+        except (ValueError, AttributeError):
+            logger.exception("OAuth token exchange returned invalid JSON")
+            return None
+        if not data.get("access_token"):
+            logger.error("OAuth token exchange missing access_token body=%s", body)
+            return None
+        return data
 
     @staticmethod
     async def _read_json(request: Request) -> dict[str, Any] | None:

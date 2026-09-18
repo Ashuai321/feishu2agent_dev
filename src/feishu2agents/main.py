@@ -206,8 +206,11 @@ def main() -> int:
         register_feishu_tools(relay_mcp, bot, requester_registry, group_draft_store)
 
         # In webhook mode, receive Feishu events over HTTP instead of the long
-        # connection: mount the event callback on the same relay HTTP app.
-        extra_routes = bot.webhook_routes() if settings.feishu_event_mode == "webhook" else None
+        # connection: mount the event callback on the same relay HTTP app. The
+        # user-identity OAuth callbacks are mounted regardless of event mode.
+        extra_routes = list(bot.oauth_routes())
+        if settings.feishu_event_mode == "webhook":
+            extra_routes.extend(bot.webhook_routes())
         app = build_http_app(extra_routes=extra_routes)
 
         def serve_http() -> None:
