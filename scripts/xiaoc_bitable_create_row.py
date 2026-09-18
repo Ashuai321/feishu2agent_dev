@@ -19,6 +19,7 @@ try:
         get_user_info,
         load_dotenv,
         parse_date_to_millis,
+        platform_endpoints,
         resolve_wiki_bitable_app_token,
     )
 except ModuleNotFoundError:  # Allows ``python scripts/xiaoc_bitable_create_row.py``.
@@ -30,6 +31,7 @@ except ModuleNotFoundError:  # Allows ``python scripts/xiaoc_bitable_create_row.
         get_user_info,
         load_dotenv,
         parse_date_to_millis,
+        platform_endpoints,
         resolve_wiki_bitable_app_token,
     )
 
@@ -50,8 +52,9 @@ FIELD_NAMES = (
 )
 
 
-def _token_from_args(path: Path | None) -> str:
-    value = os.getenv("FEISHU_USER_ACCESS_TOKEN", "").strip()
+def _token_from_args(path: Path | None, platform: str) -> str:
+    endpoints = platform_endpoints(platform)
+    value = os.getenv(endpoints.user_token_env, "").strip()
     if value:
         return value
     if path and path.exists():
@@ -60,7 +63,8 @@ def _token_from_args(path: Path | None) -> str:
         if value:
             return value
     raise FeishuScriptError(
-        "缺少用户 token：先运行 xiaoc_bitable_oauth.py，或设置 FEISHU_USER_ACCESS_TOKEN"
+        f"缺少{platform}用户 token：先运行 xiaoc_bitable_oauth.py --platform {platform}，"
+        f"或设置 {endpoints.user_token_env}"
     )
 
 
@@ -114,7 +118,8 @@ def _build_fields(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--token-file", type=Path, default=Path(".feishu-user-token.json"))
+    parser.add_argument("--platform", choices=("feishu", "lark"), default="feishu")
+    parser.add_argument("--token-file", type=Path, default=None)
     parser.add_argument("--wiki-token", default=WIKI_TOKEN)
     parser.add_argument("--table-id", default=TABLE_ID)
     parser.add_argument("--app-token", help="已知 app_token；不传则用 wiki token 解析")
@@ -132,26 +137,37 @@ def main() -> int:
     args = parser.parse_args()
     try:
         load_dotenv()
-        user_token = _token_from_args(args.token_file)
-        app_token = args.app_token or resolve_wiki_bitable_app_token(user_token, args.wiki_token)
-        fields = get_bitable_fields(user_token, app_token, args.table_id)
+        endpoints = platform_endpoints(args.platform)
+        token_file = args.token_file or Path(endpoints.user_token_file)
+        user_token = _token_from_args(token_file, args.platform)
+        app_token = args.app_token or resolve_wiki_bitable_app_token(
+            user_token, args.wiki_token, base_url=endpoints.api_base
+        )
+        fields = get_bitable_fields(
+            user_token, app_token, args.table_id, base_url=endpoints.api_base
+        )
         available = _field_map(fields)
         _print_fields(fields)
         if args.inspect:
-            records = get_bitable_records(user_token, app_token, args.table_id)
+            records = get_bitable_records(
+                user_token, app_token, args.table_id, base_url=endpoints.api_base
+            )
             print(f"现有记录数（当前页最多 100 条）：{len(records)}")
             for record in records[:10]:
                 print(json.dumps(record, ensure_ascii=False))
             return 0
         user_open_id = ""
         with contextlib.suppress(FeishuScriptError):
-            user_open_id = str(get_user_info(user_token).get("open_id") or "")
+            user_open_id = str(
+                get_user_info(user_token, base_url=endpoints.api_base).get("open_id") or ""
+            )
         values = _build_fields(args, available, user_open_id)
         record = create_bitable_record(
             user_token,
             app_token=app_token,
             table_id=args.table_id,
             fields=values,
+            base_url=endpoints.api_base,
         )
     except (FeishuScriptError, OSError, json.JSONDecodeError) as exc:
         print(f"多维表格操作失败：{exc}")

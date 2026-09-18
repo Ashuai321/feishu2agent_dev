@@ -48,3 +48,5 @@ dist/
 # Agent request/result state (contains per-request callback credentials)
 data/
 .tools/
+
+.feishu-user-token.json

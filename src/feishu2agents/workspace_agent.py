@@ -78,9 +78,13 @@ class WorkspaceAgentMessageHandler:
         # Optional callable(user_message_id, text) -> outbound_message_id, used to
         # post the "processing" placeholder that the final answer overrides in place.
         self.post_placeholder: Callable[[str, str], str] | None = None
+        # Optional platform-aware variant used when both Feishu and Lark bots
+        # run in the same process. The legacy callback above remains supported.
+        self.post_placeholder_for_context: Callable[[MessageContext, str], str] | None = None
         # Optional callable(message_id, image_key) -> bytes: used to persist an
         # image quote-reply as the conversation's pending group avatar.
         self.download_image: Callable[[str, str], bytes] | None = None
+        self.download_image_for_context: Callable[[MessageContext, str], bytes] | None = None
         # Optional callable(context, conversation_key): fired once a message is
         # claimed for dispatch, so the caller can record who @'d the bot.
         self.on_dispatch: Callable[[MessageContext, str], None] | None = None
@@ -92,7 +96,10 @@ class WorkspaceAgentMessageHandler:
         stored = False
         for image_key in context.image_keys:
             try:
-                data = self.download_image(context.message_id, image_key)
+                if self.download_image_for_context is not None:
+                    data = self.download_image_for_context(context, image_key)
+                else:
+                    data = self.download_image(context.message_id, image_key)
             except Exception:
                 logger.exception(
                     "Failed to download image image_key=%s message_id=%s",
@@ -110,12 +117,17 @@ class WorkspaceAgentMessageHandler:
         return stored
 
     def _post_processing_placeholder(self, context: MessageContext, request_id: str) -> None:
-        if self.post_placeholder is None:
+        if self.post_placeholder is None and self.post_placeholder_for_context is None:
             return
         try:
-            outbound = self.post_placeholder(
-                context.message_id, "正在处理，Agent 完成后会回复到这条消息。"
-            )
+            if self.post_placeholder_for_context is not None:
+                outbound = self.post_placeholder_for_context(
+                    context, "正在处理，Agent 完成后会回复到这条消息。"
+                )
+            else:
+                outbound = self.post_placeholder(
+                    context.message_id, "正在处理，Agent 完成后会回复到这条消息。"
+                )
         except Exception:
             logger.exception(
                 "Failed to post processing placeholder request_id=%s message_id=%s",
@@ -138,7 +150,20 @@ class WorkspaceAgentMessageHandler:
             )
             if continued:
                 return continued
-        return f"feishu:{context.bot_app_id}:{context.chat_id}:{uuid4().hex[:12]}"
+        platform = (
+            str(getattr(context, "platform", "feishu") or "feishu").strip().lower()
+            or "feishu"
+        )
+        return f"{platform}:{context.bot_app_id}:{context.chat_id}:{uuid4().hex[:12]}"
+
+    @staticmethod
+    def _bridge_message_key(context: MessageContext) -> str:
+        """Keep Lark and legacy Feishu message dedupe keys disjoint."""
+        platform = (
+            str(getattr(context, "platform", "feishu") or "feishu").strip().lower()
+            or "feishu"
+        )
+        return context.message_id if platform == "feishu" else f"{platform}:{context.message_id}"
 
     def _find_agent(self, conversation: dict) -> dict:
         for agent in self._store.list_agents():
@@ -159,12 +184,17 @@ class WorkspaceAgentMessageHandler:
         if not should_process(context):
             return None
         base_conversation_key = self._conversation_key(context)
-        first_request_id = generate_request_id("feishu")
+        platform = (
+            str(getattr(context, "platform", "feishu") or "feishu").strip().lower()
+            or "feishu"
+        )
+        first_request_id = generate_request_id(platform)
 
         # Exactly-once gate per Feishu message: only the first handler call owns
         # the message. Redeliveries (WS reconnect, duplicate instances) skip.
+        bridge_message_key = self._bridge_message_key(context)
         if not self._bridge.claim(
-            feishu_message_id=context.message_id,
+            feishu_message_id=bridge_message_key,
             request_id=first_request_id,
         ):
             logger.info(
@@ -208,7 +238,7 @@ class WorkspaceAgentMessageHandler:
 
         dispatched_request_ids: list[str] = []
         for index, (agent, access_token) in enumerate(targets):
-            request_id = first_request_id if index == 0 else generate_request_id("feishu")
+            request_id = first_request_id if index == 0 else generate_request_id(platform)
             conversation_key = self._agent_conversation_key(
                 base_conversation_key, int(agent["id"]), fanout=fanout
             )
@@ -246,7 +276,7 @@ class WorkspaceAgentMessageHandler:
             )
             if index > 0:
                 self._bridge.register_run(
-                    feishu_message_id=context.message_id,
+                    feishu_message_id=bridge_message_key,
                     request_id=request_id,
                 )
             trigger_input = build_trigger_input(

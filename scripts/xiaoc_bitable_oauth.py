@@ -1,4 +1,4 @@
-"""Obtain the current Feishu user's Bitable OAuth token through a browser."""
+"""Obtain the current Feishu or Lark user's Bitable OAuth token through a browser."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ try:
         FeishuScriptError,
         exchange_user_access_token,
         load_dotenv,
+        platform_endpoints,
         required_env,
     )
 except ModuleNotFoundError:  # Allows ``python scripts/xiaoc_bitable_oauth.py``.
@@ -23,11 +24,12 @@ except ModuleNotFoundError:  # Allows ``python scripts/xiaoc_bitable_oauth.py``.
         FeishuScriptError,
         exchange_user_access_token,
         load_dotenv,
+        platform_endpoints,
         required_env,
     )
 
 DEFAULT_AUTHORIZE_URL = "https://bot.boooe.com/feishu/oauth/authorize"
-DEFAULT_CALLBACK_URI = "http://127.0.0.1:8765/callback"
+DEFAULT_CALLBACK_URI = "https://bot.boooe.com/feishu/oauth/callback"
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -57,63 +59,89 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 
 def _save_token(path: Path, token: dict[str, object]) -> None:
-    path.write_text(json.dumps(token, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(token, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     with contextlib.suppress(OSError):
         path.chmod(0o600)
 
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--authorize-url", default=DEFAULT_AUTHORIZE_URL)
-    parser.add_argument("--callback-uri", default=DEFAULT_CALLBACK_URI)
-    parser.add_argument("--token-file", type=Path, default=Path(".feishu-user-token.json"))
+    parser.add_argument("--platform", choices=("feishu", "lark"), default="feishu")
+    parser.add_argument("--authorize-url", default="")
+    parser.add_argument("--callback-uri", default="")
+    parser.add_argument("--token-file", type=Path, default=None)
     parser.add_argument("--no-open", action="store_true", help="只打印授权地址，不自动打开浏览器")
     args = parser.parse_args()
-    parsed_callback = urlparse(args.callback_uri)
-    if parsed_callback.scheme != "http" or parsed_callback.hostname not in {
+    endpoints = platform_endpoints(args.platform)
+    callback_uri = args.callback_uri or endpoints.oauth_redirect_uri
+    authorize_url = args.authorize_url or (
+        f"https://bot.boooe.com/{args.platform}/oauth/authorize"
+    )
+    token_file = args.token_file or Path(endpoints.user_token_file)
+    parsed_callback = urlparse(callback_uri)
+    is_local_callback = parsed_callback.scheme == "http" and parsed_callback.hostname in {
         "127.0.0.1",
         "localhost",
-    }:
-        print("为让脚本自动接收 code，callback-uri 必须是本机地址，例如 http://127.0.0.1:8765/callback")
+    }
+    is_public_callback = (
+        parsed_callback.scheme == "https"
+        and parsed_callback.netloc == "bot.boooe.com"
+        and parsed_callback.path == f"/{args.platform}/oauth/callback"
+    )
+    if not is_local_callback and not is_public_callback:
+        print(
+            "callback-uri 必须使用公开回调地址："
+            f"https://bot.boooe.com/{args.platform}/oauth/callback；"
+            "如需本地自动保存 token，可显式传入本机回调地址。"
+        )
         return 1
-    if not parsed_callback.port:
-        print("callback-uri 必须包含端口，例如 http://127.0.0.1:8765/callback")
+    if is_local_callback and not parsed_callback.port:
+        print("本地 callback-uri 必须包含端口，例如 http://127.0.0.1:8765/callback")
         return 1
     try:
-        load_dotenv()
-        app_id = required_env("FEISHU_APP_ID")
-        app_secret = required_env("FEISHU_APP_SECRET")
-        server = ThreadingHTTPServer(
-            (parsed_callback.hostname, parsed_callback.port), _CallbackHandler
-        )
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
-        server_thread.start()
-        authorize_url = args.authorize_url.rstrip("/") + "?" + urlencode(
-            {"callback_uri": args.callback_uri}
+        if is_local_callback:
+            load_dotenv()
+            app_id = required_env(endpoints.app_id_env)
+            app_secret = required_env(endpoints.app_secret_env)
+            server = ThreadingHTTPServer(
+                (parsed_callback.hostname, parsed_callback.port), _CallbackHandler
+            )
+            server_thread = threading.Thread(target=server.handle_request, daemon=True)
+            server_thread.start()
+        authorize_url = authorize_url.rstrip("/") + "?" + urlencode(
+            {"callback_uri": callback_uri}
         )
         print("请在浏览器中完成飞书授权：")
         print(authorize_url)
         if not args.no_open:
             webbrowser.open(authorize_url)
-        server_thread.join(timeout=300)
-        server.server_close()
-        result = dict(_CallbackHandler.result)
-        if not result.get("code"):
-            raise FeishuScriptError(result.get("error") or "等待授权回调超时")
-        token = exchange_user_access_token(
-            app_id,
-            app_secret,
-            result["code"],
-            state=result.get("state", ""),
+        if is_local_callback:
+            server_thread.join(timeout=300)
+            server.server_close()
+            result = dict(_CallbackHandler.result)
+            if not result.get("code"):
+                raise FeishuScriptError(result.get("error") or "等待授权回调超时")
+            token = exchange_user_access_token(
+                app_id,
+                app_secret,
+                result["code"],
+                redirect_uri=callback_uri,
+                auth_base=endpoints.auth_base,
+            )
+            _save_token(token_file, token)
+            print(f"OAuth 成功，token 已保存到 {token_file}（权限由授权页决定）")
+            if token.get("open_id"):
+                print(f"当前用户 open_id={token['open_id']}")
+            return 0
+        print(
+            "授权完成后，公开回调页会显示 token；"
+            "请将回调页返回的 JSON 保存后再运行写入脚本。"
         )
-        _save_token(args.token_file, token)
+        return 0
     except (OSError, FeishuScriptError) as exc:
         print(f"OAuth 失败：{exc}")
         return 1
-    print(f"OAuth 成功，token 已保存到 {args.token_file}（权限由飞书授权页决定）")
-    if token.get("open_id"):
-        print(f"当前用户 open_id={token['open_id']}")
-    return 0
 
 
 if __name__ == "__main__":

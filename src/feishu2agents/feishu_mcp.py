@@ -95,11 +95,23 @@ def _validate_group_updates(changes: dict[str, Any]) -> str | None:
 
 def register_feishu_tools(
     mcp: Any,
-    bot: FeishuBot,
+    bot: FeishuBot | dict[str, FeishuBot],
     registry: RequesterRegistry,
     group_draft_store: Any | None = None,
 ) -> None:
     """Attach Feishu group tools (private + custom group workflow) to ``mcp``."""
+
+    bots = bot if isinstance(bot, dict) else {getattr(bot, "_platform", "feishu"): bot}
+
+    def bot_for(conversation_key: str, info: dict[str, Any] | None = None) -> FeishuBot:
+        # The platform prefix is written at event dispatch time and is the
+        # authoritative routing key.  The registry value is only a legacy
+        # fallback for conversation keys created before platform routing.
+        key_platform = str(conversation_key.split(":", 1)[0] or "").strip().lower()
+        platform = key_platform if key_platform in bots else ""
+        if not platform:
+            platform = str((info or {}).get("platform") or "").strip().lower()
+        return bots.get(platform) or bots.get("feishu") or next(iter(bots.values()))
 
     @mcp.tool(
         name="get_requester_info",
@@ -158,8 +170,9 @@ def register_feishu_tools(
                 },
             }
         try:
+            selected_bot = bot_for(conversation_key, info)
             chat_id = await asyncio.to_thread(
-                bot.create_private_group,
+                selected_bot.create_private_group,
                 open_id,
                 chat_name,
                 source_chat_id=info.get("source_chat_id") or None,
@@ -196,7 +209,9 @@ def register_feishu_tools(
     )
     async def search_contacts(conversation_key: str, query: str) -> dict[str, Any]:
         try:
-            candidates = await asyncio.to_thread(bot.search_contacts, query)
+            candidates = await asyncio.to_thread(
+                bot_for(conversation_key).search_contacts, query
+            )
         except FeishuApiError as exc:
             return {"success": False, "error": {"code": exc.code, "message": exc.message}}
         except Exception as exc:
@@ -267,7 +282,9 @@ def register_feishu_tools(
         data = group_draft_store.read_avatar(conversation_key)
         if data is None:
             return None
-        return await asyncio.to_thread(bot.upload_avatar_image, data)
+        return await asyncio.to_thread(
+            bot_for(conversation_key).upload_avatar_image, data
+        )
 
     @mcp.tool(
         name="create_group",
@@ -310,8 +327,9 @@ def register_feishu_tools(
                     },
                 }
         try:
+            selected_bot = bot_for(conversation_key, info)
             chat_id = await asyncio.to_thread(
-                bot.create_chat, name, members, avatar_key
+                selected_bot.create_chat, name, members, avatar_key
             )
         except FeishuApiError as exc:
             return {"success": False, "error": {"code": exc.code, "message": exc.message}}
@@ -374,7 +392,9 @@ def register_feishu_tools(
                         "message": "no stored avatar image; ask the user to send one",
                     },
                 }
-            await asyncio.to_thread(bot.update_chat, chat_id, avatar_image_key=avatar_key)
+            await asyncio.to_thread(
+                bot_for(conversation_key).update_chat, chat_id, avatar_image_key=avatar_key
+            )
         except FeishuApiError as exc:
             return {"success": False, "error": {"code": exc.code, "message": exc.message}}
         except Exception as exc:
@@ -423,7 +443,7 @@ def register_feishu_tools(
                 },
             }
         try:
-            data = await asyncio.to_thread(bot.get_chat, chat_id)
+            data = await asyncio.to_thread(bot_for(conversation_key).get_chat, chat_id)
         except FeishuApiError as exc:
             return {"success": False, "error": {"code": exc.code, "message": exc.message}}
         except Exception as exc:
@@ -536,7 +556,9 @@ def register_feishu_tools(
             return {"success": False, "error": {"code": "invalid_setting", "message": invalid}}
         avatar_from_stored = set_avatar_from_stored
         try:
-            await asyncio.to_thread(bot.update_chat, chat_id, **changes)
+            await asyncio.to_thread(
+                bot_for(conversation_key).update_chat, chat_id, **changes
+            )
         except FeishuApiError as exc:
             return {"success": False, "error": {"code": exc.code, "message": exc.message}}
         except Exception as exc:

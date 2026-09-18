@@ -1,7 +1,7 @@
 # Feishu2Agents
 
-当前生产入口是 Cloudflare Python Worker：飞书事件、MCP/OAuth 和 Agent 回调都在
-Cloudflare 内完成。Worker 使用 D1 保存最小状态，Queue 处理后台任务，Feishu API
+当前生产入口是 Cloudflare Python Worker：Feishu/Lark 事件、MCP/OAuth 和 Agent 回调都在
+Cloudflare 内完成。Worker 使用 D1 保存最小状态，Queue 处理后台任务，平台 API
 负责重新同步可恢复信息，R2 只保存必要文件。稳定公网域名保持为
 `https://bot.boooe.com`，不使用 `PYTHON_ORIGIN` 或 tunnel。
 
@@ -9,13 +9,13 @@ Cloudflare 内完成。Worker 使用 D1 保存最小状态，Queue 处理后台�
 
 ```mermaid
 flowchart TD
-    U[飞书用户] -->|@机器人| F[飞书群聊]
-    F -->|开发者服务器 Webhook| W[Cloudflare Python Worker]
+    U[Feishu/Lark 用户] -->|@机器人| F[对应平台群聊]
+    F -->|平台 Webhook| W[Cloudflare Python Worker]
     W --> D1[(D1 最小状态)]
     W --> Q[Cloudflare Queue]
     Q --> A[Workspace Agent Trigger]
     A -->|MCP prd 回调| W
-    W --> API[Feishu API]
+    W --> API[对应平台 API]
     W -.必要文件.-> R2[(R2)]
     API --> F
 ```
@@ -26,7 +26,7 @@ D1 的去重、会话、发起人和 OAuth 状态在 Worker 重启后仍可恢�
 ## 环境要求
 
 - Python 3.11 or newer（Cloudflare Python Workers / `pywrangler` requirement）
-- 一个已启用机器人能力的飞书企业自建应用
+- 一个已启用机器人能力的 Feishu 企业自建应用；如需 Lark，再准备一个 Lark 应用
 - 可以访问飞书开放平台的本地网络
 
 本地 ASGI 入口仍可用于回归测试和故障排查；生产部署使用下面的 Cloudflare Python Worker，
@@ -71,6 +71,9 @@ cp .env.example .env
 ```dotenv
 FEISHU_APP_ID=cli_xxx
 FEISHU_APP_SECRET=your_app_secret
+# 可选：配置后本地进程会同时监听 Lark；凭证只放本地环境，不提交仓库。
+LARK_APP_ID=cli_xxx
+LARK_APP_SECRET=your_lark_app_secret
 ```
 
 `.env` 已被 Git 忽略。不要将 App Secret、tenant access token、请求头或真实 `.env`
@@ -103,15 +106,61 @@ python -m feishu2agents.main
 
 启动时程序会：
 
-1. 校验 `FEISHU_APP_ID` 和 `FEISHU_APP_SECRET`。
-2. 通过飞书 API 获取当前机器人的 `open_id`，用于准确识别多人 mention 中的 Bot。
-3. 在长连接模式建立连接并订阅 `im.message.receive_v1`；在 Webhook 模式挂载
-   `POST /feishu/events`（并保留 `/feishu/event` 兼容别名）。
+1. 校验 Feishu 凭证；若同时配置 `LARK_APP_ID`/`LARK_APP_SECRET`，再初始化 Lark 客户端。
+2. 分别通过对应平台 API 获取机器人的 `open_id`，用于准确识别多人 mention 中的 Bot。
+3. 各平台独立建立长连接，或分别挂载 `POST /feishu/events`、`POST /lark/events`（均保留
+   单数 `/event` 兼容别名）。
 4. 处理群聊中明确 @当前 Bot 的文本消息。
 5. 使用消息回复 API 回复原消息。
 
 日志只输出 message、chat、sender 等诊断标识和错误码，不输出 Secret、token、完整消息正文
 或原始事件。
+
+### 平台判定与用户权限
+
+平台不会通过 `open_id` 的字符串格式猜测，因为 Feishu 与 Lark 的 ID 形状可能相同。
+程序以事件进入的 Webhook 路径或长连接客户端作为可信来源：Feishu 事件进入
+`/feishu/events`，Lark 事件进入 `/lark/events`；本地长连接也分别绑定对应应用凭证。
+随后会话键带有 `feishu:` 或 `lark:` 前缀，Agent 回调、占位消息、最终回复、群聊工具和
+去重记录都沿用这个前缀，因此不会把 Lark 请求发到 Feishu，反之亦然。
+
+涉及用户权限的多维表格操作同样按平台分开：先进入对应平台的 OAuth 地址取得当前用户的
+`user_access_token`，再使用同一平台 API 域名读取该用户对目标多维表格的权限并执行读写。
+本地脚本用 `--platform feishu` 或 `--platform lark` 选择平台，token 文件和环境变量也彼此
+独立；不提供 Lark 凭证时，原 Feishu 流程保持不变。
+
+### 指定测试群：以 @ 发起人的身份写入多维表格
+
+`BITABLE_WORKFLOW_GROUP_CHAT_ID` 默认是
+`oc_5e9132f3638772d53d92d6fc5e953abc`。在这个群里明确 @机器人并发送文字时，
+Worker 根据事件进入的 `/feishu/events` 或 `/lark/events` 判定平台，保存发送人的
+`open_id`，并回复该平台的 OAuth 授权链接。用户完成授权后，回调会再次调用对应平台的
+`user_info`，只有返回的 `open_id` 与发起 @ 的人一致才会继续；随后以该用户 token 将
+文字写入 Wiki 节点对应多维表格「测试」表的「任务描述」，并把发起人的 open_id 写入
+「任务执行人」。不同平台的 token、API 域名和用户身份严格隔离。
+
+机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的 `user_access_token`，所以
+第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1
+中，后续同一用户可直接复用；撤销或过期后会再次要求授权。若 Lark 用户无权访问这个
+Feishu 租户中的 Wiki/多维表格，API 会返回权限错误，系统不会降级使用 Feishu 机器人
+或其他人的 token。
+
+需要只在本地验证当前已授权用户时，可运行：
+
+```bash
+python -m scripts.xiaoc_bitable_current_user --list-users
+python -m scripts.xiaoc_bitable_current_user --text "当前用户测试任务"
+```
+
+另有逐人 @ 测试脚本：
+
+```bash
+python -m scripts.xiaoc_group_mention_all --dry-run
+python -m scripts.xiaoc_group_mention_all --platform feishu --text "请确认收到"
+```
+
+指定群之外的消息仍交给原来的 Workspace Agent Relay；该 Agent 路径已单独封装，避免与
+授权写表流程互相影响。
 
 ## Cloudflare Python Worker 部署
 
@@ -122,7 +171,9 @@ Worker 使用四类 Cloudflare 绑定：
 - D1（`DB`）保存去重键、Relay 运行记录、发起人映射和 OAuth 状态。
 - Queue（`AGENT_QUEUE`）在飞书 Webhook 请求之外处理占位回复、Agent 触发和最终结果回写，避免超过飞书的响应时限。
 - R2（`AVATARS`）只为确实需要跨重启保留的文件预留；当前部署暂不绑定 R2，避免开通需要付款方式的订阅。
-- Worker Secrets 保存飞书凭证和 Workspace Agent 触发凭证。
+- Worker Secrets 保存 Feishu/Lark 凭证和 Workspace Agent 触发凭证。Feishu 与 Lark 的
+  App ID、App Secret、Bot open_id 和 verify token 必须分别配置；事件的平台前缀会贯穿
+  会话、回复和用户授权，因而不会交叉使用另一平台的 token。
 
 首次部署时，在仓库根目录执行以下命令创建资源（先执行 `npx wrangler login`）：
 
@@ -147,6 +198,10 @@ npx wrangler secret put FEISHU_APP_ID
 npx wrangler secret put FEISHU_APP_SECRET
 npx wrangler secret put FEISHU_BOT_OPEN_ID
 npx wrangler secret put FEISHU_VERIFY_TOKEN
+npx wrangler secret put LARK_APP_ID
+npx wrangler secret put LARK_APP_SECRET
+npx wrangler secret put LARK_BOT_OPEN_ID
+npx wrangler secret put LARK_VERIFY_TOKEN
 npx wrangler secret put WORKSPACE_AGENT_RELAY_TRIGGER_URL
 npx wrangler secret put WORKSPACE_AGENT_RELAY_AGENT_TOKEN
 npx wrangler secret put WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN
@@ -154,7 +209,8 @@ npx wrangler secret put WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN
 
 飞书用户 OAuth 默认回调地址为 `https://bot.boooe.com/feishu/oauth/callback`，请把它加入飞书应用的重定向地址白名单。若使用其他地址，再配置 `FEISHU_OAUTH_REDIRECT_URI`；授权入口为
 `https://bot.boooe.com/feishu/oauth/authorize`，回调会用 `code` 换取
-`user_access_token`。`state` 会保存在 D1 中并且只能使用一次。
+`user_access_token`。当前使用飞书 OAuth v3 令牌端点
+`https://accounts.feishu.cn/oauth/v3/token`，`state` 会保存在 D1 中并且只能使用一次。
 
 `WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL` 可不设置，代码默认使用 `https://bot.boooe.com`。
 `WORKSPACE_AGENT_RELAY_TRIGGER_URL` 是已发布 Workspace Agent 的触发地址，不是 Python 服务地址。
@@ -167,6 +223,24 @@ npx wrangler secret put WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN
 ```text
 https://bot.boooe.com/feishu/events
 ```
+
+Lark 应用填写：
+
+```text
+https://bot.boooe.com/lark/events
+```
+
+用户多维表格授权也按平台区分：Feishu 使用 `/feishu/oauth/authorize`，Lark 使用
+`/lark/oauth/authorize`；本地脚本可通过 `--platform lark` 取得 Lark 用户 token，写入
+脚本会使用对应的 Lark API 域名和 `.lark-user-token.json`，不会复用 Feishu token。
+
+指定测试群是 Feishu 外部群时，不要求 Lark 机器人加入群。Feishu 机器人接收消息后会
+根据事件中的发送方租户判断授权平台：同租户走 Feishu OAuth，外部租户走 Lark OAuth，
+授权链接仍由 Feishu 机器人回复；回调再使用 Lark 用户令牌写入多维表格。若部署环境能
+明确列出 Lark 租户，可用逗号分隔的 `LARK_EXTERNAL_TENANT_KEYS` 覆盖自动判断结果。
+由于 Feishu/Lark 的用户 `open_id` 属于不同命名空间，跨平台回调不会再比较两边的
+`open_id`，而是使用一次性、短时有效的 OAuth state 绑定原始群消息；同平台仍保持
+严格的用户身份匹配。
 
 ChatGPT 连接器的 MCP 地址填写：
 

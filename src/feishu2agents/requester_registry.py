@@ -28,6 +28,7 @@ class RequesterRegistry:
         open_id: str | None = None,
         name: str = "",
         source_chat_id: str = "",
+        platform: str = "feishu",
     ) -> None:
         """Record who mentioned the bot for a given conversation_key."""
         now = datetime.now(UTC).isoformat()
@@ -36,6 +37,7 @@ class RequesterRegistry:
                 "open_id": open_id or "",
                 "name": name,
                 "source_chat_id": source_chat_id,
+                "platform": str(platform or "feishu").strip().lower() or "feishu",
                 "created_at": now,
             }
 

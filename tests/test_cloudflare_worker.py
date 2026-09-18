@@ -73,6 +73,24 @@ def test_worker_normalizes_text_mentions_without_echoing_the_mention():
     assert event["image_keys"] == []
 
 
+def test_worker_preserves_cross_platform_sender_identity_fields():
+    worker = _load_worker_module()
+    body = _event("text", {"text": "@_user_bot 测试"})
+    body["header"]["tenant_key"] = "tenant_feishu"
+    body["event"]["sender"]["tenant_key"] = "tenant_lark"
+    body["event"]["sender"]["sender_id"].update(
+        {"union_id": "on_union", "user_id": "ou_user_id"}
+    )
+
+    event = worker._normalize_event(body, "ou_bot")
+
+    assert event is not None
+    assert event["union_id"] == "on_union"
+    assert event["user_id"] == "ou_user_id"
+    assert event["tenant_key"] == "tenant_feishu"
+    assert event["sender_tenant_key"] == "tenant_lark"
+
+
 def test_worker_keeps_image_key_for_queued_r2_storage():
     worker = _load_worker_module()
     event = worker._normalize_event(_event("image", {"image_key": "img_v2_abc"}), "ou_bot")
@@ -136,6 +154,219 @@ def test_worker_keeps_parent_for_an_mentioned_reply():
     assert event is not None
     assert event["parent_id"] == "om_bot_card"
     assert event["mentioned_bot"] is True
+
+
+def test_target_group_workflow_uses_the_configured_group_and_platform():
+    worker = _load_worker_module()
+
+    class Relay:
+        env = type("Env", (), {})()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+    workflow = worker.BitableGroupWorkflow(Relay())
+    assert workflow.is_target_group("oc_5e9132f3638772d53d92d6fc5e953abc") is True
+    assert workflow.is_target_group("oc_other") is False
+    assert workflow._auth_base("feishu") == "https://accounts.feishu.cn"
+    assert workflow._auth_base("lark") == "https://accounts.larksuite.com"
+
+
+def test_external_sender_seen_by_feishu_is_routed_to_lark_oauth():
+    worker = _load_worker_module()
+
+    class Relay:
+        env = type("Env", (), {"LARK_APP_ID": "cli_lark", "LARK_APP_SECRET": "secret"})()
+        lark = object()
+
+    relay = Relay()
+    # The detector only needs the configured Lark client; no API request is
+    # made in the webhook path.
+    workflow = worker.CloudflareRelay.detect_user_platform
+    assert asyncio.run(
+        workflow(
+            relay,
+            {
+                "tenant_key": "tenant_feishu",
+                "sender_tenant_key": "tenant_lark",
+            },
+            "feishu",
+        )
+    ) == "lark"
+
+
+def test_bitable_group_workflow_builds_platform_specific_authorization_link():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.pending = None
+
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = kwargs
+
+    class FakeAPI:
+        def __init__(self):
+            self.replies = []
+            self.card_replies = []
+
+        async def reply(self, message_id, text):
+            self.replies.append((message_id, text))
+            return "om_reply"
+
+        async def reply_card(self, message_id, card):
+            self.card_replies.append((message_id, card))
+            return "om_card_reply"
+
+    class Relay:
+        env = type("Env", (), {"FEISHU_APP_ID": "cli_feishu"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    workflow = worker.BitableGroupWorkflow(relay)
+    asyncio.run(
+        workflow.handle_event(
+            platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={
+                "message_id": "om_source",
+                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "open_id": "ou_requester",
+                "text": "测试任务",
+            },
+        )
+    )
+    assert relay.state.pending["platform"] == "feishu"
+    assert relay.state.pending["requester_open_id"] == "ou_requester"
+    assert relay.api.card_replies[0][0] == "om_source"
+    card = relay.api.card_replies[0][1]
+    assert card["elements"][1]["actions"][0]["text"]["content"] == "授权并继续"
+    auth_url = card["elements"][1]["actions"][0]["url"]
+    assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in auth_url
+    assert "app_id=cli_feishu" in auth_url
+
+
+def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = kwargs
+
+    class FakeAPI:
+        def __init__(self):
+            self.card_replies = []
+
+        async def reply_card(self, message_id, card):
+            self.card_replies.append((message_id, card))
+            return "om_card_reply"
+
+    class Relay:
+        env = type("Env", (), {"LARK_APP_ID": "cli_lark"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    asyncio.run(
+        worker.BitableGroupWorkflow(relay).handle_event(
+            platform="lark",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={
+                "message_id": "om_source",
+                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "open_id": "ou_requester",
+                "text": "测试任务",
+            },
+        )
+    )
+    card = relay.api.card_replies[0][1]
+    action = card["elements"][1]["actions"][0]
+    assert "accounts.larksuite.com/open-apis/authen/v1/authorize" in action["url"]
+    assert "app_id=cli_lark" in action["url"]
+    assert "授权平台：**Lark**" in card["elements"][0]["text"]["content"]
+
+
+def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
+    worker = _load_worker_module()
+
+    class FakeAPI:
+        async def user_info(self, access_token):
+            assert access_token == "lark-user-token"
+            return {"open_id": "ou_lark_user", "union_id": "on_lark_user"}
+
+        async def resolve_wiki_bitable_app_token(self, access_token, wiki_token):
+            return "app_token"
+
+        async def user_bitable_fields(self, access_token, *, app_token, table_id):
+            return [{"field_name": "任务描述"}, {"field_name": "任务执行人"}]
+
+        async def create_user_bitable_record(self, access_token, *, app_token, table_id, fields):
+            self.fields = fields
+            return {"record_id": "rec_lark"}
+
+    class Relay:
+        def __init__(self):
+            self.api = FakeAPI()
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    workflow = worker.BitableGroupWorkflow(relay)
+    result = asyncio.run(
+        workflow._write_row(
+            platform="lark",
+            source_platform="feishu",
+            requester_open_id="ou_feishu_external_projection",
+            text="测试任务",
+            access_token="lark-user-token",
+        )
+    )
+
+    assert result["record_id"] == "rec_lark"
+    assert relay.api.fields["任务执行人"] == [{"id": "ou_lark_user"}]
 
 
 def test_agent_input_uses_text_relay_envelope():
@@ -734,10 +965,58 @@ def test_cloudflare_feishu_oauth_authorize_persists_state(monkeypatch):
 
     assert result["status"] == 302
     assert result["headers"]["Location"].startswith(
-        "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+        "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
     )
     assert "app_id=cli_test" in result["headers"]["Location"]
     assert state.saved[1] == "https://bot.boooe.com/feishu/oauth/callback"
+
+
+def test_cloudflare_routes_lark_conversations_and_oauth_to_lark(monkeypatch):
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def ensure_feishu_oauth_schema(self):
+            pass
+
+        async def save_feishu_oauth_state(self, state, redirect_uri, expires_at):
+            self.saved = (state, redirect_uri, expires_at)
+
+    env = SimpleNamespace(
+        FEISHU_APP_ID="cli_feishu",
+        FEISHU_APP_SECRET="feishu-secret",
+        LARK_APP_ID="cli_lark",
+        LARK_APP_SECRET="lark-secret",
+        LARK_OAUTH_SCOPE="bitable:app",
+        LARK_OAUTH_STATE_TTL_SECONDS="600",
+    )
+    state = FakeState()
+    relay = worker.CloudflareRelay(env, None, state)
+
+    assert relay.lark is not None
+    assert relay.api_for_conversation("lark:cli_lark:oc_chat:1") is relay.lark
+    assert relay.api_for_conversation("feishu:cli_feishu:oc_chat:1") is relay.feishu
+
+    monkeypatch.setattr(
+        worker,
+        "_text_response",
+        lambda body, status=200, headers=None: {
+            "body": body,
+            "status": status,
+            "headers": headers or {},
+        },
+    )
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/lark/oauth/authorize",
+    )
+    result = asyncio.run(relay.feishu_oauth(request, "/lark/oauth/authorize", "lark"))
+
+    assert result["status"] == 302
+    assert result["headers"]["Location"].startswith(
+        "https://accounts.larksuite.com/open-apis/authen/v1/authorize?"
+    )
+    assert "app_id=cli_lark" in result["headers"]["Location"]
+    assert state.saved[1] == "https://bot.boooe.com/lark/oauth/callback"
 
 
 def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
@@ -761,10 +1040,9 @@ def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
         def json(self):
             return {
                 "code": 0,
-                "data": {
-                    "access_token": "u-xxx",
-                    "refresh_token": "r-xxx",
-                },
+                "access_token": "u-xxx",
+                "refresh_token": "r-xxx",
+                "scope": "bitable:app",
             }
 
     class FakeClient:
@@ -805,5 +1083,6 @@ def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
     assert result["status"] == 200
     assert result["payload"]["success"] is True
     assert result["payload"]["token"]["access_token"] == "u-xxx"
-    assert client.call[0].endswith("/open-apis/authen/v2/oauth/token")
-    assert client.call[1]["json"]["client_secret"] == "secret"
+    assert client.call[0] == "https://accounts.feishu.cn/oauth/v3/token"
+    assert client.call[1]["data"]["client_secret"] == "secret"
+    assert client.call[1]["data"]["redirect_uri"] == "https://example.com/callback"

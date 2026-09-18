@@ -160,7 +160,6 @@ def main() -> int:
     _trust_certifi()
     worker = None
     http_server = None
-    bot_thread = None
     dispatcher = FeishuTriggerDispatcher()
     try:
         settings = Settings.from_environment()
@@ -184,33 +183,63 @@ def main() -> int:
             group_draft_store=group_draft_store,
         )
         handler = WorkspaceAgentMessageHandler(agent_settings)
-        bot = FeishuBot(settings, handler)
-        handler.post_placeholder = bot._reply
-        handler.download_image = bot.download_message_image
+        # A single business handler is shared by both platforms, while each
+        # platform has its own SDK client, bot identity and credentials.
+        bots = {
+            platform: FeishuBot(settings, handler, platform=platform)
+            for platform in settings.configured_platforms()
+        }
+
+        def bot_for_context(context):
+            return bots.get(context.platform) or bots["feishu"]
+
+        handler.post_placeholder = bots["feishu"]._reply
+        handler.post_placeholder_for_context = lambda context, text: bot_for_context(
+            context
+        )._reply(context.message_id, text)
+        handler.download_image = bots["feishu"].download_message_image
+        handler.download_image_for_context = lambda context, image_key: bot_for_context(
+            context
+        ).download_message_image(context.message_id, image_key)
         handler.on_dispatch = lambda ctx, ck: requester_registry.register(
             ck,
             open_id=ctx.sender_ids.open_id or ctx.sender_id,
             name=ctx.sender_ids.open_id or "",
             source_chat_id=ctx.chat_id,
+            platform=ctx.platform,
         )
+
+        def bot_for_run(run):
+            key = str(run.get("conversation_key") or "")
+            platform = key.split(":", 1)[0].lower() if ":" in key else "feishu"
+            return bots.get(platform) or bots["feishu"]
+
         worker = RelayWorker(
             relay_store,
             bridge,
-            bot._reply,
-            update_message=bot._update,
+            bots["feishu"]._reply,
+            update_message=bots["feishu"]._update,
+            reply_for_run=lambda message_id, text, run: bot_for_run(run)._reply(
+                message_id, text
+            ),
+            update_for_run=lambda message_id, text, run: bot_for_run(run)._update(
+                message_id, text
+            ),
             interval=float(os.getenv("AGENT_WORKER_INTERVAL", "2.0")),
             freshness_ttl_seconds=int(os.getenv("AGENT_WORKER_TTL_SECONDS", "3600")),
         )
 
         # Add the Feishu group-creation tools to the shared relay MCP server
-        register_feishu_tools(relay_mcp, bot, requester_registry, group_draft_store)
+        register_feishu_tools(relay_mcp, bots, requester_registry, group_draft_store)
 
         # In webhook mode, receive Feishu events over HTTP instead of the long
         # connection: mount the event callback on the same relay HTTP app. The
         # user-identity OAuth callbacks are mounted regardless of event mode.
-        extra_routes = list(bot.oauth_routes())
-        if settings.feishu_event_mode == "webhook":
-            extra_routes.extend(bot.webhook_routes())
+        extra_routes = []
+        for platform_bot in bots.values():
+            extra_routes.extend(platform_bot.oauth_routes())
+            if platform_bot._platform_config.event_mode == "webhook":
+                extra_routes.extend(platform_bot.webhook_routes())
         app = build_http_app(extra_routes=extra_routes)
 
         def serve_http() -> None:
@@ -221,9 +250,14 @@ def main() -> int:
         logger.info("Relay server listening on %s:%s", relay_config.host, relay_config.port)
 
         worker.start()
-        if settings.feishu_event_mode != "webhook":
-            bot_thread = threading.Thread(target=bot.start, name="feishu-bot", daemon=True)
-            bot_thread.start()
+        if any(bot._platform_config.event_mode != "webhook" for bot in bots.values()):
+            for platform, platform_bot in bots.items():
+                if platform_bot._platform_config.event_mode == "webhook":
+                    continue
+                thread = threading.Thread(
+                    target=platform_bot.start, name=f"{platform}-bot", daemon=True
+                )
+                thread.start()
 
         # Keep the main process alive; signal (Ctrl+C) exits the try/finally.
         threading.Event().wait()
