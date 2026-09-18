@@ -253,6 +253,16 @@ CREATE TABLE IF NOT EXISTS bitable_group_modes (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (source_platform, chat_id, requester_open_id)
 );
+CREATE TABLE IF NOT EXISTS bitable_group_mode_prompts (
+    prompt_message_id TEXT PRIMARY KEY,
+    source_platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    requester_open_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bitable_group_mode_prompts_lookup
+    ON bitable_group_mode_prompts(source_platform, chat_id, requester_open_id, created_at DESC);
 """
 
 
@@ -733,6 +743,22 @@ class D1State:
                 PRIMARY KEY (platform, open_id)
             )""",
         )
+        await _db_run(
+            self.db,
+            """CREATE TABLE IF NOT EXISTS bitable_group_mode_prompts (
+                prompt_message_id TEXT PRIMARY KEY,
+                source_platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                requester_open_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )""",
+        )
+        await _db_run(
+            self.db,
+            """CREATE INDEX IF NOT EXISTS idx_bitable_group_mode_prompts_lookup
+                ON bitable_group_mode_prompts(source_platform, chat_id, requester_open_id, created_at DESC)""",
+        )
 
     async def save_bitable_pending(
         self,
@@ -844,6 +870,55 @@ class D1State:
             self.db,
             """SELECT mode FROM bitable_group_modes
                WHERE source_platform = ? AND chat_id = ? AND requester_open_id = ?""",
+            source_platform,
+            chat_id,
+            requester_open_id,
+        )
+        mode = str((row or {}).get("mode") or "").strip().lower()
+        return mode if mode in {"feishu", "lark"} else None
+
+    async def save_bitable_group_mode_prompt(
+        self,
+        *,
+        prompt_message_id: str,
+        source_platform: str,
+        chat_id: str,
+        requester_open_id: str,
+        mode: str,
+    ) -> None:
+        """Bind a two-turn document choice to the bot prompt message.
+
+        The legacy per-user mode remains as a fallback for a fresh @ message,
+        while this binding keeps two outstanding prompts independent when a
+        user selects different document targets before replying to either.
+        """
+        await _db_run(
+            self.db,
+            """INSERT OR REPLACE INTO bitable_group_mode_prompts
+               (prompt_message_id, source_platform, chat_id, requester_open_id, mode, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            prompt_message_id,
+            source_platform,
+            chat_id,
+            requester_open_id,
+            mode,
+            _now(),
+        )
+
+    async def bitable_group_mode_for_prompt(
+        self,
+        *,
+        prompt_message_id: str,
+        source_platform: str,
+        chat_id: str,
+        requester_open_id: str,
+    ) -> str | None:
+        row = await _db_first(
+            self.db,
+            """SELECT mode FROM bitable_group_mode_prompts
+               WHERE prompt_message_id = ? AND source_platform = ?
+                 AND chat_id = ? AND requester_open_id = ?""",
+            prompt_message_id,
             source_platform,
             chat_id,
             requester_open_id,
@@ -1584,9 +1659,9 @@ class BitableGroupWorkflow:
 
     async def reply_mode_prompt(
         self, source_platform: str, event: dict[str, Any], mode: str
-    ) -> None:
+    ) -> str:
         api = self.relay.api_for_conversation(f"{source_platform}:workflow")
-        await api.reply(
+        return await api.reply(
             str(event["message_id"]),
             f"已选择 [{self.mode_label(mode)}]。请继续 @机器人发送要写入的内容。",
         )
@@ -2023,6 +2098,32 @@ class CloudflareRelay:
         if len(resolved) == 1:
             return resolved[0]
         return source
+
+    async def _bitable_document_mode(
+        self, *, source_platform: str, event: dict[str, Any]
+    ) -> str | None:
+        """Resolve a two-turn document choice without changing account auth.
+
+        A reply to a mode prompt is authoritative for that message. The
+        per-user mode table is retained as a compatibility fallback for a
+        fresh @ message that is not threaded under a prompt.
+        """
+        parent_id = str(event.get("parent_id") or "").strip()
+        if parent_id:
+            selected = await self.state.bitable_group_mode_for_prompt(
+                prompt_message_id=parent_id,
+                source_platform=source_platform,
+                chat_id=str(event.get("chat_id") or ""),
+                requester_open_id=str(event.get("open_id") or ""),
+            )
+            if selected in {"feishu", "lark"}:
+                return selected
+        selected = await self.state.bitable_group_mode(
+            source_platform=source_platform,
+            chat_id=str(event.get("chat_id") or ""),
+            requester_open_id=str(event.get("open_id") or ""),
+        )
+        return selected if selected in {"feishu", "lark"} else None
 
     def base_url(self) -> str:
         return _env(self.env, "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
@@ -3483,17 +3584,36 @@ class CloudflareRelay:
                         mode=selected_mode,
                     )
                     if not payload:
-                        await self.bitable_workflow.reply_mode_prompt(
+                        prompt_message_id = await self.bitable_workflow.reply_mode_prompt(
                             normalized, event, selected_mode
                         )
+                        # Keep each outstanding two-turn choice attached to the
+                        # exact bot prompt (and the command message itself, in
+                        # case the client quotes that message) that the user
+                        # can reply to. The per-user mode above remains the
+                        # fallback for a new unthreaded @ message.
+                        await self.state.save_bitable_group_mode_prompt(
+                            prompt_message_id=prompt_message_id,
+                            source_platform=normalized,
+                            chat_id=str(event["chat_id"]),
+                            requester_open_id=str(event["open_id"]),
+                            mode=selected_mode,
+                        )
+                        if prompt_message_id != str(event["message_id"]):
+                            await self.state.save_bitable_group_mode_prompt(
+                                prompt_message_id=str(event["message_id"]),
+                                source_platform=normalized,
+                                chat_id=str(event["chat_id"]),
+                                requester_open_id=str(event["open_id"]),
+                                mode=selected_mode,
+                            )
                         return _response({"code": 0})
                     event = dict(event)
                     event["text"] = payload
                 else:
-                    selected_mode = await self.state.bitable_group_mode(
+                    selected_mode = await self._bitable_document_mode(
                         source_platform=normalized,
-                        chat_id=str(event["chat_id"]),
-                        requester_open_id=str(event["open_id"]),
+                        event=event,
                     )
                     if selected_mode is None:
                         await self.bitable_workflow.reply_mode_required(normalized, event)

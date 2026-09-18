@@ -203,6 +203,37 @@ def test_target_group_document_commands_select_mode_and_optional_payload():
     assert worker.BitableGroupWorkflow.parse_document_command("其他内容") is None
 
 
+def test_document_mode_reply_uses_prompt_binding_before_latest_user_mode():
+    worker = _load_worker_module()
+
+    class State:
+        async def bitable_group_mode_for_prompt(self, **kwargs):
+            return {
+                "om_prompt_lark": "lark",
+                "om_prompt_feishu": "feishu",
+            }.get(kwargs["prompt_message_id"])
+
+        async def bitable_group_mode(self, **kwargs):
+            # The latest per-user choice is deliberately the wrong value for
+            # the first prompt; threaded prompt binding must win.
+            return "feishu"
+
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, State())
+    event = {
+        "chat_id": "oc_group",
+        "open_id": "ou_requester",
+        "parent_id": "om_prompt_lark",
+    }
+    assert asyncio.run(
+        relay._bitable_document_mode(source_platform="feishu", event=event)
+    ) == "lark"
+
+    event["parent_id"] = "om_prompt_feishu"
+    assert asyncio.run(
+        relay._bitable_document_mode(source_platform="feishu", event=event)
+    ) == "feishu"
+
+
 def test_external_sender_seen_by_feishu_is_routed_to_lark_oauth():
     worker = _load_worker_module()
 
