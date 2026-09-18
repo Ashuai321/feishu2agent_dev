@@ -997,6 +997,25 @@ class FeishuAPI:
             raise RuntimeError("Feishu reply response returned no message_id")
         return str(outbound)
 
+    async def reply_card(self, message_id: str, card: dict[str, Any]) -> str:
+        """Reply with an interactive card.
+
+        Feishu and Lark use the same interactive-message endpoint.  Keeping
+        the OAuth URL inside an ``open_url`` button prevents the raw URL from
+        being exposed as a chat link while still opening it in the platform's
+        in-app web view after the user taps the button.
+        """
+        payload = await self._request(
+            "POST",
+            f"/open-apis/im/v1/messages/{message_id}/reply",
+            params={"user_id_type": "open_id"},
+            json={"msg_type": "interactive", "content": _json(card)},
+        )
+        outbound = payload.get("data", {}).get("message_id")
+        if not outbound:
+            raise RuntimeError("Feishu card reply response returned no message_id")
+        return str(outbound)
+
     async def update(self, message_id: str, text: str) -> None:
         await self._request(
             "PUT",
@@ -1517,11 +1536,34 @@ class BitableGroupWorkflow:
         # The bot that received the external-group message sends the link.
         # The OAuth app used by the link can be the other platform.
         api = self.relay.api_for_conversation(f"{source_platform}:workflow")
-        await api.reply(
-            str(event["message_id"]),
-            "请点击下面的授权链接，允许本次以你的账号写入多维表格；授权完成后会自动继续：\n"
-            + url,
-        )
+        platform = "Lark" if url.startswith("https://accounts.larksuite.com/") else "Feishu"
+        card = {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            "请点击下方按钮授权，允许本次以你的账号写入多维表格。"
+                            f"\n授权平台：**{platform}**\n授权完成后会自动继续。"
+                        ),
+                    },
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "授权并继续"},
+                            "type": "primary",
+                            "url": url,
+                        }
+                    ],
+                },
+            ],
+        }
+        await api.reply_card(str(event["message_id"]), card)
 
     async def _write_row(
         self,

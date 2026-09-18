@@ -214,10 +214,15 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     class FakeAPI:
         def __init__(self):
             self.replies = []
+            self.card_replies = []
 
         async def reply(self, message_id, text):
             self.replies.append((message_id, text))
             return "om_reply"
+
+        async def reply_card(self, message_id, card):
+            self.card_replies.append((message_id, card))
+            return "om_card_reply"
 
     class Relay:
         env = type("Env", (), {"FEISHU_APP_ID": "cli_feishu"})()
@@ -254,9 +259,73 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     )
     assert relay.state.pending["platform"] == "feishu"
     assert relay.state.pending["requester_open_id"] == "ou_requester"
-    assert relay.api.replies[0][0] == "om_source"
-    assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in relay.api.replies[0][1]
-    assert "app_id=cli_feishu" in relay.api.replies[0][1]
+    assert relay.api.card_replies[0][0] == "om_source"
+    card = relay.api.card_replies[0][1]
+    assert card["elements"][1]["actions"][0]["text"]["content"] == "授权并继续"
+    auth_url = card["elements"][1]["actions"][0]["url"]
+    assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in auth_url
+    assert "app_id=cli_feishu" in auth_url
+
+
+def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = kwargs
+
+    class FakeAPI:
+        def __init__(self):
+            self.card_replies = []
+
+        async def reply_card(self, message_id, card):
+            self.card_replies.append((message_id, card))
+            return "om_card_reply"
+
+    class Relay:
+        env = type("Env", (), {"LARK_APP_ID": "cli_lark"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    asyncio.run(
+        worker.BitableGroupWorkflow(relay).handle_event(
+            platform="lark",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={
+                "message_id": "om_source",
+                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "open_id": "ou_requester",
+                "text": "测试任务",
+            },
+        )
+    )
+    card = relay.api.card_replies[0][1]
+    action = card["elements"][1]["actions"][0]
+    assert "accounts.larksuite.com/open-apis/authen/v1/authorize" in action["url"]
+    assert "app_id=cli_lark" in action["url"]
+    assert "授权平台：**Lark**" in card["elements"][0]["text"]["content"]
 
 
 def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
