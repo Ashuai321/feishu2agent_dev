@@ -211,6 +211,12 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     resource TEXT NOT NULL,
     expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS feishu_oauth_states (
+    state TEXT PRIMARY KEY,
+    redirect_uri TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -565,6 +571,29 @@ class D1State:
         return await _db_first(
             self.db, "SELECT * FROM oauth_clients WHERE client_id = ?", client_id
         )
+
+    async def save_feishu_oauth_state(
+        self, state: str, redirect_uri: str, expires_at: int
+    ) -> None:
+        await _db_run(
+            self.db,
+            "INSERT INTO feishu_oauth_states(state, redirect_uri, expires_at, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            state,
+            redirect_uri,
+            expires_at,
+            _now(),
+        )
+
+    async def consume_feishu_oauth_state(self, state: str) -> dict[str, Any] | None:
+        row = await _db_first(
+            self.db,
+            "SELECT state, redirect_uri, expires_at FROM feishu_oauth_states WHERE state = ?",
+            state,
+        )
+        if row is not None:
+            await _db_run(self.db, "DELETE FROM feishu_oauth_states WHERE state = ?", state)
+        return row
 
 
 class FeishuAPI:
@@ -1068,6 +1097,127 @@ class CloudflareRelay:
         if configured:
             return configured.lower()
         return "oauth" if _env(self.env, "WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN") else "none"
+
+    def feishu_oauth_scope(self) -> str:
+        return _env(self.env, "FEISHU_OAUTH_SCOPE", "bitable:app") or "bitable:app"
+
+    def feishu_oauth_ttl(self) -> int:
+        try:
+            return max(int(_env(self.env, "FEISHU_OAUTH_STATE_TTL_SECONDS", "600")), 60)
+        except ValueError:
+            return 600
+
+    async def feishu_oauth(self, request: Any, path: str) -> Response:
+        """Handle Feishu user OAuth on the Cloudflare Worker.
+
+        This is the Worker equivalent of the legacy Python ASGI routes.  The
+        authorization nonce is kept in D1 so a cold start or a second Worker
+        instance cannot lose the callback state.
+        """
+        if request.method != "GET":
+            return _response(
+                {"error": "method_not_allowed", "message": "Feishu OAuth accepts GET requests only"},
+                status=405,
+                headers={"allow": "GET"},
+            )
+        params = parse_qs(urlparse(request.url).query, keep_blank_values=True)
+        if path == "/feishu/oauth/authorize":
+            callback_uri = str((params.get("callback_uri") or [""])[0]).strip()
+            if not callback_uri:
+                callback_uri = _env(
+                    self.env,
+                    "FEISHU_OAUTH_REDIRECT_URI",
+                    self.base_url() + "/feishu/oauth/callback",
+                )
+            if not callback_uri:
+                return _response(
+                    {
+                        "success": False,
+                        "error": "missing_redirect_uri",
+                        "message": (
+                            "Pass ?callback_uri=... or configure FEISHU_OAUTH_REDIRECT_URI."
+                        ),
+                    },
+                    status=400,
+                )
+            if not _allowed_redirect(callback_uri):
+                return _response(
+                    {"success": False, "error": "invalid_redirect_uri"}, status=400
+                )
+            state = "feishu_state_" + secrets.token_urlsafe(32)
+            expires_at = _now() + self.feishu_oauth_ttl()
+            await self.state.save_feishu_oauth_state(state, callback_uri, expires_at)
+            location = (
+                f"{self.feishu.base}/open-apis/authen/v1/authorize?"
+                + urlencode(
+                    {
+                        "app_id": _env(self.env, "FEISHU_APP_ID"),
+                        "redirect_uri": callback_uri,
+                        "scope": self.feishu_oauth_scope(),
+                        "state": state,
+                    }
+                )
+            )
+            return _text_response("", 302, {"Location": location})
+
+        if path == "/feishu/oauth/callback":
+            code = str((params.get("code") or [""])[0]).strip()
+            state = str((params.get("state") or [""])[0]).strip()
+            if not code:
+                return _response(
+                    {"success": False, "error": "missing_code"}, status=400
+                )
+            if state:
+                record = await self.state.consume_feishu_oauth_state(state)
+                if record is None:
+                    return _response(
+                        {
+                            "success": False,
+                            "error": "unknown_or_already_consumed_state",
+                        },
+                        status=400,
+                    )
+                if int(record.get("expires_at", 0)) < _now():
+                    return _response(
+                        {"success": False, "error": "expired_state"}, status=400
+                    )
+
+            payload = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": _env(self.env, "FEISHU_APP_ID"),
+                "client_secret": _env(self.env, "FEISHU_APP_SECRET"),
+            }
+            if state:
+                payload["state"] = state
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    response = await client.post(
+                        f"{self.feishu.base}/open-apis/authen/v2/oauth/token",
+                        json=payload,
+                        headers={"Content-Type": "application/json; charset=utf-8"},
+                    )
+            except httpx.HTTPError as exc:
+                return _response(
+                    {"success": False, "error": "token_exchange_network_error", "message": _safe_error(exc)},
+                    status=502,
+                )
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, dict) or not data.get("access_token"):
+                message = "Feishu did not return an access_token"
+                if isinstance(body, dict):
+                    message = str(body.get("msg") or body.get("message") or message)
+                return _response(
+                    {"success": False, "error": "token_exchange_failed", "message": message},
+                    status=502,
+                )
+            return _response({"success": True, "token": data})
+
+        return _response({"error": "not_found"}, 404)
 
     async def authorize_request(self, request: Any) -> Response | None:
         if self.auth_mode() == "none":
@@ -2304,9 +2454,17 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": MCP_NAME,
-                    "endpoints": ["/feishu/events", "/mcp", "/oauth/token"],
+                    "endpoints": [
+                        "/feishu/events",
+                        "/feishu/oauth/authorize",
+                        "/feishu/oauth/callback",
+                        "/mcp",
+                        "/oauth/token",
+                    ],
                 }
             )
+        if path in {"/feishu/oauth/authorize", "/feishu/oauth/callback"}:
+            return await relay.feishu_oauth(request, path)
         if path in {"/feishu/events", "/feishu/event"}:
             if request.method == "POST":
                 return await relay.handle_feishu(request)

@@ -696,3 +696,108 @@ def test_cloudflare_mcp_exposes_and_dispatches_add_group_members():
     assert result["structuredContent"]["success"] is True
     assert result["structuredContent"]["chat_id"] == "oc_existing"
     assert result["structuredContent"]["added_member_open_ids"] == ["ou_target"]
+
+
+def test_cloudflare_feishu_oauth_authorize_persists_state(monkeypatch):
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def save_feishu_oauth_state(self, state, redirect_uri, expires_at):
+            self.saved = (state, redirect_uri, expires_at)
+
+    env = SimpleNamespace(
+        FEISHU_APP_ID="cli_test",
+        FEISHU_API_BASE="https://open.feishu.cn",
+        FEISHU_OAUTH_SCOPE="bitable:app",
+        FEISHU_OAUTH_STATE_TTL_SECONDS="600",
+    )
+    state = FakeState()
+    relay = worker.CloudflareRelay(env, None, state)
+    monkeypatch.setattr(
+        worker,
+        "_text_response",
+        lambda body, status=200, headers=None: {
+            "body": body,
+            "status": status,
+            "headers": headers or {},
+        },
+    )
+
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/feishu/oauth/authorize",
+    )
+    result = asyncio.run(relay.feishu_oauth(request, "/feishu/oauth/authorize"))
+
+    assert result["status"] == 302
+    assert result["headers"]["Location"].startswith(
+        "https://open.feishu.cn/open-apis/authen/v1/authorize?"
+    )
+    assert "app_id=cli_test" in result["headers"]["Location"]
+    assert state.saved[1] == "https://bot.boooe.com/feishu/oauth/callback"
+
+
+def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def consume_feishu_oauth_state(self, state):
+            assert state == "feishu_state_1"
+            return {
+                "state": state,
+                "redirect_uri": "https://example.com/callback",
+                "expires_at": worker._now() + 300,
+            }
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "code": 0,
+                "data": {
+                    "access_token": "u-xxx",
+                    "refresh_token": "r-xxx",
+                },
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, **kwargs):
+            self.call = (url, kwargs)
+            return FakeResponse()
+
+    client = FakeClient()
+    env = SimpleNamespace(
+        FEISHU_APP_ID="cli_test",
+        FEISHU_APP_SECRET="secret",
+        FEISHU_API_BASE="https://open.feishu.cn",
+    )
+    relay = worker.CloudflareRelay(env, None, FakeState())
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: client)
+    monkeypatch.setattr(
+        worker,
+        "_response",
+        lambda payload, status=200, headers=None: {
+            "payload": payload,
+            "status": status,
+            "headers": headers or {},
+        },
+    )
+
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/feishu/oauth/callback?code=code-1&state=feishu_state_1",
+    )
+    result = asyncio.run(relay.feishu_oauth(request, "/feishu/oauth/callback"))
+
+    assert result["status"] == 200
+    assert result["payload"]["success"] is True
+    assert result["payload"]["token"]["access_token"] == "u-xxx"
+    assert client.call[0].endswith("/open-apis/authen/v2/oauth/token")
+    assert client.call[1]["json"]["client_secret"] == "secret"

@@ -152,6 +152,10 @@ npx wrangler secret put WORKSPACE_AGENT_RELAY_AGENT_TOKEN
 npx wrangler secret put WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN
 ```
 
+飞书用户 OAuth 默认回调地址为 `https://bot.boooe.com/feishu/oauth/callback`，请把它加入飞书应用的重定向地址白名单。若使用其他地址，再配置 `FEISHU_OAUTH_REDIRECT_URI`；授权入口为
+`https://bot.boooe.com/feishu/oauth/authorize`，回调会用 `code` 换取
+`user_access_token`。`state` 会保存在 D1 中并且只能使用一次。
+
 `WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL` 可不设置，代码默认使用 `https://bot.boooe.com`。
 `WORKSPACE_AGENT_RELAY_TRIGGER_URL` 是已发布 Workspace Agent 的触发地址，不是 Python 服务地址。
 `FEISHU_BOT_OPEN_ID` 是机器人自身的 `open_id`；部署前通过飞书的
