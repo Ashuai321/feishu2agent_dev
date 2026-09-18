@@ -24,6 +24,8 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_NAME = "workspace-agent-relay-mcp-prd"
 PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
+BITABLE_AUTOMATION_WEBHOOK_PATH = "/bitable/automation/webhook"
+BITABLE_AUTOMATION_MAX_TEXT_LENGTH = 10000
 
 
 def _image_upload_metadata(data: bytes) -> tuple[str, str]:
@@ -384,6 +386,48 @@ def _allowed_redirect(uri: str) -> bool:
 def _safe_error(value: Any, secret: str = "") -> str:
     text = str(value or "").strip()
     return text.replace(secret, "[REDACTED]") if secret else text
+
+
+def _format_bitable_automation_text(value: Any) -> str:
+    """Turn a Feishu automation payload into a bounded group-chat message.
+
+    The HTTP action can send either a raw value selected from the AI node or a
+    JSON object containing that value.  Prefer common result keys while still
+    preserving arbitrary JSON so the endpoint remains useful when Feishu adds
+    a new response shape.
+    """
+
+    candidate = value
+    if isinstance(value, dict):
+        for key in (
+            "text",
+            "message",
+            "content",
+            "result",
+            "output",
+            "analysis",
+            "summary",
+            "answer",
+            "response_body",
+        ):
+            selected = value.get(key)
+            if selected not in (None, "", [], {}):
+                candidate = selected
+                break
+
+    if isinstance(candidate, str):
+        text = candidate.strip()
+    else:
+        try:
+            text = json.dumps(candidate, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            text = str(candidate)
+        text = text.strip()
+
+    if not text:
+        text = "多维表格 AI 分析返回为空"
+    text = text[:BITABLE_AUTOMATION_MAX_TEXT_LENGTH]
+    return f"[多维表格 AI 分析]\n{text}"
 
 
 class D1State:
@@ -1148,6 +1192,26 @@ class FeishuAPI:
         if not value:
             raise RuntimeError(f"{self.platform.title()} bot identity returned no open_id")
         return str(value)
+
+    async def send_text(self, chat_id: str, text: str) -> str:
+        """Send a bot-authored text message to a group chat."""
+        target = str(chat_id or "").strip()
+        if not target:
+            raise ValueError("chat_id is required")
+        payload = await self._request(
+            "POST",
+            "/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            json={
+                "receive_id": target,
+                "msg_type": "text",
+                "content": _json({"text": str(text or "")}),
+            },
+        )
+        outbound = payload.get("data", {}).get("message_id")
+        if not outbound:
+            raise RuntimeError("Feishu message response returned no message_id")
+        return str(outbound)
 
     async def reply(self, message_id: str, text: str) -> str:
         payload = await self._request(
@@ -2180,6 +2244,87 @@ class CloudflareRelay:
         )
         self.bitable_workflow = BitableGroupWorkflow(self)
         self.agent_workflow = AgentRelayWorkflow(self)
+
+    async def bitable_automation_webhook(self, request: Any) -> Response:
+        """Receive a Bitable AI/workflow HTTP action and post it to 小 C's group.
+
+        This endpoint intentionally uses the Feishu bot tenant token.  The
+        workflow is an outbound notification from the table, so it must not
+        consume or impersonate any user's OAuth token.
+        """
+
+        if str(request.method or "").upper() != "POST":
+            return _response(
+                {
+                    "success": False,
+                    "error": "method_not_allowed",
+                    "message": "Bitable automation webhook accepts POST requests only",
+                },
+                status=405,
+                headers={"allow": "POST"},
+            )
+
+        expected = str(_env(self.env, "BITABLE_AUTOMATION_WEBHOOK_TOKEN", "") or "").strip()
+        if expected:
+            provided = str(
+                request.headers.get("x-bitable-webhook-token")
+                or request.headers.get("authorization")
+                or ""
+            ).strip()
+            if provided.lower().startswith("bearer "):
+                provided = provided[7:].strip()
+            if not hmac.compare_digest(provided, expected):
+                return _response(
+                    {"success": False, "error": "invalid_webhook_token"},
+                    status=401,
+                )
+
+        try:
+            try:
+                body = await request.json()
+            except Exception:
+                raw = await request.text()
+                try:
+                    body = json.loads(raw)
+                except (TypeError, ValueError):
+                    body = raw
+            if body in (None, "", [], {}):
+                return _response(
+                    {
+                        "success": False,
+                        "error": "missing_body",
+                        "message": "The HTTP action must send the AI analysis result in its request body",
+                    },
+                    status=400,
+                )
+
+            text = _format_bitable_automation_text(body)
+            chat_id = str(
+                _env(
+                    self.env,
+                    "BITABLE_WORKFLOW_GROUP_CHAT_ID",
+                    BITABLE_WORKFLOW_GROUP_CHAT_ID,
+                )
+                or BITABLE_WORKFLOW_GROUP_CHAT_ID
+            ).strip()
+            message_id = await self.feishu.send_text(chat_id, text)
+            return _response(
+                {
+                    "success": True,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                }
+            )
+        except Exception as exc:
+            print(f"Bitable automation webhook forwarding failed: {_safe_error(exc, expected)}")
+            return _response(
+                {
+                    "success": False,
+                    "error": "forward_failed",
+                    "message": _safe_error(exc, expected),
+                },
+                status=502,
+            )
 
     def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
         """Select the API client from the event's platform-prefixed key."""
@@ -3827,6 +3972,7 @@ class Default(WorkerEntrypoint):
                     "ok": True,
                     "service": MCP_NAME,
                     "endpoints": [
+                        BITABLE_AUTOMATION_WEBHOOK_PATH,
                         "/feishu/events",
                         "/feishu/oauth/authorize",
                         "/feishu/oauth/callback",
@@ -3838,6 +3984,8 @@ class Default(WorkerEntrypoint):
                     ],
                 }
             )
+        if path == BITABLE_AUTOMATION_WEBHOOK_PATH:
+            return await relay.bitable_automation_webhook(request)
         if path in {"/feishu/oauth/authorize", "/feishu/oauth/callback"}:
             return await relay.feishu_oauth(request, path, "feishu")
         if path in {"/lark/oauth/authorize", "/lark/oauth/callback"}:

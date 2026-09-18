@@ -113,6 +113,23 @@ def test_worker_detects_actual_image_format_for_avatar_upload():
     )
 
 
+def test_bitable_automation_formatter_prefers_ai_result_text():
+    worker = _load_worker_module()
+
+    assert worker._format_bitable_automation_text(
+        {"result": "本周任务完成率为 80%", "trace_id": "ignored"}
+    ) == "[多维表格 AI 分析]\n本周任务完成率为 80%"
+
+
+def test_bitable_automation_formatter_preserves_arbitrary_json():
+    worker = _load_worker_module()
+
+    text = worker._format_bitable_automation_text({"rows": 3, "status": "ok"})
+    assert text.startswith("[多维表格 AI 分析]\n")
+    assert '"rows": 3' in text
+    assert '"status": "ok"' in text
+
+
 def test_worker_parses_caption_and_image_post_message():
     worker = _load_worker_module()
     content = {

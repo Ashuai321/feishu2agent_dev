@@ -166,6 +166,20 @@ python -m scripts.xiaoc_group_mention_all --platform feishu --text "请确认收
 指定群之外的消息仍交给原来的 Workspace Agent Relay；该 Agent 路径已单独封装，避免与
 授权写表流程互相影响。
 
+### 多维表格 AI 分析结果转发到群
+
+多维表格自动化在 `AI 分析` 后添加“发送 HTTP 请求”动作，POST 到：
+
+```text
+https://bot.boooe.com/bitable/automation/webhook
+```
+
+请求体可直接选择 AI 分析节点的结果/响应体变量，也可以发送 JSON。Worker 会提取常见
+结果字段并由小 C 发到 `BITABLE_WORKFLOW_GROUP_CHAT_ID` 指定的群。该接口使用机器人租户
+令牌，不会读取或修改用户 OAuth。需要保护入口时，设置
+`BITABLE_AUTOMATION_WEBHOOK_TOKEN`，并在 HTTP 请求 Headers 中加入同名
+`X-Bitable-Webhook-Token`。
+
 ## Cloudflare Python Worker 部署
 
 生产入口是 `cloudflare_worker/src/entry.py`。它把飞书 Webhook、MCP/OAuth 和 Agent 回调都运行在 Cloudflare Python Worker 内部，不再使用 Python 源站，也不需要 `PYTHON_ORIGIN`。现有稳定域名继续使用 `https://bot.boooe.com`。
