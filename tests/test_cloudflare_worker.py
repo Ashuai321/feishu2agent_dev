@@ -73,6 +73,24 @@ def test_worker_normalizes_text_mentions_without_echoing_the_mention():
     assert event["image_keys"] == []
 
 
+def test_worker_preserves_cross_platform_sender_identity_fields():
+    worker = _load_worker_module()
+    body = _event("text", {"text": "@_user_bot 测试"})
+    body["header"]["tenant_key"] = "tenant_feishu"
+    body["event"]["sender"]["tenant_key"] = "tenant_lark"
+    body["event"]["sender"]["sender_id"].update(
+        {"union_id": "on_union", "user_id": "ou_user_id"}
+    )
+
+    event = worker._normalize_event(body, "ou_bot")
+
+    assert event is not None
+    assert event["union_id"] == "on_union"
+    assert event["user_id"] == "ou_user_id"
+    assert event["tenant_key"] == "tenant_feishu"
+    assert event["sender_tenant_key"] == "tenant_lark"
+
+
 def test_worker_keeps_image_key_for_queued_r2_storage():
     worker = _load_worker_module()
     event = worker._normalize_event(_event("image", {"image_key": "img_v2_abc"}), "ou_bot")
@@ -154,6 +172,29 @@ def test_target_group_workflow_uses_the_configured_group_and_platform():
     assert workflow._auth_base("lark") == "https://accounts.larksuite.com"
 
 
+def test_external_sender_seen_by_feishu_is_routed_to_lark_oauth():
+    worker = _load_worker_module()
+
+    class Relay:
+        env = type("Env", (), {"LARK_APP_ID": "cli_lark", "LARK_APP_SECRET": "secret"})()
+        lark = object()
+
+    relay = Relay()
+    # The detector only needs the configured Lark client; no API request is
+    # made in the webhook path.
+    workflow = worker.CloudflareRelay.detect_user_platform
+    assert asyncio.run(
+        workflow(
+            relay,
+            {
+                "tenant_key": "tenant_feishu",
+                "sender_tenant_key": "tenant_lark",
+            },
+            "feishu",
+        )
+    ) == "lark"
+
+
 def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     worker = _load_worker_module()
 
@@ -216,6 +257,47 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     assert relay.api.replies[0][0] == "om_source"
     assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in relay.api.replies[0][1]
     assert "app_id=cli_feishu" in relay.api.replies[0][1]
+
+
+def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
+    worker = _load_worker_module()
+
+    class FakeAPI:
+        async def user_info(self, access_token):
+            assert access_token == "lark-user-token"
+            return {"open_id": "ou_lark_user", "union_id": "on_lark_user"}
+
+        async def resolve_wiki_bitable_app_token(self, access_token, wiki_token):
+            return "app_token"
+
+        async def user_bitable_fields(self, access_token, *, app_token, table_id):
+            return [{"field_name": "任务描述"}, {"field_name": "任务执行人"}]
+
+        async def create_user_bitable_record(self, access_token, *, app_token, table_id, fields):
+            self.fields = fields
+            return {"record_id": "rec_lark"}
+
+    class Relay:
+        def __init__(self):
+            self.api = FakeAPI()
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    workflow = worker.BitableGroupWorkflow(relay)
+    result = asyncio.run(
+        workflow._write_row(
+            platform="lark",
+            source_platform="feishu",
+            requester_open_id="ou_feishu_external_projection",
+            text="测试任务",
+            access_token="lark-user-token",
+        )
+    )
+
+    assert result["record_id"] == "rec_lark"
+    assert relay.api.fields["任务执行人"] == [{"id": "ou_lark_user"}]
 
 
 def test_agent_input_uses_text_relay_envelope():

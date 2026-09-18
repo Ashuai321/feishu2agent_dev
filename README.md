@@ -234,6 +234,14 @@ https://bot.boooe.com/lark/events
 `/lark/oauth/authorize`；本地脚本可通过 `--platform lark` 取得 Lark 用户 token，写入
 脚本会使用对应的 Lark API 域名和 `.lark-user-token.json`，不会复用 Feishu token。
 
+指定测试群是 Feishu 外部群时，不要求 Lark 机器人加入群。Feishu 机器人接收消息后会
+根据事件中的发送方租户判断授权平台：同租户走 Feishu OAuth，外部租户走 Lark OAuth，
+授权链接仍由 Feishu 机器人回复；回调再使用 Lark 用户令牌写入多维表格。若部署环境能
+明确列出 Lark 租户，可用逗号分隔的 `LARK_EXTERNAL_TENANT_KEYS` 覆盖自动判断结果。
+由于 Feishu/Lark 的用户 `open_id` 属于不同命名空间，跨平台回调不会再比较两边的
+`open_id`，而是使用一次性、短时有效的 OAuth state 绑定原始群消息；同平台仍保持
+严格的用户身份匹配。
+
 ChatGPT 连接器的 MCP 地址填写：
 
 ```text

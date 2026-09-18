@@ -12,7 +12,7 @@ import secrets
 import time
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import httpx
 from workers import Response, WorkerEntrypoint
@@ -223,11 +223,14 @@ CREATE TABLE IF NOT EXISTS feishu_oauth_states (
 CREATE TABLE IF NOT EXISTS bitable_pending_requests (
     state TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
+    source_platform TEXT NOT NULL DEFAULT 'feishu',
     redirect_uri TEXT NOT NULL,
     conversation_key TEXT NOT NULL,
     source_message_id TEXT NOT NULL,
     source_chat_id TEXT NOT NULL,
     requester_open_id TEXT NOT NULL,
+    requester_union_id TEXT NOT NULL DEFAULT '',
+    requester_user_id TEXT NOT NULL DEFAULT '',
     input_text TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
@@ -682,6 +685,7 @@ class D1State:
             """CREATE TABLE IF NOT EXISTS bitable_pending_requests (
                 state TEXT PRIMARY KEY,
                 platform TEXT NOT NULL,
+                source_platform TEXT NOT NULL DEFAULT 'feishu',
                 redirect_uri TEXT NOT NULL,
                 conversation_key TEXT NOT NULL,
                 source_message_id TEXT NOT NULL,
@@ -692,6 +696,18 @@ class D1State:
                 created_at INTEGER NOT NULL
             )""",
         )
+        # Keep pending OAuth records compatible with the initial deployment,
+        # which only stored the authorization platform.
+        for column, definition in (
+            ("source_platform", "TEXT NOT NULL DEFAULT 'feishu'"),
+            ("requester_union_id", "TEXT NOT NULL DEFAULT ''"),
+            ("requester_user_id", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            with contextlib.suppress(Exception):
+                await _db_run(
+                    self.db,
+                    f"ALTER TABLE bitable_pending_requests ADD COLUMN {column} {definition}",
+                )
         await _db_run(
             self.db,
             """CREATE TABLE IF NOT EXISTS bitable_user_tokens (
@@ -710,27 +726,34 @@ class D1State:
         *,
         state: str,
         platform: str,
+        source_platform: str = "feishu",
         redirect_uri: str,
         conversation_key: str,
         source_message_id: str,
         source_chat_id: str,
         requester_open_id: str,
+        requester_union_id: str = "",
+        requester_user_id: str = "",
         input_text: str,
         expires_at: int,
     ) -> None:
         await _db_run(
             self.db,
             """INSERT INTO bitable_pending_requests
-               (state, platform, redirect_uri, conversation_key, source_message_id,
-                source_chat_id, requester_open_id, input_text, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (state, platform, source_platform, redirect_uri, conversation_key,
+                source_message_id, source_chat_id, requester_open_id,
+                requester_union_id, requester_user_id, input_text, expires_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             state,
             platform,
+            source_platform,
             redirect_uri,
             conversation_key,
             source_message_id,
             source_chat_id,
             requester_open_id,
+            requester_union_id,
+            requester_user_id,
             input_text,
             expires_at,
             _now(),
@@ -880,6 +903,22 @@ class FeishuAPI:
         if not isinstance(data, dict) or not data.get("open_id"):
             raise RuntimeError(f"{self.platform.title()} user info returned no open_id")
         return data
+
+    async def resolve_user_id(
+        self, identifier: str, *, user_id_type: str = "open_id"
+    ) -> dict[str, Any]:
+        """Resolve an event sender in this platform's user namespace."""
+        value = str(identifier or "").strip()
+        if not value:
+            return {}
+        payload = await self._request(
+            "GET",
+            f"/open-apis/contact/v3/users/{quote(value, safe='')}",
+            params={"user_id_type": user_id_type},
+        )
+        data = payload.get("data") or {}
+        user = data.get("user") if isinstance(data, dict) else None
+        return user if isinstance(user, dict) else (data if isinstance(data, dict) else {})
 
     async def resolve_wiki_bitable_app_token(
         self, access_token: str, wiki_token: str
@@ -1307,12 +1346,17 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
         "message_id": message_id,
         "chat_id": chat_id,
         "open_id": str(sender_id.get("open_id") or ""),
+        "union_id": str(sender_id.get("union_id") or ""),
+        "user_id": str(sender_id.get("user_id") or ""),
         "name": str(sender.get("sender_id", {}).get("open_id") or ""),
         "parent_id": parent_id,
         "mentioned_bot": mentioned_bot,
         "text": text,
         "image_keys": image_keys,
         "tenant_key": str(header.get("tenant_key") or ""),
+        "sender_tenant_key": str(
+            sender.get("tenant_key") or sender_id.get("tenant_key") or ""
+        ),
     }
 
 
@@ -1388,13 +1432,14 @@ class BitableGroupWorkflow:
     This workflow is deliberately isolated from the Workspace Agent relay. A
     message in the configured test group is handled synchronously as:
 
-    ``event platform -> sender open_id -> matching OAuth -> user API write``.
+    ``source bot -> detected user platform -> matching OAuth -> user API write``.
 
     The sender's open_id is available from the event, but a bot event never
     contains that person's user access token. The first request therefore
     replies with a platform-specific authorization URL. The callback stores a
-    short-lived pending request, verifies the OAuth user open_id matches the
-    sender, and only then writes the row with the user's token.
+    short-lived pending request, verifies the OAuth identity when both sides
+    share an ID namespace, and uses the one-time state binding for a
+    cross-platform external sender before writing with the user's token.
     """
 
     def __init__(self, relay: CloudflareRelay) -> None:
@@ -1432,6 +1477,7 @@ class BitableGroupWorkflow:
         self,
         *,
         platform: str,
+        source_platform: str,
         conversation_key: str,
         event: dict[str, Any],
     ) -> str:
@@ -1441,11 +1487,14 @@ class BitableGroupWorkflow:
         await self.relay.state.save_bitable_pending(
             state=state,
             platform=platform,
+            source_platform=source_platform,
             redirect_uri=callback_uri,
             conversation_key=conversation_key,
             source_message_id=str(event["message_id"]),
             source_chat_id=str(event["chat_id"]),
             requester_open_id=str(event["open_id"]),
+            requester_union_id=str(event.get("union_id") or ""),
+            requester_user_id=str(event.get("user_id") or ""),
             input_text=str(event.get("text") or "").strip(),
             expires_at=expires_at,
         )
@@ -1462,8 +1511,12 @@ class BitableGroupWorkflow:
             )
         )
 
-    async def _reply_auth(self, platform: str, event: dict[str, Any], url: str) -> None:
-        api = self.relay.api_for_conversation(f"{platform}:workflow")
+    async def _reply_auth(
+        self, source_platform: str, event: dict[str, Any], url: str
+    ) -> None:
+        # The bot that received the external-group message sends the link.
+        # The OAuth app used by the link can be the other platform.
+        api = self.relay.api_for_conversation(f"{source_platform}:workflow")
         await api.reply(
             str(event["message_id"]),
             "请点击下面的授权链接，允许本次以你的账号写入多维表格；授权完成后会自动继续：\n"
@@ -1474,14 +1527,38 @@ class BitableGroupWorkflow:
         self,
         *,
         platform: str,
+        source_platform: str = "feishu",
         requester_open_id: str,
+        requester_union_id: str = "",
+        requester_user_id: str = "",
         text: str,
         access_token: str,
     ) -> dict[str, Any]:
         api = self.relay.api_for_conversation(f"{platform}:workflow")
         identity = await api.user_info(access_token)
         authorized_open_id = str(identity.get("open_id") or "").strip()
-        if not authorized_open_id or authorized_open_id != requester_open_id:
+        identity_ids = {
+            str(identity.get(key) or "").strip()
+            for key in ("open_id", "union_id", "user_id")
+            if str(identity.get(key) or "").strip()
+        }
+        requester_ids = {
+            value
+            for value in (
+                requester_open_id,
+                requester_union_id,
+                requester_user_id,
+            )
+            if str(value or "").strip()
+        }
+        # A Feishu webhook can carry a Lark user's sender identity when the
+        # bot is in an external group, but the Lark OAuth callback necessarily
+        # returns Lark-scoped IDs.  In that cross-platform path there is no
+        # common open_id namespace to compare.  The one-time state is bound to
+        # the triggering message and the link is sent to that sender.  Keep a
+        # strict identity intersection whenever both sides share a namespace.
+        cross_platform = source_platform != platform
+        if not authorized_open_id or (not cross_platform and not identity_ids.intersection(requester_ids)):
             raise RuntimeError(
                 "OAuth 用户与发起 @ 的用户不一致；为避免越权，未写入多维表格"
             )
@@ -1499,18 +1576,28 @@ class BitableGroupWorkflow:
             raise RuntimeError(
                 "测试表缺少字段：" + "、".join(sorted(missing))
             )
-        return await api.create_user_bitable_record(
+        record = await api.create_user_bitable_record(
             access_token,
             app_token=app_token,
             table_id=BITABLE_WORKFLOW_TABLE_ID,
             fields={
                 "任务描述": text,
-                "任务执行人": [{"id": requester_open_id}],
+                "任务执行人": [{"id": authorized_open_id}],
             },
         )
+        # Keep the platform-scoped assignee available to the caller without
+        # changing the upstream record payload returned by Feishu/Lark.
+        result = dict(record)
+        result["_authorized_open_id"] = authorized_open_id
+        return result
 
     async def handle_event(
-        self, *, platform: str, conversation_key: str, event: dict[str, Any]
+        self,
+        *,
+        platform: str,
+        source_platform: str = "feishu",
+        conversation_key: str,
+        event: dict[str, Any],
     ) -> None:
         await self.relay.state.ensure_feishu_oauth_schema()
         requester_open_id = str(event.get("open_id") or "").strip()
@@ -1522,13 +1609,17 @@ class BitableGroupWorkflow:
             try:
                 record = await self._write_row(
                     platform=platform,
+                    source_platform=source_platform,
                     requester_open_id=requester_open_id,
+                    requester_union_id=str(event.get("union_id") or ""),
+                    requester_user_id=str(event.get("user_id") or ""),
                     text=text,
                     access_token=str(cached.get("access_token") or ""),
                 )
-                await self.relay.api_for_conversation(f"{platform}:workflow").reply(
+                await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
                     str(event["message_id"]),
-                    f"已使用你之前的 {platform} 授权写入多维表格，任务执行人={requester_open_id}，"
+                    f"已使用你之前的 {platform} 授权写入多维表格，任务执行人="
+                    f"{record.get('_authorized_open_id') or requester_open_id}，"
                     f"record_id={record.get('record_id')}",
                 )
                 return
@@ -1538,22 +1629,27 @@ class BitableGroupWorkflow:
                 print(f"Cached {platform} user token was not usable: {_safe_error(exc)}")
         url = await self._authorization_url(
             platform=platform,
+            source_platform=source_platform,
             conversation_key=conversation_key,
             event=event,
         )
-        await self._reply_auth(platform, event, url)
+        await self._reply_auth(source_platform, event, url)
 
     async def complete_oauth(
         self, pending: dict[str, Any], token_data: dict[str, Any]
     ) -> dict[str, Any]:
         platform = str(pending.get("platform") or "").strip().lower()
+        source_platform = str(pending.get("source_platform") or platform).strip().lower()
         requester_open_id = str(pending.get("requester_open_id") or "").strip()
         access_token = str(token_data.get("access_token") or "").strip()
         if platform not in {"feishu", "lark"} or not access_token:
             raise RuntimeError("OAuth callback data is missing platform or access_token")
         record = await self._write_row(
             platform=platform,
+            source_platform=source_platform,
             requester_open_id=requester_open_id,
+            requester_union_id=str(pending.get("requester_union_id") or ""),
+            requester_user_id=str(pending.get("requester_user_id") or ""),
             text=str(pending.get("input_text") or "").strip(),
             access_token=access_token,
         )
@@ -1565,14 +1661,16 @@ class BitableGroupWorkflow:
             refresh_token=str(token_data.get("refresh_token") or ""),
             expires_at=_now() + max(expires_in, 60),
         )
-        await self.relay.api_for_conversation(f"{platform}:workflow").reply(
+        await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
             str(pending.get("source_message_id") or ""),
-            f"授权成功，已按你的 {platform} 账号写入多维表格，任务执行人={requester_open_id}，"
+            f"授权成功，已按你的 {platform} 账号写入多维表格，任务执行人="
+            f"{record.get('_authorized_open_id') or requester_open_id}，"
             f"record_id={record.get('record_id')}",
         )
         return {
             "platform": platform,
-            "open_id": requester_open_id,
+            "source_platform": source_platform,
+            "open_id": str(record.get("_authorized_open_id") or requester_open_id),
             "record_id": str(record.get("record_id") or ""),
         }
 
@@ -1645,6 +1743,77 @@ class CloudflareRelay:
                 raise RuntimeError("Lark is not configured: set LARK_APP_ID and LARK_APP_SECRET")
             return self.lark
         return self.feishu
+
+    async def detect_user_platform(
+        self, event: dict[str, Any], source_platform: str
+    ) -> str:
+        """Choose the OAuth platform for a sender seen by a bot webhook.
+
+        A Lark bot cannot be added to a Feishu external group, so the Feishu
+        bot is the receiver for both cases.  The event does not expose a
+        universal ``feishu``/``lark`` brand field.  The stable signal available
+        to the receiver is whether the sender belongs to the webhook tenant:
+        a sender from another tenant is treated as the Lark external-user path
+        when a Lark app is configured.  Same-tenant senders stay on Feishu.
+        Deployments with a known tenant mapping can override this without code
+        changes through ``LARK_EXTERNAL_TENANT_KEYS``.
+        """
+        source = str(source_platform or "feishu").strip().lower() or "feishu"
+        if source not in {"feishu", "lark"}:
+            source = "feishu"
+        if self.lark is None:
+            return source
+
+        explicit = str(
+            event.get("tenant_brand")
+            or event.get("platform")
+            or event.get("brand")
+            or ""
+        ).strip().lower()
+        if explicit in {"feishu", "lark"}:
+            return explicit
+
+        sender_tenant = str(event.get("sender_tenant_key") or "").strip()
+        event_tenant = str(event.get("tenant_key") or "").strip()
+        configured = {
+            item.strip()
+            for item in _env(self.env, "LARK_EXTERNAL_TENANT_KEYS", "").split(",")
+            if item.strip()
+        }
+        if sender_tenant and sender_tenant in configured:
+            return "lark"
+        if sender_tenant and event_tenant and sender_tenant != event_tenant:
+            return "lark"
+
+        # Some external-group payloads normalize both tenant fields to the
+        # receiving Feishu tenant.  In that case resolve the sender ID through
+        # each configured platform's contact API.  The IDs are app/tenant
+        # scoped, so a successful resolution is a stronger signal than the
+        # webhook URL that happened to receive the event.
+        identifiers = (
+            (str(event.get("open_id") or "").strip(), "open_id"),
+            (str(event.get("union_id") or "").strip(), "union_id"),
+            (str(event.get("user_id") or "").strip(), "user_id"),
+        )
+        resolved: list[str] = []
+        for candidate, api in (("feishu", self.feishu), ("lark", self.lark)):
+            if api is None:
+                continue
+            for identifier, identifier_type in identifiers:
+                if not identifier:
+                    continue
+                try:
+                    user = await api.resolve_user_id(
+                        identifier, user_id_type=identifier_type
+                    )
+                except Exception:
+                    continue
+                if user:
+                    resolved.append(candidate)
+                    break
+        if len(resolved) == 1:
+            return resolved[0]
+        return source
 
     def base_url(self) -> str:
         return _env(self.env, "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
@@ -1836,8 +2005,11 @@ class CloudflareRelay:
                     # success/error reply when the user account can be verified.
                     message = _safe_error(exc, str(data.get("access_token") or ""))
                     try:
+                        source_platform = str(
+                            pending.get("source_platform") or normalized
+                        ).strip().lower()
                         await self.api_for_conversation(
-                            f"{normalized}:workflow"
+                            f"{source_platform}:workflow"
                         ).reply(
                             str(pending.get("source_message_id") or ""),
                             f"授权完成，但未能写入多维表格：{message}",
@@ -3079,8 +3251,10 @@ class CloudflareRelay:
                 normalized,
             )
             if self.bitable_workflow.is_target_group(event["chat_id"]):
+                auth_platform = await self.detect_user_platform(event, normalized)
                 await self.bitable_workflow.handle_event(
-                    platform=normalized,
+                    platform=auth_platform,
+                    source_platform=normalized,
                     conversation_key=conversation_key,
                     event=event,
                 )
