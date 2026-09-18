@@ -469,6 +469,190 @@ def test_lark_document_selection_keeps_feishu_requester_on_feishu_oauth():
     assert "授权平台：**Feishu**" in card["elements"][0]["text"]["content"]
 
 
+def test_pending_authorization_sends_one_card_and_queues_later_requests():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.pending = None
+            self.items = []
+
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = dict(kwargs)
+
+        async def bitable_pending_authorization(self, *, platform, requester_open_id):
+            if (
+                self.pending
+                and self.pending["platform"] == platform
+                and self.pending["requester_open_id"] == requester_open_id
+            ):
+                return self.pending
+            return None
+
+        async def append_bitable_pending_item(self, *, state, item):
+            assert self.pending and self.pending["state"] == state
+            self.items.append(dict(item))
+
+    class FakeAPI:
+        def __init__(self):
+            self.card_replies = []
+
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
+            return "om_card_reply"
+
+    class Relay:
+        env = type("Env", (), {"LARK_APP_ID": "cli_lark"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    workflow = worker.BitableGroupWorkflow(relay)
+    common = {
+        "chat_id": worker.BITABLE_WORKFLOW_GROUP_CHAT_ID,
+        "open_id": "ou_requester",
+    }
+    asyncio.run(
+        workflow.handle_event(
+            platform="lark",
+            document_mode="lark",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={**common, "message_id": "om_lark", "text": "Lark请求"},
+        )
+    )
+    asyncio.run(
+        workflow.handle_event(
+            platform="lark",
+            document_mode="feishu",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={**common, "message_id": "om_feishu", "text": "飞书请求"},
+        )
+    )
+
+    assert len(relay.api.card_replies) == 1
+    assert [item["document_mode"] for item in relay.state.items] == [
+        "lark",
+        "feishu",
+    ]
+    assert [item["source_message_id"] for item in relay.state.items] == [
+        "om_lark",
+        "om_feishu",
+    ]
+
+
+def test_complete_oauth_processes_all_queued_document_requests_once():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.saved_tokens = []
+
+        async def save_user_token(self, **kwargs):
+            self.saved_tokens.append(kwargs)
+
+    class FakeAPI:
+        def __init__(self):
+            self.records = []
+            self.replies = []
+
+        async def user_info(self, access_token):
+            return {"open_id": "ou_lark_authorized"}
+
+        async def resolve_wiki_bitable_app_token(self, access_token, wiki_token):
+            return f"app:{wiki_token}"
+
+        async def user_bitable_fields(self, access_token, *, app_token, table_id):
+            if table_id == worker.LARK_DOCUMENT_TABLE_ID:
+                return [{"field_name": "文本"}, {"field_name": "测试3"}]
+            return [{"field_name": "任务描述"}, {"field_name": "任务执行人"}]
+
+        async def create_user_bitable_record(
+            self, access_token, *, app_token, table_id, fields
+        ):
+            record_id = f"rec_{len(self.records) + 1}"
+            self.records.append((table_id, fields))
+            return {"record_id": record_id}
+
+        async def reply(self, message_id, text):
+            self.replies.append((message_id, text))
+            return "om_reply"
+
+    class Relay:
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    pending = {
+        "platform": "lark",
+        "source_platform": "feishu",
+        "requester_open_id": "ou_external_projection",
+        "pending_items_json": json.dumps(
+            [
+                {
+                    "platform": "lark",
+                    "document_mode": "lark",
+                    "source_platform": "feishu",
+                    "source_message_id": "om_lark",
+                    "requester_open_id": "ou_external_projection",
+                    "input_text": "Lark内容",
+                },
+                {
+                    "platform": "lark",
+                    "document_mode": "feishu",
+                    "source_platform": "feishu",
+                    "source_message_id": "om_feishu",
+                    "requester_open_id": "ou_external_projection",
+                    "input_text": "飞书内容",
+                },
+            ]
+        ),
+    }
+
+    result = asyncio.run(
+        worker.BitableGroupWorkflow(relay).complete_oauth(
+            pending, {"access_token": "lark-token", "expires_in": 7200}
+        )
+    )
+
+    assert result["processed_count"] == 2
+    assert result["failed_count"] == 0
+    assert [table_id for table_id, fields in relay.api.records] == [
+        worker.LARK_DOCUMENT_TABLE_ID,
+        worker.BITABLE_WORKFLOW_TABLE_ID,
+    ]
+    assert [message_id for message_id, text in relay.api.replies] == [
+        "om_lark",
+        "om_feishu",
+    ]
+    assert len(relay.state.saved_tokens) == 1
+
+
 def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
     worker = _load_worker_module()
 

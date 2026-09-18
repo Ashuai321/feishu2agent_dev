@@ -233,6 +233,7 @@ CREATE TABLE IF NOT EXISTS bitable_pending_requests (
     requester_union_id TEXT NOT NULL DEFAULT '',
     requester_user_id TEXT NOT NULL DEFAULT '',
     input_text TEXT NOT NULL,
+    pending_items_json TEXT NOT NULL DEFAULT '[]',
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
@@ -712,6 +713,7 @@ class D1State:
                 source_chat_id TEXT NOT NULL,
                 requester_open_id TEXT NOT NULL,
                 input_text TEXT NOT NULL,
+                pending_items_json TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             )""",
@@ -725,6 +727,7 @@ class D1State:
             ("source_platform", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("requester_union_id", "TEXT NOT NULL DEFAULT ''"),
             ("requester_user_id", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_items_json", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             with contextlib.suppress(Exception):
                 await _db_run(
@@ -782,8 +785,9 @@ class D1State:
             """INSERT INTO bitable_pending_requests
                (state, platform, document_mode, source_platform, redirect_uri, conversation_key,
                 source_message_id, source_chat_id, requester_open_id,
-                requester_union_id, requester_user_id, input_text, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                requester_union_id, requester_user_id, input_text, pending_items_json,
+                expires_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             state,
             platform,
             document_mode,
@@ -796,8 +800,47 @@ class D1State:
             requester_union_id,
             requester_user_id,
             input_text,
+            "[]",
             expires_at,
             _now(),
+        )
+
+    async def bitable_pending_authorization(
+        self, *, platform: str, requester_open_id: str
+    ) -> dict[str, Any] | None:
+        """Return an active authorization request for this platform user."""
+        return await _db_first(
+            self.db,
+            """SELECT * FROM bitable_pending_requests
+               WHERE platform = ? AND requester_open_id = ? AND expires_at > ?
+               ORDER BY created_at DESC LIMIT 1""",
+            platform,
+            requester_open_id,
+            _now(),
+        )
+
+    async def append_bitable_pending_item(
+        self, *, state: str, item: dict[str, Any]
+    ) -> None:
+        row = await _db_first(
+            self.db,
+            "SELECT pending_items_json FROM bitable_pending_requests WHERE state = ?",
+            state,
+        )
+        if row is None:
+            return
+        try:
+            items = json.loads(str(row.get("pending_items_json") or "[]"))
+        except (TypeError, ValueError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+        items.append(item)
+        await _db_run(
+            self.db,
+            "UPDATE bitable_pending_requests SET pending_items_json = ? WHERE state = ?",
+            _json(items),
+            state,
         )
 
     async def consume_bitable_pending(self, state: str) -> dict[str, Any] | None:
@@ -1721,8 +1764,37 @@ class BitableGroupWorkflow:
         source_platform: str,
         conversation_key: str,
         event: dict[str, Any],
-    ) -> str:
+    ) -> str | None:
         callback_uri = self._callback_uri(platform)
+
+        # One active authorization is enough for all requests from the same
+        # account. Queue later requests behind that state instead of sending
+        # another card. The account platform remains the lookup key; the
+        # document mode is retained per queued item.
+        find_pending = getattr(self.relay.state, "bitable_pending_authorization", None)
+        append_item = getattr(self.relay.state, "append_bitable_pending_item", None)
+        requester_open_id = str(event["open_id"])
+        item = {
+            "platform": platform,
+            "document_mode": document_mode,
+            "source_platform": source_platform,
+            "conversation_key": conversation_key,
+            "source_message_id": str(event["message_id"]),
+            "source_chat_id": str(event["chat_id"]),
+            "requester_open_id": requester_open_id,
+            "requester_union_id": str(event.get("union_id") or ""),
+            "requester_user_id": str(event.get("user_id") or ""),
+            "input_text": str(event.get("text") or "").strip(),
+        }
+        if callable(find_pending) and callable(append_item):
+            existing = await find_pending(
+                platform=platform,
+                requester_open_id=requester_open_id,
+            )
+            if existing and str(existing.get("state") or ""):
+                await append_item(state=str(existing["state"]), item=item)
+                return None
+
         state = f"bitable_{platform}_" + secrets.token_urlsafe(32)
         expires_at = _now() + self.relay.feishu_oauth_ttl(platform)
         await self.relay.state.save_bitable_pending(
@@ -1734,12 +1806,14 @@ class BitableGroupWorkflow:
             conversation_key=conversation_key,
             source_message_id=str(event["message_id"]),
             source_chat_id=str(event["chat_id"]),
-            requester_open_id=str(event["open_id"]),
+            requester_open_id=requester_open_id,
             requester_union_id=str(event.get("union_id") or ""),
             requester_user_id=str(event.get("user_id") or ""),
             input_text=str(event.get("text") or "").strip(),
             expires_at=expires_at,
         )
+        if callable(append_item):
+            await append_item(state=state, item=item)
         prefix = platform.upper()
         return (
             f"{self._auth_base(platform)}/open-apis/authen/v1/authorize?"
@@ -1917,28 +1991,117 @@ class BitableGroupWorkflow:
             conversation_key=conversation_key,
             event=event,
         )
-        await self._reply_auth(source_platform, event, url)
+        if url:
+            await self._reply_auth(source_platform, event, url)
 
     async def complete_oauth(
         self, pending: dict[str, Any], token_data: dict[str, Any]
     ) -> dict[str, Any]:
         platform = str(pending.get("platform") or "").strip().lower()
-        document_mode = str(pending.get("document_mode") or "feishu").strip().lower()
-        source_platform = str(pending.get("source_platform") or platform).strip().lower()
         requester_open_id = str(pending.get("requester_open_id") or "").strip()
         access_token = str(token_data.get("access_token") or "").strip()
         if platform not in {"feishu", "lark"} or not access_token:
             raise RuntimeError("OAuth callback data is missing platform or access_token")
-        record = await self._write_row(
-            platform=platform,
-            source_platform=source_platform,
-            document_mode=document_mode,
-            requester_open_id=requester_open_id,
-            requester_union_id=str(pending.get("requester_union_id") or ""),
-            requester_user_id=str(pending.get("requester_user_id") or ""),
-            text=str(pending.get("input_text") or "").strip(),
-            access_token=access_token,
+
+        # Requests received while the authorization card is open are stored
+        # as a JSON array on the same pending OAuth state.  Keep the old
+        # single-request row shape as a fallback so states created before the
+        # queue column was deployed still complete normally.
+        raw_items = pending.get("pending_items_json")
+        if isinstance(raw_items, str):
+            try:
+                queued_items = json.loads(raw_items)
+            except (TypeError, ValueError):
+                queued_items = []
+        else:
+            queued_items = raw_items
+        items = (
+            [dict(item) for item in queued_items if isinstance(item, dict)]
+            if isinstance(queued_items, list)
+            else []
         )
+        if not items:
+            items = [dict(pending)]
+
+        processed: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        for item in items:
+            item_platform = str(item.get("platform") or platform).strip().lower()
+            item_mode = str(item.get("document_mode") or "feishu").strip().lower()
+            item_source_platform = str(
+                item.get("source_platform") or platform
+            ).strip().lower()
+            item_open_id = str(
+                item.get("requester_open_id") or requester_open_id
+            ).strip()
+            item_message_id = str(item.get("source_message_id") or "").strip()
+            try:
+                if item_platform != platform:
+                    raise RuntimeError("待处理请求的授权平台与当前授权不一致")
+                record = await self._write_row(
+                    platform=platform,
+                    source_platform=item_source_platform,
+                    document_mode=item_mode,
+                    requester_open_id=item_open_id,
+                    requester_union_id=str(item.get("requester_union_id") or ""),
+                    requester_user_id=str(item.get("requester_user_id") or ""),
+                    text=str(item.get("input_text") or "").strip(),
+                    access_token=access_token,
+                )
+            except Exception as exc:
+                message = _safe_error(exc, access_token)
+                failures.append(
+                    {
+                        "source_message_id": item_message_id,
+                        "document_mode": item_mode,
+                        "message": message,
+                    }
+                )
+                try:
+                    if item_message_id:
+                        await self.relay.api_for_conversation(
+                            f"{item_source_platform}:workflow"
+                        ).reply(
+                            item_message_id,
+                            f"授权完成，但未能写入 {self.mode_label(item_mode)}：{message}",
+                        )
+                except Exception as reply_exc:
+                    print(
+                        "Bitable queued error reply failed: "
+                        f"{_safe_error(reply_exc)}"
+                    )
+                continue
+
+            result = {
+                "source_message_id": item_message_id,
+                "document_mode": item_mode,
+                "source_platform": item_source_platform,
+                "open_id": str(
+                    record.get("_authorized_open_id") or item_open_id
+                ),
+                "record_id": str(record.get("record_id") or ""),
+            }
+            processed.append(result)
+            try:
+                if item_message_id:
+                    await self.relay.api_for_conversation(
+                        f"{item_source_platform}:workflow"
+                    ).reply(
+                        item_message_id,
+                        f"授权成功，已按你的 {platform} 账号写入 "
+                        f"{self.mode_label(item_mode)}，任务执行人="
+                        f"{result['open_id']}，record_id={result['record_id']}",
+                    )
+            except Exception as reply_exc:
+                print(
+                    "Bitable queued success reply failed: "
+                    f"{_safe_error(reply_exc)}"
+                )
+
+        if not processed:
+            details = failures[0]["message"] if failures else "没有可处理的请求"
+            raise RuntimeError(f"所有待处理请求均写入失败：{details}")
+
         expires_in = int(token_data.get("expires_in") or 7200)
         await self.relay.state.save_user_token(
             platform=platform,
@@ -1947,18 +2110,17 @@ class BitableGroupWorkflow:
             refresh_token=str(token_data.get("refresh_token") or ""),
             expires_at=_now() + max(expires_in, 60),
         )
-        await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
-            str(pending.get("source_message_id") or ""),
-            f"授权成功，已按你的 {platform} 账号写入 {self.mode_label(document_mode)}，任务执行人="
-            f"{record.get('_authorized_open_id') or requester_open_id}，"
-            f"record_id={record.get('record_id')}",
-        )
+        first = processed[0]
         return {
             "platform": platform,
-            "document_mode": document_mode,
-            "source_platform": source_platform,
-            "open_id": str(record.get("_authorized_open_id") or requester_open_id),
-            "record_id": str(record.get("record_id") or ""),
+            "document_mode": first["document_mode"],
+            "source_platform": first["source_platform"],
+            "open_id": first["open_id"],
+            "record_id": first["record_id"],
+            "processed_count": len(processed),
+            "failed_count": len(failures),
+            "records": processed,
+            "failures": failures,
         }
 
 
