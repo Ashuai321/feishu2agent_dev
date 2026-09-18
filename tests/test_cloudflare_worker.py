@@ -702,6 +702,9 @@ def test_cloudflare_feishu_oauth_authorize_persists_state(monkeypatch):
     worker = _load_worker_module()
 
     class FakeState:
+        async def ensure_feishu_oauth_schema(self):
+            pass
+
         async def save_feishu_oauth_state(self, state, redirect_uri, expires_at):
             self.saved = (state, redirect_uri, expires_at)
 
@@ -741,6 +744,9 @@ def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
     worker = _load_worker_module()
 
     class FakeState:
+        async def ensure_feishu_oauth_schema(self):
+            pass
+
         async def consume_feishu_oauth_state(self, state):
             assert state == "feishu_state_1"
             return {

@@ -595,6 +595,24 @@ class D1State:
             await _db_run(self.db, "DELETE FROM feishu_oauth_states WHERE state = ?", state)
         return row
 
+    async def ensure_feishu_oauth_schema(self) -> None:
+        """Create the OAuth state table when a deploy has not run migrations yet.
+
+        Existing installations may already have the initial D1 migrations, while
+        Cloudflare's GitHub build does not automatically apply a newly committed
+        migration.  Keeping this idempotent guard on the OAuth path makes the
+        new endpoint self-healing without changing any existing tables or data.
+        """
+        await _db_run(
+            self.db,
+            """CREATE TABLE IF NOT EXISTS feishu_oauth_states (
+                state TEXT PRIMARY KEY,
+                redirect_uri TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )""",
+        )
+
 
 class FeishuAPI:
     def __init__(self, env: Any) -> None:
@@ -1144,6 +1162,7 @@ class CloudflareRelay:
                 return _response(
                     {"success": False, "error": "invalid_redirect_uri"}, status=400
                 )
+            await self.state.ensure_feishu_oauth_schema()
             state = "feishu_state_" + secrets.token_urlsafe(32)
             expires_at = _now() + self.feishu_oauth_ttl()
             await self.state.save_feishu_oauth_state(state, callback_uri, expires_at)
@@ -1168,6 +1187,7 @@ class CloudflareRelay:
                     {"success": False, "error": "missing_code"}, status=400
                 )
             if state:
+                await self.state.ensure_feishu_oauth_schema()
                 record = await self.state.consume_feishu_oauth_state(state)
                 if record is None:
                     return _response(
