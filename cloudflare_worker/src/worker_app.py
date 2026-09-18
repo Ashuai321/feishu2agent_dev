@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS requesters (
     open_id TEXT NOT NULL,
     name TEXT NOT NULL DEFAULT '',
     source_chat_id TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT 'feishu',
     group_chat_id TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
@@ -217,6 +219,27 @@ CREATE TABLE IF NOT EXISTS feishu_oauth_states (
     redirect_uri TEXT NOT NULL,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bitable_pending_requests (
+    state TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    redirect_uri TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    source_message_id TEXT NOT NULL,
+    source_chat_id TEXT NOT NULL,
+    requester_open_id TEXT NOT NULL,
+    input_text TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bitable_user_tokens (
+    platform TEXT NOT NULL,
+    open_id TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT NOT NULL DEFAULT '',
+    expires_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (platform, open_id)
 );
 """
 
@@ -355,6 +378,14 @@ class D1State:
             statement = statement.strip()
             if statement:
                 await _db_run(self.db, statement)
+        # Existing D1 databases created before platform routing do not have
+        # this column.  ALTER is intentionally idempotent through the guarded
+        # exception so old Feishu rows remain readable.
+        with contextlib.suppress(Exception):
+            await _db_run(
+                self.db,
+                "ALTER TABLE requesters ADD COLUMN platform TEXT NOT NULL DEFAULT 'feishu'",
+            )
         self._schema_ready = True
 
     async def claim_event(
@@ -383,12 +414,23 @@ class D1State:
         return bool(isinstance(meta, dict) and meta.get("changes", 0))
 
     async def requester(self, conversation_key: str) -> dict[str, Any] | None:
-        return await _db_first(
-            self.db,
-            "SELECT conversation_key, open_id, name, source_chat_id, group_chat_id, created_at "
-            "FROM requesters WHERE conversation_key = ?",
-            conversation_key,
-        )
+        try:
+            return await _db_first(
+                self.db,
+                "SELECT conversation_key, open_id, name, source_chat_id, platform, group_chat_id, created_at "
+                "FROM requesters WHERE conversation_key = ?",
+                conversation_key,
+            )
+        except Exception:
+            row = await _db_first(
+                self.db,
+                "SELECT conversation_key, open_id, name, source_chat_id, group_chat_id, created_at "
+                "FROM requesters WHERE conversation_key = ?",
+                conversation_key,
+            )
+            if row is not None:
+                row["platform"] = "feishu"
+            return row
 
     async def save_requester(
         self,
@@ -396,22 +438,44 @@ class D1State:
         open_id: str,
         name: str,
         chat_id: str,
+        platform: str = "feishu",
     ) -> None:
-        await _db_run(
-            self.db,
-            """INSERT INTO requesters
-               (conversation_key, open_id, name, source_chat_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(conversation_key) DO UPDATE SET
-                 open_id=excluded.open_id, name=excluded.name,
-                 source_chat_id=excluded.source_chat_id, updated_at=excluded.updated_at""",
-            conversation_key,
-            open_id,
-            name,
-            chat_id,
-            _now(),
-            _now(),
-        )
+        try:
+            await _db_run(
+                self.db,
+                """INSERT INTO requesters
+                   (conversation_key, open_id, name, source_chat_id, platform, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(conversation_key) DO UPDATE SET
+                     open_id=excluded.open_id, name=excluded.name,
+                     source_chat_id=excluded.source_chat_id, platform=excluded.platform,
+                     updated_at=excluded.updated_at""",
+                conversation_key,
+                open_id,
+                name,
+                chat_id,
+                platform,
+                _now(),
+                _now(),
+            )
+        except Exception:
+            # A pre-platform D1 deployment may still have the original table;
+            # keep the legacy Feishu path usable until the next migration.
+            await _db_run(
+                self.db,
+                """INSERT INTO requesters
+                   (conversation_key, open_id, name, source_chat_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(conversation_key) DO UPDATE SET
+                     open_id=excluded.open_id, name=excluded.name,
+                     source_chat_id=excluded.source_chat_id, updated_at=excluded.updated_at""",
+                conversation_key,
+                open_id,
+                name,
+                chat_id,
+                _now(),
+                _now(),
+            )
 
     async def bind_group(self, conversation_key: str, chat_id: str) -> None:
         await _db_run(
@@ -613,6 +677,110 @@ class D1State:
                 created_at INTEGER NOT NULL
             )""",
         )
+        await _db_run(
+            self.db,
+            """CREATE TABLE IF NOT EXISTS bitable_pending_requests (
+                state TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                conversation_key TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                source_chat_id TEXT NOT NULL,
+                requester_open_id TEXT NOT NULL,
+                input_text TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )""",
+        )
+        await _db_run(
+            self.db,
+            """CREATE TABLE IF NOT EXISTS bitable_user_tokens (
+                platform TEXT NOT NULL,
+                open_id TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (platform, open_id)
+            )""",
+        )
+
+    async def save_bitable_pending(
+        self,
+        *,
+        state: str,
+        platform: str,
+        redirect_uri: str,
+        conversation_key: str,
+        source_message_id: str,
+        source_chat_id: str,
+        requester_open_id: str,
+        input_text: str,
+        expires_at: int,
+    ) -> None:
+        await _db_run(
+            self.db,
+            """INSERT INTO bitable_pending_requests
+               (state, platform, redirect_uri, conversation_key, source_message_id,
+                source_chat_id, requester_open_id, input_text, expires_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            state,
+            platform,
+            redirect_uri,
+            conversation_key,
+            source_message_id,
+            source_chat_id,
+            requester_open_id,
+            input_text,
+            expires_at,
+            _now(),
+        )
+
+    async def consume_bitable_pending(self, state: str) -> dict[str, Any] | None:
+        row = await _db_first(
+            self.db,
+            "SELECT * FROM bitable_pending_requests WHERE state = ?",
+            state,
+        )
+        if row is not None:
+            await _db_run(self.db, "DELETE FROM bitable_pending_requests WHERE state = ?", state)
+        return row
+
+    async def user_token(self, platform: str, open_id: str) -> dict[str, Any] | None:
+        return await _db_first(
+            self.db,
+            "SELECT platform, open_id, access_token, refresh_token, expires_at, updated_at "
+            "FROM bitable_user_tokens WHERE platform = ? AND open_id = ?",
+            platform,
+            open_id,
+        )
+
+    async def save_user_token(
+        self,
+        *,
+        platform: str,
+        open_id: str,
+        access_token: str,
+        refresh_token: str,
+        expires_at: int,
+    ) -> None:
+        await _db_run(
+            self.db,
+            """INSERT INTO bitable_user_tokens
+               (platform, open_id, access_token, refresh_token, expires_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(platform, open_id) DO UPDATE SET
+                 access_token=excluded.access_token,
+                 refresh_token=excluded.refresh_token,
+                 expires_at=excluded.expires_at,
+                 updated_at=excluded.updated_at""",
+            platform,
+            open_id,
+            access_token,
+            refresh_token,
+            expires_at,
+            _now(),
+        )
 
 
 class FeishuAPI:
@@ -672,6 +840,104 @@ class FeishuAPI:
                 f"{self.platform.title()} API {path} failed ({response.status_code}): {message}"
             )
         return payload
+
+    async def _user_request(
+        self, access_token: str, method: str, path: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Call a platform API with a human user's OAuth token.
+
+        Bot tenant tokens and user tokens are intentionally separate.  The
+        Bitable workflow uses this method only after the OAuth callback has
+        matched the returned user open_id to the sender who mentioned the bot.
+        """
+        token = str(access_token or "").strip()
+        if not token:
+            raise RuntimeError("user access token is empty")
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["Authorization"] = f"Bearer {token}"
+        headers.setdefault("Content-Type", "application/json")
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.request(
+                method, f"{self.base}{path}", headers=headers, **kwargs
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {"raw": response.text}
+        if response.status_code >= 400 or payload.get("code", 0) != 0:
+            message = payload.get("msg") or payload.get("message") or response.text
+            raise RuntimeError(
+                f"{self.platform.title()} user API {path} failed "
+                f"({response.status_code}): {message}"
+            )
+        return payload
+
+    async def user_info(self, access_token: str) -> dict[str, Any]:
+        payload = await self._user_request(
+            access_token, "GET", "/open-apis/authen/v1/user_info"
+        )
+        data = payload.get("data")
+        if not isinstance(data, dict) or not data.get("open_id"):
+            raise RuntimeError(f"{self.platform.title()} user info returned no open_id")
+        return data
+
+    async def resolve_wiki_bitable_app_token(
+        self, access_token: str, wiki_token: str
+    ) -> str:
+        payload = await self._user_request(
+            access_token,
+            "GET",
+            "/open-apis/wiki/v2/spaces/get_node",
+            params={"token": wiki_token},
+        )
+        node = (payload.get("data") or {}).get("node") or {}
+        if not isinstance(node, dict):
+            raise RuntimeError("Wiki node response has no node")
+        app_token = str(node.get("obj_token") or node.get("token") or "")
+        obj_type = str(node.get("obj_type") or "")
+        if not app_token:
+            raise RuntimeError("Wiki node did not return a Bitable app_token")
+        if obj_type and obj_type not in {"bitable", "sheet"}:
+            raise RuntimeError(f"Wiki node type is {obj_type}, not a Bitable")
+        return app_token
+
+    async def create_user_bitable_record(
+        self,
+        access_token: str,
+        *,
+        app_token: str,
+        table_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = await self._user_request(
+            access_token,
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            params={"user_id_type": "open_id"},
+            json={"fields": fields},
+        )
+        record = (payload.get("data") or {}).get("record")
+        if not isinstance(record, dict) or not record.get("record_id"):
+            raise RuntimeError("Bitable create response did not contain record_id")
+        return record
+
+    async def user_bitable_fields(
+        self,
+        access_token: str,
+        *,
+        app_token: str,
+        table_id: str,
+    ) -> list[dict[str, Any]]:
+        payload = await self._user_request(
+            access_token,
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            params={"user_id_type": "open_id", "page_size": 100},
+        )
+        items = (payload.get("data") or {}).get("items") or []
+        if not isinstance(items, list):
+            raise RuntimeError("Bitable fields response is invalid")
+        return [item for item in items if isinstance(item, dict)]
 
     async def bot_open_id(self) -> str:
         payload = await self._request("GET", "/open-apis/bot/v3/info")
@@ -1111,6 +1377,249 @@ def _conversation_input(
     return "\n".join([*header, "", *body])
 
 
+BITABLE_WORKFLOW_GROUP_CHAT_ID = "oc_5e9132f3638772d53d92d6fc5e953abc"
+BITABLE_WORKFLOW_WIKI_TOKEN = "AYNDwkmOUiZtbgkZ3BAcLchUnnb"
+BITABLE_WORKFLOW_TABLE_ID = "tblVyvH3RGHqwQBC"
+
+
+class BitableGroupWorkflow:
+    """Handle the dedicated group-to-Bitable test flow.
+
+    This workflow is deliberately isolated from the Workspace Agent relay. A
+    message in the configured test group is handled synchronously as:
+
+    ``event platform -> sender open_id -> matching OAuth -> user API write``.
+
+    The sender's open_id is available from the event, but a bot event never
+    contains that person's user access token. The first request therefore
+    replies with a platform-specific authorization URL. The callback stores a
+    short-lived pending request, verifies the OAuth user open_id matches the
+    sender, and only then writes the row with the user's token.
+    """
+
+    def __init__(self, relay: CloudflareRelay) -> None:
+        self.relay = relay
+
+    def target_group(self) -> str:
+        return _env(
+            self.relay.env,
+            "BITABLE_WORKFLOW_GROUP_CHAT_ID",
+            BITABLE_WORKFLOW_GROUP_CHAT_ID,
+        ) or BITABLE_WORKFLOW_GROUP_CHAT_ID
+
+    def is_target_group(self, chat_id: str) -> bool:
+        return str(chat_id or "").strip() == self.target_group()
+
+    @staticmethod
+    def _auth_base(platform: str) -> str:
+        return (
+            "https://accounts.larksuite.com"
+            if platform == "lark"
+            else FEISHU_AUTH_BASE_URL
+        )
+
+    def _callback_uri(self, platform: str) -> str:
+        return _env(
+            self.relay.env,
+            f"{platform.upper()}_OAUTH_REDIRECT_URI",
+            self.relay.base_url() + f"/{platform}/oauth/callback",
+        )
+
+    def _scope(self, platform: str) -> str:
+        return self.relay.platform_oauth_scope(platform)
+
+    async def _authorization_url(
+        self,
+        *,
+        platform: str,
+        conversation_key: str,
+        event: dict[str, Any],
+    ) -> str:
+        callback_uri = self._callback_uri(platform)
+        state = f"bitable_{platform}_" + secrets.token_urlsafe(32)
+        expires_at = _now() + self.relay.feishu_oauth_ttl(platform)
+        await self.relay.state.save_bitable_pending(
+            state=state,
+            platform=platform,
+            redirect_uri=callback_uri,
+            conversation_key=conversation_key,
+            source_message_id=str(event["message_id"]),
+            source_chat_id=str(event["chat_id"]),
+            requester_open_id=str(event["open_id"]),
+            input_text=str(event.get("text") or "").strip(),
+            expires_at=expires_at,
+        )
+        prefix = platform.upper()
+        return (
+            f"{self._auth_base(platform)}/open-apis/authen/v1/authorize?"
+            + urlencode(
+                {
+                    "app_id": _env(self.relay.env, f"{prefix}_APP_ID"),
+                    "redirect_uri": callback_uri,
+                    "scope": self._scope(platform),
+                    "state": state,
+                }
+            )
+        )
+
+    async def _reply_auth(self, platform: str, event: dict[str, Any], url: str) -> None:
+        api = self.relay.api_for_conversation(f"{platform}:workflow")
+        await api.reply(
+            str(event["message_id"]),
+            "请点击下面的授权链接，允许本次以你的账号写入多维表格；授权完成后会自动继续：\n"
+            + url,
+        )
+
+    async def _write_row(
+        self,
+        *,
+        platform: str,
+        requester_open_id: str,
+        text: str,
+        access_token: str,
+    ) -> dict[str, Any]:
+        api = self.relay.api_for_conversation(f"{platform}:workflow")
+        identity = await api.user_info(access_token)
+        authorized_open_id = str(identity.get("open_id") or "").strip()
+        if not authorized_open_id or authorized_open_id != requester_open_id:
+            raise RuntimeError(
+                "OAuth 用户与发起 @ 的用户不一致；为避免越权，未写入多维表格"
+            )
+        app_token = await api.resolve_wiki_bitable_app_token(
+            access_token, BITABLE_WORKFLOW_WIKI_TOKEN
+        )
+        fields = await api.user_bitable_fields(
+            access_token,
+            app_token=app_token,
+            table_id=BITABLE_WORKFLOW_TABLE_ID,
+        )
+        field_names = {str(item.get("field_name") or "") for item in fields}
+        missing = {"任务描述", "任务执行人"} - field_names
+        if missing:
+            raise RuntimeError(
+                "测试表缺少字段：" + "、".join(sorted(missing))
+            )
+        return await api.create_user_bitable_record(
+            access_token,
+            app_token=app_token,
+            table_id=BITABLE_WORKFLOW_TABLE_ID,
+            fields={
+                "任务描述": text,
+                "任务执行人": [{"id": requester_open_id}],
+            },
+        )
+
+    async def handle_event(
+        self, *, platform: str, conversation_key: str, event: dict[str, Any]
+    ) -> None:
+        await self.relay.state.ensure_feishu_oauth_schema()
+        requester_open_id = str(event.get("open_id") or "").strip()
+        text = str(event.get("text") or "").strip()
+        if not requester_open_id or not text:
+            return
+        cached = await self.relay.state.user_token(platform, requester_open_id)
+        if cached and int(cached.get("expires_at") or 0) > _now() + 60:
+            try:
+                record = await self._write_row(
+                    platform=platform,
+                    requester_open_id=requester_open_id,
+                    text=text,
+                    access_token=str(cached.get("access_token") or ""),
+                )
+                await self.relay.api_for_conversation(f"{platform}:workflow").reply(
+                    str(event["message_id"]),
+                    f"已使用你之前的 {platform} 授权写入多维表格，任务执行人={requester_open_id}，"
+                    f"record_id={record.get('record_id')}",
+                )
+                return
+            except Exception as exc:
+                # A revoked/expired token should fall through to a fresh
+                # authorization instead of silently using a different user.
+                print(f"Cached {platform} user token was not usable: {_safe_error(exc)}")
+        url = await self._authorization_url(
+            platform=platform,
+            conversation_key=conversation_key,
+            event=event,
+        )
+        await self._reply_auth(platform, event, url)
+
+    async def complete_oauth(
+        self, pending: dict[str, Any], token_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        platform = str(pending.get("platform") or "").strip().lower()
+        requester_open_id = str(pending.get("requester_open_id") or "").strip()
+        access_token = str(token_data.get("access_token") or "").strip()
+        if platform not in {"feishu", "lark"} or not access_token:
+            raise RuntimeError("OAuth callback data is missing platform or access_token")
+        record = await self._write_row(
+            platform=platform,
+            requester_open_id=requester_open_id,
+            text=str(pending.get("input_text") or "").strip(),
+            access_token=access_token,
+        )
+        expires_in = int(token_data.get("expires_in") or 7200)
+        await self.relay.state.save_user_token(
+            platform=platform,
+            open_id=requester_open_id,
+            access_token=access_token,
+            refresh_token=str(token_data.get("refresh_token") or ""),
+            expires_at=_now() + max(expires_in, 60),
+        )
+        await self.relay.api_for_conversation(f"{platform}:workflow").reply(
+            str(pending.get("source_message_id") or ""),
+            f"授权成功，已按你的 {platform} 账号写入多维表格，任务执行人={requester_open_id}，"
+            f"record_id={record.get('record_id')}",
+        )
+        return {
+            "platform": platform,
+            "open_id": requester_open_id,
+            "record_id": str(record.get("record_id") or ""),
+        }
+
+
+class AgentRelayWorkflow:
+    """Keep the pre-existing Workspace Agent relay path isolated.
+
+    The dedicated Bitable test-group flow is selected before this class is
+    called. Every other group continues through this unchanged relay contract.
+    """
+
+    def __init__(self, relay: CloudflareRelay) -> None:
+        self.relay = relay
+
+    async def handle_event(
+        self,
+        *,
+        platform: str,
+        conversation_key: str,
+        event: dict[str, Any],
+        request_id: str,
+    ) -> None:
+        continuation = await self.relay.state.previous_run_exists(conversation_key)
+        input_text = _conversation_input(
+            request_id=request_id,
+            conversation_key=conversation_key,
+            text=str(event.get("text") or ""),
+            continuation=continuation,
+            image_keys=event.get("image_keys") or [],
+        )
+        await self.relay.state.create_run(
+            request_id=request_id,
+            conversation_key=conversation_key,
+            source_message_id=str(event["message_id"]),
+            input_markdown=input_text,
+            image_keys=event.get("image_keys") or [],
+        )
+        prefix = platform.upper()
+        await self.relay._enqueue(
+            {
+                "kind": "agent",
+                "request_id": request_id,
+                "idempotency_key": f"{_env(self.relay.env, f'{prefix}_APP_ID')}:{event['message_id']}",
+            }
+        )
+
+
 class CloudflareRelay:
     def __init__(self, env: Any, ctx: Any, db_state: D1State) -> None:
         self.env = env
@@ -1122,6 +1631,8 @@ class CloudflareRelay:
             if _env(env, "LARK_APP_ID") and _env(env, "LARK_APP_SECRET")
             else None
         )
+        self.bitable_workflow = BitableGroupWorkflow(self)
+        self.agent_workflow = AgentRelayWorkflow(self)
 
     def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
         """Select the API client from the event's platform-prefixed key."""
@@ -1243,10 +1754,13 @@ class CloudflareRelay:
                     {"success": False, "error": "missing_code"}, status=400
                 )
             redirect_uri = ""
+            pending: dict[str, Any] | None = None
             if state:
                 await self.state.ensure_feishu_oauth_schema()
-                record = await self.state.consume_feishu_oauth_state(state)
-                if record is None:
+                consume_pending = getattr(self.state, "consume_bitable_pending", None)
+                pending = await consume_pending(state) if consume_pending is not None else None
+                record = None if pending is not None else await self.state.consume_feishu_oauth_state(state)
+                if record is None and pending is None:
                     return _response(
                         {
                             "success": False,
@@ -1254,11 +1768,11 @@ class CloudflareRelay:
                         },
                         status=400,
                     )
-                if int(record.get("expires_at", 0)) < _now():
+                if int((pending or record or {}).get("expires_at", 0)) < _now():
                     return _response(
                         {"success": False, "error": "expired_state"}, status=400
                     )
-                redirect_uri = str(record.get("redirect_uri") or "").strip()
+                redirect_uri = str((pending or record or {}).get("redirect_uri") or "").strip()
             if not redirect_uri:
                 redirect_uri = _env(
                     self.env,
@@ -1309,6 +1823,30 @@ class CloudflareRelay:
                 return _response(
                     {"success": False, "error": "token_exchange_failed", "message": message},
                     status=502,
+                )
+            if pending is not None:
+                try:
+                    result = await self.bitable_workflow.complete_oauth(pending, data)
+                except Exception as exc:
+                    # Do not expose access tokens or raw upstream payloads in a
+                    # browser response. The initiating message receives the
+                    # success/error reply when the user account can be verified.
+                    message = _safe_error(exc, str(data.get("access_token") or ""))
+                    try:
+                        await self.api_for_conversation(
+                            f"{normalized}:workflow"
+                        ).reply(
+                            str(pending.get("source_message_id") or ""),
+                            f"授权完成，但未能写入多维表格：{message}",
+                        )
+                    except Exception as reply_exc:
+                        print(f"Bitable workflow error reply failed: {_safe_error(reply_exc)}")
+                    return _response(
+                        {"success": False, "error": "bitable_write_failed", "message": message},
+                        status=502,
+                    )
+                return _response(
+                    {"success": True, "workflow": "bitable_group", **result}
                 )
             return _response({"success": True, "token": data})
 
@@ -2512,6 +3050,8 @@ class CloudflareRelay:
             if not conversation_key:
                 conversation_key = f"{normalized}:{_env(self.env, f'{prefix}_APP_ID')}:{event['chat_id']}:{secrets.token_hex(6)}"
             request_id = _request_id(normalized)
+            if self.bitable_workflow.is_target_group(event["chat_id"]):
+                await self.state.ensure_schema()
             # Feishu rows already use the raw message id. Prefix only Lark
             # dedupe keys so old Feishu state remains readable while the two
             # platforms cannot suppress each other's messages.
@@ -2529,29 +3069,24 @@ class CloudflareRelay:
             ):
                 return _response({"code": 0})
             await self.state.save_requester(
-                conversation_key, event["open_id"], event["name"], event["chat_id"]
+                conversation_key,
+                event["open_id"],
+                event["name"],
+                event["chat_id"],
+                normalized,
             )
-            continuation = await self.state.previous_run_exists(conversation_key)
-            input_text = _conversation_input(
-                request_id=request_id,
+            if self.bitable_workflow.is_target_group(event["chat_id"]):
+                await self.bitable_workflow.handle_event(
+                    platform=normalized,
+                    conversation_key=conversation_key,
+                    event=event,
+                )
+                return _response({"code": 0})
+            await self.agent_workflow.handle_event(
+                platform=normalized,
                 conversation_key=conversation_key,
-                text=event["text"],
-                continuation=continuation,
-                image_keys=event.get("image_keys") or [],
-            )
-            await self.state.create_run(
+                event=event,
                 request_id=request_id,
-                conversation_key=conversation_key,
-                source_message_id=event["message_id"],
-                input_markdown=input_text,
-                image_keys=event.get("image_keys") or [],
-            )
-            await self._enqueue(
-                {
-                    "kind": "agent",
-                    "request_id": request_id,
-                    "idempotency_key": f"{_env(self.env, f'{prefix}_APP_ID')}:{event['message_id']}",
-                }
             )
         except Exception as exc:
             # Always acknowledge after validation to avoid an endless Feishu retry

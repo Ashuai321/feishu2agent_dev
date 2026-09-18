@@ -138,6 +138,86 @@ def test_worker_keeps_parent_for_an_mentioned_reply():
     assert event["mentioned_bot"] is True
 
 
+def test_target_group_workflow_uses_the_configured_group_and_platform():
+    worker = _load_worker_module()
+
+    class Relay:
+        env = type("Env", (), {})()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+    workflow = worker.BitableGroupWorkflow(Relay())
+    assert workflow.is_target_group("oc_5e9132f3638772d53d92d6fc5e953abc") is True
+    assert workflow.is_target_group("oc_other") is False
+    assert workflow._auth_base("feishu") == "https://accounts.feishu.cn"
+    assert workflow._auth_base("lark") == "https://accounts.larksuite.com"
+
+
+def test_bitable_group_workflow_builds_platform_specific_authorization_link():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.pending = None
+
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = kwargs
+
+    class FakeAPI:
+        def __init__(self):
+            self.replies = []
+
+        async def reply(self, message_id, text):
+            self.replies.append((message_id, text))
+            return "om_reply"
+
+    class Relay:
+        env = type("Env", (), {"FEISHU_APP_ID": "cli_feishu"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    workflow = worker.BitableGroupWorkflow(relay)
+    asyncio.run(
+        workflow.handle_event(
+            platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={
+                "message_id": "om_source",
+                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "open_id": "ou_requester",
+                "text": "测试任务",
+            },
+        )
+    )
+    assert relay.state.pending["platform"] == "feishu"
+    assert relay.state.pending["requester_open_id"] == "ou_requester"
+    assert relay.api.replies[0][0] == "om_source"
+    assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in relay.api.replies[0][1]
+    assert "app_id=cli_feishu" in relay.api.replies[0][1]
+
+
 def test_agent_input_uses_text_relay_envelope():
     worker = _load_worker_module()
 

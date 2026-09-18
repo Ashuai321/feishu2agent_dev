@@ -129,6 +129,39 @@ python -m feishu2agents.main
 本地脚本用 `--platform feishu` 或 `--platform lark` 选择平台，token 文件和环境变量也彼此
 独立；不提供 Lark 凭证时，原 Feishu 流程保持不变。
 
+### 指定测试群：以 @ 发起人的身份写入多维表格
+
+`BITABLE_WORKFLOW_GROUP_CHAT_ID` 默认是
+`oc_5e9132f3638772d53d92d6fc5e953abc`。在这个群里明确 @机器人并发送文字时，
+Worker 根据事件进入的 `/feishu/events` 或 `/lark/events` 判定平台，保存发送人的
+`open_id`，并回复该平台的 OAuth 授权链接。用户完成授权后，回调会再次调用对应平台的
+`user_info`，只有返回的 `open_id` 与发起 @ 的人一致才会继续；随后以该用户 token 将
+文字写入 Wiki 节点对应多维表格「测试」表的「任务描述」，并把发起人的 open_id 写入
+「任务执行人」。不同平台的 token、API 域名和用户身份严格隔离。
+
+机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的 `user_access_token`，所以
+第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1
+中，后续同一用户可直接复用；撤销或过期后会再次要求授权。若 Lark 用户无权访问这个
+Feishu 租户中的 Wiki/多维表格，API 会返回权限错误，系统不会降级使用 Feishu 机器人
+或其他人的 token。
+
+需要只在本地验证当前已授权用户时，可运行：
+
+```bash
+python -m scripts.xiaoc_bitable_current_user --list-users
+python -m scripts.xiaoc_bitable_current_user --text "当前用户测试任务"
+```
+
+另有逐人 @ 测试脚本：
+
+```bash
+python -m scripts.xiaoc_group_mention_all --dry-run
+python -m scripts.xiaoc_group_mention_all --platform feishu --text "请确认收到"
+```
+
+指定群之外的消息仍交给原来的 Workspace Agent Relay；该 Agent 路径已单独封装，避免与
+授权写表流程互相影响。
+
 ## Cloudflare Python Worker 部署
 
 生产入口是 `cloudflare_worker/src/entry.py`。它把飞书 Webhook、MCP/OAuth 和 Agent 回调都运行在 Cloudflare Python Worker 内部，不再使用 Python 源站，也不需要 `PYTHON_ORIGIN`。现有稳定域名继续使用 `https://bot.boooe.com`。

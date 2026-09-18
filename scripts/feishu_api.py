@@ -354,6 +354,67 @@ def get_user_info(
     return result
 
 
+def get_bot_info(
+    app_id: str,
+    app_secret: str,
+    *,
+    base_url: str = FEISHU_BASE_URL,
+) -> dict[str, Any]:
+    """Return the bot identity for one platform application.
+
+    This small diagnostic call is deliberately separate from ``get_user_info``:
+    the former proves that the selected Feishu/Lark bot credentials are being
+    used, while the latter proves which human user authorized the operation.
+    """
+    tenant_token = get_tenant_access_token(app_id, app_secret, base_url=base_url)
+    data = _request_json(
+        "GET", "/open-apis/bot/v3/info", token=tenant_token, base_url=base_url
+    )
+    bot = data.get("bot")
+    if not isinstance(bot, dict) or not bot.get("open_id"):
+        raise FeishuScriptError("机器人身份响应中没有 open_id")
+    return bot
+
+
+def list_chat_members(
+    tenant_token: str,
+    chat_id: str,
+    *,
+    base_url: str = FEISHU_BASE_URL,
+    page_size: int = 100,
+) -> list[dict[str, Any]]:
+    """List the members visible to the platform bot in one group."""
+    result: list[dict[str, Any]] = []
+    page_token = ""
+    while True:
+        query = {
+            "member_id_type": "open_id",
+            "page_size": max(1, min(page_size, 100)),
+        }
+        if page_token:
+            query["page_token"] = page_token
+        data = _request_json(
+            "GET",
+            f"/open-apis/im/v1/chats/{urllib.parse.quote(chat_id, safe='')}/members",
+            token=tenant_token,
+            query=query,
+            base_url=base_url,
+        )
+        payload = data.get("data") or {}
+        items = payload.get("items") or [] if isinstance(payload, dict) else []
+        if not isinstance(items, list):
+            raise FeishuScriptError("群成员响应格式不正确")
+        for item in items:
+            if isinstance(item, dict):
+                result.append(item)
+        has_more = bool(payload.get("has_more")) if isinstance(payload, dict) else False
+        next_token = str(payload.get("page_token") or "") if isinstance(payload, dict) else ""
+        if not has_more or not next_token or next_token == page_token:
+            break
+        page_token = next_token
+    return result
+
+
 def parse_date_to_millis(value: str) -> int:
     raw = value.strip()
     parsed: datetime
