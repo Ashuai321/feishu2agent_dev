@@ -616,9 +616,19 @@ class D1State:
 
 
 class FeishuAPI:
-    def __init__(self, env: Any) -> None:
+    def __init__(self, env: Any, platform: str = "feishu") -> None:
         self.env = env
-        self.base = _env(env, "FEISHU_API_BASE", "https://open.feishu.cn")
+        self.platform = str(platform or "feishu").strip().lower() or "feishu"
+        if self.platform not in {"feishu", "lark"}:
+            raise ValueError("platform must be feishu or lark")
+        prefix = self.platform.upper()
+        self.base = _env(
+            env,
+            f"{prefix}_API_BASE",
+            "https://open.larksuite.com" if self.platform == "lark" else "https://open.feishu.cn",
+        )
+        self.app_id_env = f"{prefix}_APP_ID"
+        self.app_secret_env = f"{prefix}_APP_SECRET"
         self._token: str = ""
         self._token_expires = 0
 
@@ -629,15 +639,17 @@ class FeishuAPI:
             response = await client.post(
                 f"{self.base}/open-apis/auth/v3/tenant_access_token/internal",
                 json={
-                    "app_id": _env(self.env, "FEISHU_APP_ID"),
-                    "app_secret": _env(self.env, "FEISHU_APP_SECRET"),
+                    "app_id": _env(self.env, self.app_id_env),
+                    "app_secret": _env(self.env, self.app_secret_env),
                 },
             )
         response.raise_for_status()
         payload = response.json()
         token = str(payload.get("tenant_access_token") or "")
         if not token:
-            raise RuntimeError("Feishu token response did not contain tenant_access_token")
+            raise RuntimeError(
+                f"{self.platform.title()} token response did not contain tenant_access_token"
+            )
         self._token = token
         self._token_expires = _now() + int(payload.get("expire", 7200))
         return token
@@ -656,14 +668,16 @@ class FeishuAPI:
             payload = {"raw": response.text}
         if response.status_code >= 400 or payload.get("code", 0) != 0:
             message = payload.get("msg") or payload.get("message") or response.text
-            raise RuntimeError(f"Feishu API {path} failed ({response.status_code}): {message}")
+            raise RuntimeError(
+                f"{self.platform.title()} API {path} failed ({response.status_code}): {message}"
+            )
         return payload
 
     async def bot_open_id(self) -> str:
         payload = await self._request("GET", "/open-apis/bot/v3/info")
         value = payload.get("bot", {}).get("open_id")
         if not value:
-            raise RuntimeError("Feishu bot identity returned no open_id")
+            raise RuntimeError(f"{self.platform.title()} bot identity returned no open_id")
         return str(value)
 
     async def reply(self, message_id: str, text: str) -> str:
@@ -1036,9 +1050,10 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
     }
 
 
-def _request_id() -> str:
+def _request_id(platform: str = "feishu") -> str:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    return f"feishu_{stamp}_{secrets.token_hex(6)}"
+    normalized = str(platform or "feishu").strip().lower() or "feishu"
+    return f"{normalized}_{stamp}_{secrets.token_hex(6)}"
 
 
 def _conversation_input(
@@ -1102,6 +1117,20 @@ class CloudflareRelay:
         self.ctx = ctx
         self.state = db_state
         self.feishu = FeishuAPI(env)
+        self.lark = (
+            FeishuAPI(env, "lark")
+            if _env(env, "LARK_APP_ID") and _env(env, "LARK_APP_SECRET")
+            else None
+        )
+
+    def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
+        """Select the API client from the event's platform-prefixed key."""
+        platform = str(conversation_key or "").split(":", 1)[0].lower()
+        if platform == "lark":
+            if self.lark is None:
+                raise RuntimeError("Lark is not configured: set LARK_APP_ID and LARK_APP_SECRET")
+            return self.lark
+        return self.feishu
 
     def base_url(self) -> str:
         return _env(self.env, "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
@@ -1117,29 +1146,34 @@ class CloudflareRelay:
             return configured.lower()
         return "oauth" if _env(self.env, "WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN") else "none"
 
-    def feishu_oauth_scope(self) -> str:
+    def platform_oauth_scope(self, platform: str = "feishu") -> str:
         # The test scripts resolve the supplied Wiki URL to a Bitable app
         # token before reading/writing records.  Request the Bitable write
         # permission and the Wiki node read permission up front.  The
         # optional offline_access scope lets the returned token include a
         # refresh token when the app has enabled it.
-        return (
-            _env(
-                self.env,
-                "FEISHU_OAUTH_SCOPE",
-                "bitable:app wiki:wiki:readonly offline_access",
-            )
-            or "bitable:app wiki:wiki:readonly offline_access"
-        )
+        prefix = str(platform or "feishu").upper()
+        return _env(
+            self.env,
+            f"{prefix}_OAUTH_SCOPE",
+            "bitable:app wiki:wiki:readonly offline_access",
+        ) or "bitable:app wiki:wiki:readonly offline_access"
 
-    def feishu_oauth_ttl(self) -> int:
+    def feishu_oauth_scope(self) -> str:
+        """Backward-compatible Feishu scope accessor."""
+        return self.platform_oauth_scope("feishu")
+
+    def feishu_oauth_ttl(self, platform: str = "feishu") -> int:
         try:
-            return max(int(_env(self.env, "FEISHU_OAUTH_STATE_TTL_SECONDS", "600")), 60)
+            prefix = str(platform or "feishu").upper()
+            return max(int(_env(self.env, f"{prefix}_OAUTH_STATE_TTL_SECONDS", "600")), 60)
         except ValueError:
             return 600
 
-    async def feishu_oauth(self, request: Any, path: str) -> Response:
-        """Handle Feishu user OAuth on the Cloudflare Worker.
+    async def feishu_oauth(
+        self, request: Any, path: str, platform: str = "feishu"
+    ) -> Response:
+        """Handle Feishu or Lark user OAuth on the Cloudflare Worker.
 
         This is the Worker equivalent of the legacy Python ASGI routes.  The
         authorization nonce is kept in D1 so a cold start or a second Worker
@@ -1152,13 +1186,22 @@ class CloudflareRelay:
                 headers={"allow": "GET"},
             )
         params = parse_qs(urlparse(request.url).query, keep_blank_values=True)
-        if path == "/feishu/oauth/authorize":
+        normalized = str(platform or "feishu").strip().lower() or "feishu"
+        if normalized not in {"feishu", "lark"}:
+            return _response({"success": False, "error": "unsupported_platform"}, status=400)
+        prefix = normalized.upper()
+        auth_base = (
+            "https://accounts.larksuite.com"
+            if normalized == "lark"
+            else FEISHU_AUTH_BASE_URL
+        )
+        if path == f"/{normalized}/oauth/authorize":
             callback_uri = str((params.get("callback_uri") or [""])[0]).strip()
             if not callback_uri:
                 callback_uri = _env(
                     self.env,
-                    "FEISHU_OAUTH_REDIRECT_URI",
-                    self.base_url() + "/feishu/oauth/callback",
+                    f"{prefix}_OAUTH_REDIRECT_URI",
+                    self.base_url() + f"/{normalized}/oauth/callback",
                 )
             if not callback_uri:
                 return _response(
@@ -1176,23 +1219,23 @@ class CloudflareRelay:
                     {"success": False, "error": "invalid_redirect_uri"}, status=400
                 )
             await self.state.ensure_feishu_oauth_schema()
-            state = "feishu_state_" + secrets.token_urlsafe(32)
-            expires_at = _now() + self.feishu_oauth_ttl()
+            state = f"{normalized}_state_" + secrets.token_urlsafe(32)
+            expires_at = _now() + self.feishu_oauth_ttl(normalized)
             await self.state.save_feishu_oauth_state(state, callback_uri, expires_at)
             location = (
-                f"{FEISHU_AUTH_BASE_URL}/open-apis/authen/v1/authorize?"
+                f"{auth_base}/open-apis/authen/v1/authorize?"
                 + urlencode(
                     {
-                        "app_id": _env(self.env, "FEISHU_APP_ID"),
+                        "app_id": _env(self.env, f"{prefix}_APP_ID"),
                         "redirect_uri": callback_uri,
-                        "scope": self.feishu_oauth_scope(),
+                        "scope": self.platform_oauth_scope(normalized),
                         "state": state,
                     }
                 )
             )
             return _text_response("", 302, {"Location": location})
 
-        if path == "/feishu/oauth/callback":
+        if path == f"/{normalized}/oauth/callback":
             code = str((params.get("code") or [""])[0]).strip()
             state = str((params.get("state") or [""])[0]).strip()
             if not code:
@@ -1219,21 +1262,21 @@ class CloudflareRelay:
             if not redirect_uri:
                 redirect_uri = _env(
                     self.env,
-                    "FEISHU_OAUTH_REDIRECT_URI",
-                    self.base_url() + "/feishu/oauth/callback",
+                    f"{prefix}_OAUTH_REDIRECT_URI",
+                    self.base_url() + f"/{normalized}/oauth/callback",
                 ).strip()
 
             payload = {
                 "grant_type": "authorization_code",
                 "code": code,
-                "client_id": _env(self.env, "FEISHU_APP_ID"),
-                "client_secret": _env(self.env, "FEISHU_APP_SECRET"),
+                "client_id": _env(self.env, f"{prefix}_APP_ID"),
+                "client_secret": _env(self.env, f"{prefix}_APP_SECRET"),
                 "redirect_uri": redirect_uri,
             }
             try:
                 async with httpx.AsyncClient(timeout=20) as client:
                     response = await client.post(
-                        "https://accounts.feishu.cn/oauth/v3/token",
+                        f"{auth_base}/oauth/v3/token",
                         data=payload,
                         headers={
                             "Content-Type": "application/x-www-form-urlencoded",
@@ -1255,7 +1298,7 @@ class CloudflareRelay:
             if not isinstance(data, dict):
                 data = body if isinstance(body, dict) else {}
             if not data.get("access_token"):
-                message = "Feishu did not return an access_token"
+                message = f"{normalized.title()} did not return an access_token"
                 if isinstance(body, dict):
                     message = str(
                         body.get("error_description")
@@ -1883,7 +1926,7 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                chat_id = await self.feishu.create_private_group(
+                chat_id = await self.api_for_conversation(conversation_key).create_private_group(
                     str(row["open_id"]), args.get("chat_name")
                 )
             except Exception as exc:
@@ -1917,7 +1960,7 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                candidates = await self.feishu.search_contacts(query)
+                candidates = await self.api_for_conversation(conversation_key).search_contacts(query)
             except Exception as exc:
                 return self._tool_result(
                     {
@@ -1985,7 +2028,9 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                chat_id = await self.feishu.create_group(group_name, members)
+                chat_id = await self.api_for_conversation(conversation_key).create_group(
+                    group_name, members
+                )
             except Exception as exc:
                 return self._tool_result(
                     {
@@ -2059,7 +2104,9 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                result = await self.feishu.add_group_members(target_chat_id, members)
+                result = await self.api_for_conversation(conversation_key).add_group_members(
+                    target_chat_id, members
+                )
             except Exception as exc:
                 return self._tool_result(
                     {
@@ -2094,7 +2141,9 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                settings = await self.feishu.get_chat(target_chat_id)
+                settings = await self.api_for_conversation(conversation_key).get_chat(
+                    target_chat_id
+                )
             except Exception as exc:
                 return self._tool_result(
                     {
@@ -2164,7 +2213,7 @@ class CloudflareRelay:
                         True,
                     )
                 try:
-                    image_data = await self.feishu.download_image(
+                    image_data = await self.api_for_conversation(conversation_key).download_image(
                         source_message_id, str(image_keys[-1])
                     )
                 except Exception as exc:
@@ -2179,7 +2228,9 @@ class CloudflareRelay:
                         True,
                     )
                 try:
-                    changes["avatar_image_key"] = await self.feishu.upload_avatar_image(image_data)
+                    changes["avatar_image_key"] = await self.api_for_conversation(
+                        conversation_key
+                    ).upload_avatar_image(image_data)
                 except Exception as exc:
                     return self._tool_result(
                         {
@@ -2209,7 +2260,9 @@ class CloudflareRelay:
                     True,
                 )
             try:
-                await self.feishu.update_chat(target_chat_id, changes)
+                await self.api_for_conversation(conversation_key).update_chat(
+                    target_chat_id, changes
+                )
             except Exception as exc:
                 return self._tool_result(
                     {
@@ -2314,7 +2367,9 @@ class CloudflareRelay:
         for image_key in image_keys[:3]:
             if not isinstance(image_key, str) or not image_key:
                 continue
-            data = await self.feishu.download_image(str(run["source_message_id"]), image_key)
+            data = await self.api_for_conversation(str(run["conversation_key"])).download_image(
+                str(run["source_message_id"]), image_key
+            )
             object_key = f"{run['conversation_key']}/{run['source_message_id']}/{image_key}"
             await bucket.put(object_key, data)
             await self.state.save_avatar(str(run["conversation_key"]), object_key, len(data))
@@ -2333,7 +2388,9 @@ class CloudflareRelay:
             await self._store_run_images(run)
             placeholder_id = run.get("placeholder_message_id")
             if not placeholder_id:
-                placeholder_id = await self.feishu.reply(
+                placeholder_id = await self.api_for_conversation(
+                    str(run["conversation_key"])
+                ).reply(
                     str(run["source_message_id"]), PLACEHOLDER
                 )
                 await self.state.update_run(request_id, placeholder_message_id=placeholder_id)
@@ -2397,7 +2454,9 @@ class CloudflareRelay:
             placeholder = str(run.get("placeholder_message_id") or "")
             if placeholder:
                 try:
-                    await self.feishu.update(placeholder, text)
+                    await self.api_for_conversation(str(run["conversation_key"])).update(
+                        placeholder, text
+                    )
                     outbound = placeholder
                 except Exception as exc:
                     # Keep delivery reliable if an old message is no longer
@@ -2405,9 +2464,13 @@ class CloudflareRelay:
                     # messages use the PUT text-edit path above and normally
                     # stay in place.
                     print(f"Feishu message update failed; sending a reply: {_safe_error(exc)}")
-                    outbound = await self.feishu.reply(str(run["source_message_id"]), text)
+                    outbound = await self.api_for_conversation(
+                        str(run["conversation_key"])
+                    ).reply(str(run["source_message_id"]), text)
             else:
-                outbound = await self.feishu.reply(str(run["source_message_id"]), text)
+                outbound = await self.api_for_conversation(
+                    str(run["conversation_key"])
+                ).reply(str(run["source_message_id"]), text)
             await _db_run(
                 self.state.db,
                 "UPDATE relay_runs SET delivered = 1, updated_at = ? WHERE request_id = ?",
@@ -2419,22 +2482,26 @@ class CloudflareRelay:
             await self.state.update_run(request_id, trigger_error=_safe_error(exc))
             raise
 
-    async def handle_feishu(self, request: Any) -> Response:
+    async def handle_feishu(self, request: Any, platform: str = "feishu") -> Response:
+        normalized = str(platform or "feishu").strip().lower() or "feishu"
+        if normalized not in {"feishu", "lark"}:
+            return _response({"code": 1, "error": "unsupported_platform"}, status=400)
+        prefix = normalized.upper()
         body = await self._body_json(request)
         header = body.get("header") if isinstance(body.get("header"), dict) else {}
-        verify = _env(self.env, "FEISHU_VERIFY_TOKEN")
+        verify = _env(self.env, f"{prefix}_VERIFY_TOKEN")
         if verify and str(header.get("token") or "") != verify:
             return _response({"code": 1}, 403)
         if body.get("challenge"):
             return _response({"challenge": body["challenge"]})
         if str(header.get("event_type") or "") != "im.message.receive_v1":
             return _response({"code": 0})
-        bot_id = _env(self.env, "FEISHU_BOT_OPEN_ID")
+        bot_id = _env(self.env, f"{prefix}_BOT_OPEN_ID")
         if not bot_id:
             # Do not make a Feishu API call in the webhook request.  A cold
             # Worker must acknowledge within Feishu's timeout; resolve the
             # value once with /open-apis/bot/v3/info and store it as a Secret.
-            print("FEISHU_BOT_OPEN_ID is not configured; event ignored")
+            print(f"{prefix}_BOT_OPEN_ID is not configured; event ignored")
             return _response({"code": 0})
         try:
             event = _normalize_event(body, bot_id)
@@ -2443,10 +2510,18 @@ class CloudflareRelay:
             parent = event["parent_id"]
             conversation_key = await self.state.reply_conversation(parent) if parent else None
             if not conversation_key:
-                conversation_key = f"feishu:{_env(self.env, 'FEISHU_APP_ID')}:{event['chat_id']}:{secrets.token_hex(6)}"
-            request_id = _request_id()
+                conversation_key = f"{normalized}:{_env(self.env, f'{prefix}_APP_ID')}:{event['chat_id']}:{secrets.token_hex(6)}"
+            request_id = _request_id(normalized)
+            # Feishu rows already use the raw message id. Prefix only Lark
+            # dedupe keys so old Feishu state remains readable while the two
+            # platforms cannot suppress each other's messages.
+            event_key = (
+                event["message_id"]
+                if normalized == "feishu"
+                else f"{normalized}:{event['message_id']}"
+            )
             if not await self.state.claim_event(
-                message_id=event["message_id"],
+                message_id=event_key,
                 request_id=request_id,
                 conversation_key=conversation_key,
                 chat_id=event["chat_id"],
@@ -2475,7 +2550,7 @@ class CloudflareRelay:
                 {
                     "kind": "agent",
                     "request_id": request_id,
-                    "idempotency_key": f"{_env(self.env, 'FEISHU_APP_ID')}:{event['message_id']}",
+                    "idempotency_key": f"{_env(self.env, f'{prefix}_APP_ID')}:{event['message_id']}",
                 }
             )
         except Exception as exc:
@@ -2510,20 +2585,26 @@ class Default(WorkerEntrypoint):
                         "/feishu/events",
                         "/feishu/oauth/authorize",
                         "/feishu/oauth/callback",
+                        "/lark/events",
+                        "/lark/oauth/authorize",
+                        "/lark/oauth/callback",
                         "/mcp",
                         "/oauth/token",
                     ],
                 }
             )
         if path in {"/feishu/oauth/authorize", "/feishu/oauth/callback"}:
-            return await relay.feishu_oauth(request, path)
-        if path in {"/feishu/events", "/feishu/event"}:
+            return await relay.feishu_oauth(request, path, "feishu")
+        if path in {"/lark/oauth/authorize", "/lark/oauth/callback"}:
+            return await relay.feishu_oauth(request, path, "lark")
+        if path in {"/feishu/events", "/feishu/event", "/lark/events", "/lark/event"}:
             if request.method == "POST":
-                return await relay.handle_feishu(request)
+                platform = "lark" if path.startswith("/lark/") else "feishu"
+                return await relay.handle_feishu(request, platform)
             return _response(
                 {
                     "error": "method_not_allowed",
-                    "message": "Feishu webhook endpoint accepts POST requests only",
+                    "message": "Platform webhook endpoint accepts POST requests only",
                 },
                 status=405,
                 headers={"allow": "POST"},

@@ -9,6 +9,7 @@ try:
         FeishuScriptError,
         get_tenant_access_token,
         load_dotenv,
+        platform_endpoints,
         required_env,
         send_text_mention,
     )
@@ -17,6 +18,7 @@ except ModuleNotFoundError:  # Allows ``python scripts/xiaoc_send_mention.py``.
         FeishuScriptError,
         get_tenant_access_token,
         load_dotenv,
+        platform_endpoints,
         required_env,
         send_text_mention,
     )
@@ -28,6 +30,7 @@ USER_NAME = "文帅"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--platform", choices=("feishu", "lark"), default="feishu")
     parser.add_argument(
         "--text",
         default="小C测试消息，请查收。",
@@ -38,15 +41,19 @@ def main() -> int:
     args = parser.parse_args()
     try:
         load_dotenv()
-        app_id = required_env("FEISHU_APP_ID")
-        app_secret = required_env("FEISHU_APP_SECRET")
-        tenant_token = get_tenant_access_token(app_id, app_secret)
+        endpoints = platform_endpoints(args.platform)
+        app_id = required_env(endpoints.app_id_env)
+        app_secret = required_env(endpoints.app_secret_env)
+        tenant_token = get_tenant_access_token(
+            app_id, app_secret, base_url=endpoints.api_base
+        )
         message_id = send_text_mention(
             tenant_token,
             chat_id=args.chat_id,
             user_open_id=args.user_open_id,
             user_name=USER_NAME,
             text=args.text,
+            base_url=endpoints.api_base,
         )
     except FeishuScriptError as exc:
         print(f"发送失败：{exc}")

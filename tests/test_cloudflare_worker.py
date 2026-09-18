@@ -740,6 +740,54 @@ def test_cloudflare_feishu_oauth_authorize_persists_state(monkeypatch):
     assert state.saved[1] == "https://bot.boooe.com/feishu/oauth/callback"
 
 
+def test_cloudflare_routes_lark_conversations_and_oauth_to_lark(monkeypatch):
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def ensure_feishu_oauth_schema(self):
+            pass
+
+        async def save_feishu_oauth_state(self, state, redirect_uri, expires_at):
+            self.saved = (state, redirect_uri, expires_at)
+
+    env = SimpleNamespace(
+        FEISHU_APP_ID="cli_feishu",
+        FEISHU_APP_SECRET="feishu-secret",
+        LARK_APP_ID="cli_lark",
+        LARK_APP_SECRET="lark-secret",
+        LARK_OAUTH_SCOPE="bitable:app",
+        LARK_OAUTH_STATE_TTL_SECONDS="600",
+    )
+    state = FakeState()
+    relay = worker.CloudflareRelay(env, None, state)
+
+    assert relay.lark is not None
+    assert relay.api_for_conversation("lark:cli_lark:oc_chat:1") is relay.lark
+    assert relay.api_for_conversation("feishu:cli_feishu:oc_chat:1") is relay.feishu
+
+    monkeypatch.setattr(
+        worker,
+        "_text_response",
+        lambda body, status=200, headers=None: {
+            "body": body,
+            "status": status,
+            "headers": headers or {},
+        },
+    )
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/lark/oauth/authorize",
+    )
+    result = asyncio.run(relay.feishu_oauth(request, "/lark/oauth/authorize", "lark"))
+
+    assert result["status"] == 302
+    assert result["headers"]["Location"].startswith(
+        "https://accounts.larksuite.com/open-apis/authen/v1/authorize?"
+    )
+    assert "app_id=cli_lark" in result["headers"]["Location"]
+    assert state.saved[1] == "https://bot.boooe.com/lark/oauth/callback"
+
+
 def test_cloudflare_feishu_oauth_callback_exchanges_code(monkeypatch):
     worker = _load_worker_module()
 

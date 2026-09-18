@@ -53,6 +53,10 @@ class MessageContext:
     reply_to_message_id: str | None = None
     # image/post 消息 content 里的 image_key 列表。其他消息为空元组。
     image_keys: tuple[str, ...] = ()
+    # The platform that delivered this event.  It is part of the identity of
+    # the request, not something inferred from the user's open_id (Feishu and
+    # Lark use the same open_id shape).
+    platform: str = "feishu"
 
     @property
     def mentions_bot(self) -> bool:
@@ -154,6 +158,7 @@ def normalize_message_event(
     *,
     bot_app_id: str,
     bot_open_id: str,
+    platform: str = "feishu",
 ) -> MessageContext:
     """Convert a P2ImMessageReceiveV1-like SDK object or dict to MessageContext."""
     payload = _get(event, "event")
@@ -207,4 +212,5 @@ def normalize_message_event(
             _get(message, "parent_id") or _get(message, "root_id") or None
         ),
         image_keys=image_keys,
+        platform=str(platform or "feishu").strip().lower() or "feishu",
     )

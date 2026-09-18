@@ -29,7 +29,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
 from .bot_handler import MessageHandler
-from .config import Settings
+from .config import PlatformSettings, Settings
 from .dedupe import DedupeCache
 from .message_context import MessageNormalizationError, normalize_message_event
 
@@ -70,23 +70,33 @@ class FeishuBot:
         settings: Settings,
         handler: MessageHandler,
         *,
+        platform: str = "feishu",
         dedupe: DedupeCache | None = None,
     ) -> None:
         self._settings = settings
+        self._platform_config: PlatformSettings = settings.platform(platform)
+        self._platform = self._platform_config.name
+        self._route_prefix = f"/{self._platform}"
         self._handler = handler
         self._dedupe = dedupe or DedupeCache()
         self._api_client = (
             lark.Client.builder()
-            # .domain(lark.LARK_DOMAIN) ---切换飞书和lark
-            .domain(lark.FEISHU_DOMAIN)
-            .app_id(settings.feishu_app_id)
-            .app_secret(settings.feishu_app_secret)
+            .domain(self._platform_config.domain)
+            .app_id(self._platform_config.app_id)
+            .app_secret(self._platform_config.app_secret)
             .log_level(lark.LogLevel.INFO)
             .build()
         )
         self._bot_open_id = ""
         # Pending OAuth state nonces: state -> {"target": str, "expiry": float}
         self._oauth_states: dict[str, dict[str, Any]] = {}
+
+    def _current_platform_config(self) -> PlatformSettings:
+        """Read current settings so tests/config reloads remain compatible."""
+        try:
+            return self._settings.platform(self._platform)
+        except (AttributeError, TypeError):
+            return self._platform_config
 
     def start(self) -> None:
         self._bot_open_id = self._fetch_bot_open_id()
@@ -96,14 +106,17 @@ class FeishuBot:
             .build()
         )
         ws_client = lark.ws.Client(
-            self._settings.feishu_app_id,
-            self._settings.feishu_app_secret,
+            self._platform_config.app_id,
+            self._platform_config.app_secret,
             log_level=lark.LogLevel.INFO,
             event_handler=event_handler,
-            # domain=lark.LARK_DOMAIN, ---切换飞书和lark
-            domain=lark.FEISHU_DOMAIN,
+            domain=self._platform_config.domain,
         )
-        logger.info("Starting Feishu long connection bot_app_id=%s", self._settings.feishu_app_id)
+        logger.info(
+            "Starting %s long connection bot_app_id=%s",
+            self._platform,
+            self._platform_config.app_id,
+        )
         ws_client.start()
 
     def ensure_identity(self) -> str:
@@ -113,32 +126,32 @@ class FeishuBot:
         return self._bot_open_id
 
     def webhook_routes(self) -> list[Route]:
-        """Return Starlette routes implementing Feishu developer-server mode.
+        """Return Starlette routes implementing developer-server mode.
 
         Handles the URL verification ``challenge`` sent during event-subscription setup
         and forwards ``im.message.receive_v1`` events to the same pipeline as the long
         connection (normalize -> dedupe -> handler.handle -> reply / placeholder).
 
-        ``/feishu/events`` is the public route used by the Cloudflare Worker. The
-        singular ``/feishu/event`` alias remains available for existing deployments.
+        The URL prefix identifies the platform, so the same event schema cannot
+        accidentally be handled with the other platform's credentials.
         """
 
         async def handler(request: Request) -> JSONResponse:
             try:
                 body = await self._read_json(request)
             except Exception:
-                logger.exception("Feishu webhook: failed to read request body")
+                logger.exception("%s webhook: failed to read request body", self._platform)
                 return JSONResponse({"code": 0})
 
             if body is None:
                 return JSONResponse({"code": 0})
 
-            verify_token = self._settings.feishu_verify_token
+            verify_token = self._platform_config.verify_token
             if verify_token:
                 header = body.get("header") if isinstance(body, dict) else None
                 token = header.get("token") if isinstance(header, dict) else None
                 if token != verify_token:
-                    logger.warning("Feishu webhook: verify token mismatch")
+                    logger.warning("%s webhook: verify token mismatch", self._platform)
                     return JSONResponse({"code": 1}, status_code=403)
 
             if isinstance(body, dict) and body.get("challenge"):
@@ -160,13 +173,15 @@ class FeishuBot:
                 except Exception:
                     # Swallow and still ack so Feishu does not retry forever; the same
                     # message is also protected server-side by dedupe on message_id.
-                    logger.exception("Feishu webhook: failed to process message event")
+                    logger.exception(
+                        "%s webhook: failed to process message event", self._platform
+                    )
 
             return JSONResponse({"code": 0})
 
         return [
-            Route("/feishu/events", endpoint=handler, methods=["POST"]),
-            Route("/feishu/event", endpoint=handler, methods=["POST"]),
+            Route(f"{self._route_prefix}/events", endpoint=handler, methods=["POST"]),
+            Route(f"{self._route_prefix}/event", endpoint=handler, methods=["POST"]),
         ]
 
     def webhook_route(self) -> Route:
@@ -177,44 +192,52 @@ class FeishuBot:
         """Routes for user-identity OAuth used to act on Bitable with the
         authorizing user's own permissions (not the bot's).
 
-        - ``GET /feishu/oauth/authorize`` builds a Feishu authorization link
+        - ``GET /<platform>/oauth/authorize`` builds a platform authorization link
           (with a fresh ``state`` nonce) and redirects the user to it.
-        - ``GET /feishu/oauth/callback`` exchanges the returned ``code`` for a
+        - ``GET /<platform>/oauth/callback`` exchanges the returned ``code`` for a
           ``user_access_token`` and renders the token (plus refresh token) so
           it can be wired into Bitable calls.
         """
         return [
-            Route("/feishu/oauth/authorize", endpoint=self._oauth_authorize, methods=["GET"]),
-            Route("/feishu/oauth/callback", endpoint=self._oauth_callback, methods=["GET"]),
+            Route(
+                f"{self._route_prefix}/oauth/authorize",
+                endpoint=self._oauth_authorize,
+                methods=["GET"],
+            ),
+            Route(
+                f"{self._route_prefix}/oauth/callback",
+                endpoint=self._oauth_callback,
+                methods=["GET"],
+            ),
         ]
 
     def _oauth_authorize(self, request: Request) -> RedirectResponse:
-        settings = self._settings
+        settings = self._current_platform_config()
         callback_uri = (request.query_params.get("callback_uri") or "").strip()
-        default_redirect = settings.feishu_oauth_redirect_uri.strip()
+        default_redirect = settings.oauth_redirect_uri.strip()
         if not callback_uri:
             callback_uri = default_redirect
         if not callback_uri:
             msg = (
                 "Missing OAuth redirect target. Pass ?callback_uri=... or set "
-                "FEISHU_OAUTH_REDIRECT_URI in the environment."
+                f"{self._platform.upper()}_OAUTH_REDIRECT_URI in the environment."
             )
             return HTMLResponse(msg, status_code=400)
 
         state = secrets.token_urlsafe(32)
-        expires_at = time.time() + settings.feishu_oauth_state_ttl_seconds
+        expires_at = time.time() + settings.oauth_state_ttl_seconds
         self._oauth_states[state] = {"target": callback_uri, "expiry": expires_at}
 
         authorize_query = urlencode(
             {
-                "app_id": settings.feishu_app_id,
+                "app_id": settings.app_id,
                 "redirect_uri": callback_uri,
-                "scope": settings.feishu_oauth_scope,
+                "scope": settings.oauth_scope,
                 "state": state,
             }
         )
         authorize_url = (
-            "https://accounts.feishu.cn/open-apis/authen/v1/authorize?"
+            f"{settings.auth_base}/open-apis/authen/v1/authorize?"
             + authorize_query
         )
         logger.info("OAuth authorize: state=%s target=%s", state, callback_uri)
@@ -275,19 +298,19 @@ class FeishuBot:
         Returns the raw token payload (``access_token``, ``refresh_token``,
         ``expires_in``, ``scope``, ``open_id`` ...) or ``None`` on failure.
         """
-        settings = self._settings
+        settings = self._current_platform_config()
         payload: dict[str, Any] = {
             "grant_type": "authorization_code",
             "code": code,
-            "client_id": settings.feishu_app_id,
-            "client_secret": settings.feishu_app_secret,
+            "client_id": settings.app_id,
+            "client_secret": settings.app_secret,
         }
         payload["redirect_uri"] = (
-            redirect_uri or settings.feishu_oauth_redirect_uri
+            redirect_uri or settings.oauth_redirect_uri
         )
         try:
             response = requests.post(
-                "https://accounts.feishu.cn/oauth/v3/token",
+                f"{settings.auth_base}/oauth/v3/token",
                 data=payload,
                 headers={
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -357,8 +380,13 @@ class FeishuBot:
         try:
             context = normalize_message_event(
                 event,
-                bot_app_id=self._settings.feishu_app_id,
+                bot_app_id=getattr(
+                    getattr(self, "_platform_config", None),
+                    "app_id",
+                    getattr(self._settings, "feishu_app_id", ""),
+                ),
                 bot_open_id=self._bot_open_id,
+                platform=getattr(self, "_platform", "feishu"),
             )
             if not self._dedupe.begin(context.message_id):
                 logger.info("Ignored duplicate message message_id=%s", context.message_id)
@@ -394,7 +422,8 @@ class FeishuBot:
             if reserved and context is not None:
                 self._dedupe.fail(context.message_id)
             logger.exception(
-                "Failed to process Feishu message message_id=%s",
+                "Failed to process %s message message_id=%s",
+                getattr(self, "_platform", "feishu"),
                 context.message_id if context else "unknown",
             )
             # Let the SDK report a failed handler execution so Feishu can retry.

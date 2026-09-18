@@ -1,9 +1,9 @@
-"""SQLite bridge linking an agent run to the Feishu message that should reply.
+"""SQLite bridge linking an agent run to the platform message that should reply.
 
 The built-in relay store (``feishu2agents.relay``) does not track which
-Feishu message triggered a run, so a small table records that mapping. Delivery
-is **exactly-once per Feishu message**: the table is keyed by
-``feishu_message_id`` and the claim transitions ``delivered`` atomically, so
+message triggered a run, so a small table records that mapping. Delivery is
+**exactly-once per incoming message**: the historical column is keyed by
+``feishu_message_id`` (with a ``lark:`` prefix for Lark), and the claim transitions ``delivered`` atomically, so
 even when several workers/instances share the file, only one posts the answer.
 
 A run is looked up by ``request_id``; rows older than the worker's freshness

@@ -127,6 +127,45 @@ def test_normalize_accepts_push_body_dict() -> None:
     assert context.mentions_bot is True
 
 
+def test_normalize_preserves_the_platform_that_delivered_event() -> None:
+    context = normalize_message_event(
+        _make_event_body(),
+        bot_app_id="cli_test",
+        bot_open_id="ou_bot",
+        platform="lark",
+    )
+    assert context.platform == "lark"
+
+
+def test_lark_webhook_and_oauth_routes_use_lark_configuration() -> None:
+    settings = Settings(
+        feishu_app_id="cli_feishu",
+        feishu_app_secret="feishu-secret",
+        lark_app_id="cli_lark",
+        lark_app_secret="lark-secret",
+        lark_event_mode="webhook",
+        lark_oauth_redirect_uri="https://bot.boooe.com/lark/oauth/callback",
+        lark_oauth_scope="bitable:app",
+    )
+    bot = FeishuBot(settings, _StubHandler(), platform="lark")
+    bot._bot_open_id = "ou_lark_bot"
+    app = Starlette(routes=bot.webhook_routes() + bot.oauth_routes())
+
+    with TestClient(app) as client:
+        challenge = client.post("/lark/events", json={"challenge": "lark-challenge"})
+        assert challenge.status_code == 200
+        assert challenge.json() == {"challenge": "lark-challenge"}
+
+        redirect = client.get("/lark/oauth/authorize", follow_redirects=False)
+        assert redirect.status_code == 302
+        location = redirect.headers["location"]
+        assert location.startswith(
+            "https://accounts.larksuite.com/open-apis/authen/v1/authorize?"
+        )
+        assert "app_id=cli_lark" in location
+        assert "scope=bitable%3Aapp" in location
+
+
 def _make_oauth_bot():
     settings = Settings(
         feishu_app_id="cli_test",

@@ -26,6 +26,16 @@ logger = logging.getLogger(__name__)
 ReplyCallable = Callable[[str, str], str]
 # An optional in-place editor that overwrites a bot-sent message's content.
 UpdateCallable = Callable[[str, str], None]
+# Platform-aware variants used when Feishu and Lark workers share one relay.
+RunReplyCallable = Callable[[str, str, dict[str, Any]], str]
+RunUpdateCallable = Callable[[str, str, dict[str, Any]], None]
+
+
+def _raw_message_id(value: str) -> str:
+    """Strip the Lark-only dedupe prefix before calling a platform API."""
+    if value.startswith("lark:"):
+        return value.split(":", 1)[1]
+    return value
 
 
 def format_result_for_feishu(store: RelayStore, run: dict[str, Any]) -> str:
@@ -57,6 +67,8 @@ class RelayWorker:
         reply: ReplyCallable,
         *,
         update_message: UpdateCallable | None = None,
+        reply_for_run: RunReplyCallable | None = None,
+        update_for_run: RunUpdateCallable | None = None,
         interval: float = 2.0,
         freshness_ttl_seconds: int = 3600,
     ) -> None:
@@ -64,6 +76,8 @@ class RelayWorker:
         self._bridge = bridge
         self._reply = reply
         self._update_message = update_message
+        self._reply_for_run = reply_for_run
+        self._update_for_run = update_for_run
         self._interval = interval
         # Ignore pending rows older than this: prevents a restart from flushing
         # very old @messages (some of which were already replied to).
@@ -95,7 +109,7 @@ class RelayWorker:
         now = int(time.time())
         for row in self._bridge.pending():
             request_id = row["request_id"]
-            message_id = row["feishu_message_id"]
+            message_id = _raw_message_id(str(row["feishu_message_id"] or ""))
             created_at = int(row.get("created_at") or 0)
             # Skip stale @messages so a restart never replies to very old ones.
             if created_at and now - created_at > self._freshness_ttl:
@@ -113,13 +127,22 @@ class RelayWorker:
             try:
                 # Prefer editing the "processing" placeholder message in place.
                 placeholder_id = self._bridge.resolve_outbound_message(request_id)
-                if placeholder_id and self._update_message is not None:
-                    self._update_message(placeholder_id, text)
+                if placeholder_id and (
+                    self._update_for_run is not None or self._update_message is not None
+                ):
+                    if self._update_for_run is not None:
+                        self._update_for_run(placeholder_id, text, run)
+                    else:
+                        self._update_message(placeholder_id, text)
                     self._bridge.record_reply(
                         placeholder_id, run.get("conversation_key") or ""
                     )
                 else:
-                    outbound_id = self._reply(message_id, text)
+                    outbound_id = (
+                        self._reply_for_run(message_id, text, run)
+                        if self._reply_for_run is not None
+                        else self._reply(message_id, text)
+                    )
                     self._bridge.record_reply(
                         outbound_id, run.get("conversation_key") or ""
                     )

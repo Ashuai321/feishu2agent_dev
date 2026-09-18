@@ -7,7 +7,9 @@
   "workers_dev": true,
   "vars": {
     "FEISHU_OAUTH_REDIRECT_URI": "https://bot.boooe.com/feishu/oauth/callback",
-    "FEISHU_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access"
+    "FEISHU_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access",
+    "LARK_OAUTH_REDIRECT_URI": "https://bot.boooe.com/lark/oauth/callback",
+    "LARK_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access"
   },
   "observability": {
     "enabled": true
