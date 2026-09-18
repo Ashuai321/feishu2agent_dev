@@ -9,4 +9,6 @@ The configured test group (`BITABLE_WORKFLOW_GROUP_CHAT_ID`, default
 `oc_5e9132f3638772d53d92d6fc5e953abc`) has a separate path. It accepts the
 `[飞书文档]` and `[lark文档]` mode commands, then uses the selected platform's
 OAuth token to write the requester's follow-up text to the corresponding target
-table. All other groups continue through the Agent queue.
+table. The authorization card is sent as a user-targeted ephemeral card, so it
+is visible only to the requester in the group. All other groups continue
+through the Agent queue.

@@ -251,8 +251,8 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
             self.replies.append((message_id, text))
             return "om_reply"
 
-        async def reply_card(self, message_id, card):
-            self.card_replies.append((message_id, card))
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
             return "om_card_reply"
 
     class Relay:
@@ -290,8 +290,11 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     )
     assert relay.state.pending["platform"] == "feishu"
     assert relay.state.pending["requester_open_id"] == "ou_requester"
-    assert relay.api.card_replies[0][0] == "om_source"
-    card = relay.api.card_replies[0][1]
+    assert relay.api.card_replies[0][0:2] == (
+        "oc_5e9132f3638772d53d92d6fc5e953abc",
+        "ou_requester",
+    )
+    card = relay.api.card_replies[0][2]
     assert card["elements"][1]["actions"][0]["text"]["content"] == "授权并继续"
     auth_url = card["elements"][1]["actions"][0]["url"]
     assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in auth_url
@@ -315,8 +318,8 @@ def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
         def __init__(self):
             self.card_replies = []
 
-        async def reply_card(self, message_id, card):
-            self.card_replies.append((message_id, card))
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
             return "om_card_reply"
 
     class Relay:
@@ -352,7 +355,11 @@ def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
             },
         )
     )
-    card = relay.api.card_replies[0][1]
+    assert relay.api.card_replies[0][0:2] == (
+        "oc_5e9132f3638772d53d92d6fc5e953abc",
+        "ou_requester",
+    )
+    card = relay.api.card_replies[0][2]
     action = card["elements"][1]["actions"][0]
     assert "accounts.larksuite.com/open-apis/authen/v1/authorize" in action["url"]
     assert "app_id=cli_lark" in action["url"]

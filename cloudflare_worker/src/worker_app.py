@@ -1055,6 +1055,30 @@ class FeishuAPI:
             raise RuntimeError("Feishu card reply response returned no message_id")
         return str(outbound)
 
+    async def send_ephemeral_card(
+        self, *, chat_id: str, open_id: str, card: dict[str, Any]
+    ) -> str:
+        """Send a group card that is visible only to one online user.
+
+        Feishu/Lark's ephemeral-card endpoint deliberately uses the group and
+        recipient IDs instead of replying to the source message.  This keeps
+        OAuth links private to the person who mentioned the bot.
+        """
+        payload = await self._request(
+            "POST",
+            "/open-apis/ephemeral/v1/send",
+            json={
+                "chat_id": str(chat_id),
+                "open_id": str(open_id),
+                "msg_type": "interactive",
+                "card": card,
+            },
+        )
+        outbound = payload.get("data", {}).get("message_id")
+        if not outbound:
+            raise RuntimeError("Feishu ephemeral card response returned no message_id")
+        return str(outbound)
+
     async def update(self, message_id: str, text: str) -> None:
         await self._request(
             "PUT",
@@ -1678,7 +1702,11 @@ class BitableGroupWorkflow:
                 },
             ],
         }
-        await api.reply_card(str(event["message_id"]), card)
+        await api.send_ephemeral_card(
+            chat_id=str(event["chat_id"]),
+            open_id=str(event["open_id"]),
+            card=card,
+        )
 
     async def _write_row(
         self,

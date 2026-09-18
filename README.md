@@ -140,8 +140,9 @@ Feishu OAuth 和「测试」表，将文字写入「任务描述」、用户写�
 `UmGRwFFDQiegHckOVh0j0DIrpRc` 下的表 `tblmd8DAQwM00t7B` 的「文本」，并将用户写入
 「测试3」。不同平台的 token、API 域名和用户身份严格隔离。
 
-机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的 `user_access_token`，所以
-第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1
+授权卡片通过临时消息卡片发送，只对触发 @ 的用户显示；飞书客户端要求该用户在线，群内
+其他成员不会看到卡片内容。机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的
+`user_access_token`，所以第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1
 中，后续同一用户可直接复用；撤销或过期后会再次要求授权。若 Lark 用户无权访问这个
 Feishu 租户中的 Wiki/多维表格，API 会返回权限错误，系统不会降级使用 Feishu 机器人
 或其他人的 token。
