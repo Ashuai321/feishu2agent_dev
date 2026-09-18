@@ -223,6 +223,7 @@ CREATE TABLE IF NOT EXISTS feishu_oauth_states (
 CREATE TABLE IF NOT EXISTS bitable_pending_requests (
     state TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
+    document_mode TEXT NOT NULL DEFAULT 'feishu',
     source_platform TEXT NOT NULL DEFAULT 'feishu',
     redirect_uri TEXT NOT NULL,
     conversation_key TEXT NOT NULL,
@@ -693,6 +694,7 @@ class D1State:
             """CREATE TABLE IF NOT EXISTS bitable_pending_requests (
                 state TEXT PRIMARY KEY,
                 platform TEXT NOT NULL,
+                document_mode TEXT NOT NULL DEFAULT 'feishu',
                 source_platform TEXT NOT NULL DEFAULT 'feishu',
                 redirect_uri TEXT NOT NULL,
                 conversation_key TEXT NOT NULL,
@@ -705,8 +707,11 @@ class D1State:
             )""",
         )
         # Keep pending OAuth records compatible with the initial deployment,
-        # which only stored the authorization platform.
+        # which only stored the authorization platform. The document target
+        # is separate because a Feishu user can select the Lark document (and
+        # vice versa); the OAuth platform must remain tied to the requester.
         for column, definition in (
+            ("document_mode", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("source_platform", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("requester_union_id", "TEXT NOT NULL DEFAULT ''"),
             ("requester_user_id", "TEXT NOT NULL DEFAULT ''"),
@@ -734,6 +739,7 @@ class D1State:
         *,
         state: str,
         platform: str,
+        document_mode: str = "feishu",
         source_platform: str = "feishu",
         redirect_uri: str,
         conversation_key: str,
@@ -748,12 +754,13 @@ class D1State:
         await _db_run(
             self.db,
             """INSERT INTO bitable_pending_requests
-               (state, platform, source_platform, redirect_uri, conversation_key,
+               (state, platform, document_mode, source_platform, redirect_uri, conversation_key,
                 source_message_id, source_chat_id, requester_open_id,
                 requester_union_id, requester_user_id, input_text, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             state,
             platform,
+            document_mode,
             source_platform,
             redirect_uri,
             conversation_key,
@@ -1635,6 +1642,7 @@ class BitableGroupWorkflow:
         self,
         *,
         platform: str,
+        document_mode: str = "feishu",
         source_platform: str,
         conversation_key: str,
         event: dict[str, Any],
@@ -1645,6 +1653,7 @@ class BitableGroupWorkflow:
         await self.relay.state.save_bitable_pending(
             state=state,
             platform=platform,
+            document_mode=document_mode,
             source_platform=source_platform,
             redirect_uri=callback_uri,
             conversation_key=conversation_key,
@@ -1791,14 +1800,22 @@ class BitableGroupWorkflow:
         await self.relay.state.ensure_feishu_oauth_schema()
         requester_open_id = str(event.get("open_id") or "").strip()
         text = str(event.get("text") or "").strip()
-        selected_mode = str(document_mode or platform or "feishu").strip().lower()
+        # ``platform`` is the requester's actual account platform and controls
+        # OAuth, token storage, identity verification, and API client choice.
+        # ``document_mode`` only selects the destination document/table.
+        auth_platform = str(platform or "feishu").strip().lower()
+        selected_mode = str(document_mode or "feishu").strip().lower()
+        if auth_platform not in {"feishu", "lark"}:
+            auth_platform = "feishu"
+        if selected_mode not in {"feishu", "lark"}:
+            selected_mode = "feishu"
         if not requester_open_id or not text:
             return
-        cached = await self.relay.state.user_token(selected_mode, requester_open_id)
+        cached = await self.relay.state.user_token(auth_platform, requester_open_id)
         if cached and int(cached.get("expires_at") or 0) > _now() + 60:
             try:
                 record = await self._write_row(
-                    platform=selected_mode,
+                    platform=auth_platform,
                     source_platform=source_platform,
                     document_mode=selected_mode,
                     requester_open_id=requester_open_id,
@@ -1809,7 +1826,7 @@ class BitableGroupWorkflow:
                 )
                 await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
                     str(event["message_id"]),
-                    f"已使用你之前的 {selected_mode} 授权写入多维表格，任务执行人="
+                    f"已使用你之前的 {auth_platform} 授权写入 {self.mode_label(selected_mode)}，任务执行人="
                     f"{record.get('_authorized_open_id') or requester_open_id}，"
                     f"record_id={record.get('record_id')}",
                 )
@@ -1817,9 +1834,10 @@ class BitableGroupWorkflow:
             except Exception as exc:
                 # A revoked/expired token should fall through to a fresh
                 # authorization instead of silently using a different user.
-                print(f"Cached {selected_mode} user token was not usable: {_safe_error(exc)}")
+                print(f"Cached {auth_platform} user token was not usable: {_safe_error(exc)}")
         url = await self._authorization_url(
-            platform=selected_mode,
+            platform=auth_platform,
+            document_mode=selected_mode,
             source_platform=source_platform,
             conversation_key=conversation_key,
             event=event,
@@ -1830,6 +1848,7 @@ class BitableGroupWorkflow:
         self, pending: dict[str, Any], token_data: dict[str, Any]
     ) -> dict[str, Any]:
         platform = str(pending.get("platform") or "").strip().lower()
+        document_mode = str(pending.get("document_mode") or "feishu").strip().lower()
         source_platform = str(pending.get("source_platform") or platform).strip().lower()
         requester_open_id = str(pending.get("requester_open_id") or "").strip()
         access_token = str(token_data.get("access_token") or "").strip()
@@ -1838,7 +1857,7 @@ class BitableGroupWorkflow:
         record = await self._write_row(
             platform=platform,
             source_platform=source_platform,
-            document_mode=platform,
+            document_mode=document_mode,
             requester_open_id=requester_open_id,
             requester_union_id=str(pending.get("requester_union_id") or ""),
             requester_user_id=str(pending.get("requester_user_id") or ""),
@@ -1855,12 +1874,13 @@ class BitableGroupWorkflow:
         )
         await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
             str(pending.get("source_message_id") or ""),
-            f"授权成功，已按你的 {platform} 账号写入多维表格，任务执行人="
+            f"授权成功，已按你的 {platform} 账号写入 {self.mode_label(document_mode)}，任务执行人="
             f"{record.get('_authorized_open_id') or requester_open_id}，"
             f"record_id={record.get('record_id')}",
         )
         return {
             "platform": platform,
+            "document_mode": document_mode,
             "source_platform": source_platform,
             "open_id": str(record.get("_authorized_open_id") or requester_open_id),
             "record_id": str(record.get("record_id") or ""),
@@ -3478,8 +3498,12 @@ class CloudflareRelay:
                     if selected_mode is None:
                         await self.bitable_workflow.reply_mode_required(normalized, event)
                         return _response({"code": 0})
+                # The command chooses the destination document only. Resolve
+                # Feishu vs Lark from the sender/event identity so selecting
+                # ``[lark文档]`` can never force a Feishu user into Lark OAuth.
+                account_platform = await self.detect_user_platform(event, normalized)
                 await self.bitable_workflow.handle_event(
-                    platform=selected_mode,
+                    platform=account_platform,
                     source_platform=normalized,
                     document_mode=selected_mode,
                     conversation_key=conversation_key,
