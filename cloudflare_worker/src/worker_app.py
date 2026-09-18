@@ -244,6 +244,14 @@ CREATE TABLE IF NOT EXISTS bitable_user_tokens (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (platform, open_id)
 );
+CREATE TABLE IF NOT EXISTS bitable_group_modes (
+    source_platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    requester_open_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (source_platform, chat_id, requester_open_id)
+);
 """
 
 
@@ -805,6 +813,37 @@ class D1State:
             _now(),
         )
 
+    async def save_bitable_group_mode(
+        self, *, source_platform: str, chat_id: str, requester_open_id: str, mode: str
+    ) -> None:
+        await _db_run(
+            self.db,
+            """INSERT INTO bitable_group_modes
+               (source_platform, chat_id, requester_open_id, mode, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(source_platform, chat_id, requester_open_id) DO UPDATE SET
+                 mode=excluded.mode, updated_at=excluded.updated_at""",
+            source_platform,
+            chat_id,
+            requester_open_id,
+            mode,
+            _now(),
+        )
+
+    async def bitable_group_mode(
+        self, *, source_platform: str, chat_id: str, requester_open_id: str
+    ) -> str | None:
+        row = await _db_first(
+            self.db,
+            """SELECT mode FROM bitable_group_modes
+               WHERE source_platform = ? AND chat_id = ? AND requester_open_id = ?""",
+            source_platform,
+            chat_id,
+            requester_open_id,
+        )
+        mode = str((row or {}).get("mode") or "").strip().lower()
+        return mode if mode in {"feishu", "lark"} else None
+
 
 class FeishuAPI:
     def __init__(self, env: Any, platform: str = "feishu") -> None:
@@ -1323,7 +1362,9 @@ def _message_parts(message_type: str, content: Any) -> tuple[str, list[str]] | N
     return ("".join(text_parts), image_keys)
 
 
-def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] | None:
+def _normalize_event(
+    body: dict[str, Any], bot_open_id: str, *, allow_unmentioned_reply: bool = False
+) -> dict[str, Any] | None:
     event = body.get("event") if isinstance(body.get("event"), dict) else {}
     header = body.get("header") if isinstance(body.get("header"), dict) else {}
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
@@ -1344,6 +1385,7 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
     text, image_keys = parts
     if image_keys:
         text = f"{text}\n[用户发送了一张图片，已保存为必要文件]"
+    parent_id = str(message.get("parent_id") or message.get("root_id") or "")
     mentions = message.get("mentions") or []
     mentioned_bot = False
     for mention in mentions:
@@ -1354,12 +1396,13 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
             if key:
                 text = re.sub(re.escape(str(key)), "", text)
     text = text.strip()
-    parent_id = str(message.get("parent_id") or message.get("root_id") or "")
     # The bot must be explicitly @mentioned for every request.  When that
     # mention is attached to a reply quoting one of our messages, the handler
     # uses the parent mapping to continue the existing conversation; a fresh
     # @mention without a mapped parent starts a new conversation.
-    if not mentioned_bot or (not text and not image_keys):
+    if (not mentioned_bot and not (allow_unmentioned_reply and parent_id)) or (
+        not text and not image_keys
+    ):
         return None
     return {
         "message_id": message_id,
@@ -1443,6 +1486,8 @@ def _conversation_input(
 BITABLE_WORKFLOW_GROUP_CHAT_ID = "oc_5e9132f3638772d53d92d6fc5e953abc"
 BITABLE_WORKFLOW_WIKI_TOKEN = "AYNDwkmOUiZtbgkZ3BAcLchUnnb"
 BITABLE_WORKFLOW_TABLE_ID = "tblVyvH3RGHqwQBC"
+LARK_DOCUMENT_WIKI_TOKEN = "UmGRwFFDQiegHckOVh0j0DIrpRc"
+LARK_DOCUMENT_TABLE_ID = "tblmd8DAQwM00t7B"
 
 
 class BitableGroupWorkflow:
@@ -1473,6 +1518,76 @@ class BitableGroupWorkflow:
 
     def is_target_group(self, chat_id: str) -> bool:
         return str(chat_id or "").strip() == self.target_group()
+
+    @staticmethod
+    def parse_document_command(text: str) -> tuple[str, str] | None:
+        """Return the selected document platform and any inline payload.
+
+        The command can be sent as ``[飞书文档]``/``[lark文档]`` or without the
+        display brackets.  An optional payload after whitespace or a colon is
+        accepted so both the two-turn flow and a single-message flow work.
+        """
+        value = str(text or "").strip()
+        aliases = (
+            ("[飞书文档]", "feishu"),
+            ("飞书文档", "feishu"),
+            ("[lark文档]", "lark"),
+            ("lark文档", "lark"),
+        )
+        lowered = value.casefold()
+        for label, mode in aliases:
+            prefix = label.casefold()
+            if lowered == prefix:
+                return mode, ""
+            if not lowered.startswith(prefix):
+                continue
+            remainder = value[len(label) :]
+            if remainder and remainder[0] not in " \t\r\n:：,，":
+                continue
+            return mode, remainder.lstrip(" \t\r\n:：,，")
+        return None
+
+    @staticmethod
+    def mode_label(mode: str) -> str:
+        return "飞书文档" if str(mode or "").strip().lower() == "feishu" else "lark文档"
+
+    async def reply_mode_prompt(
+        self, source_platform: str, event: dict[str, Any], mode: str
+    ) -> None:
+        api = self.relay.api_for_conversation(f"{source_platform}:workflow")
+        await api.reply(
+            str(event["message_id"]),
+            f"已选择 [{self.mode_label(mode)}]。请继续 @机器人发送要写入的内容。",
+        )
+
+    async def reply_mode_required(self, source_platform: str, event: dict[str, Any]) -> None:
+        api = self.relay.api_for_conversation(f"{source_platform}:workflow")
+        await api.reply(
+            str(event["message_id"]),
+            "此群只支持两种指令：请输入 [飞书文档] 或 [lark文档]，然后继续 @机器人发送内容。",
+        )
+
+    def target(self, mode: str) -> tuple[str, str, str, str]:
+        """Return wiki token, table id, text field, and assignee field."""
+        normalized = str(mode or "feishu").strip().lower()
+        env = getattr(self.relay, "env", None)
+        if normalized == "lark":
+            return (
+                _env(env, "LARK_DOCUMENT_WIKI_TOKEN", LARK_DOCUMENT_WIKI_TOKEN)
+                or LARK_DOCUMENT_WIKI_TOKEN,
+                _env(env, "LARK_DOCUMENT_TABLE_ID", LARK_DOCUMENT_TABLE_ID)
+                or LARK_DOCUMENT_TABLE_ID,
+                "文本",
+                "测试3",
+            )
+        return (
+            _env(env, "BITABLE_WORKFLOW_WIKI_TOKEN", BITABLE_WORKFLOW_WIKI_TOKEN)
+            or BITABLE_WORKFLOW_WIKI_TOKEN,
+            _env(env, "BITABLE_WORKFLOW_TABLE_ID", BITABLE_WORKFLOW_TABLE_ID)
+            or BITABLE_WORKFLOW_TABLE_ID,
+            "任务描述",
+            "任务执行人",
+        )
 
     @staticmethod
     def _auth_base(platform: str) -> str:
@@ -1570,6 +1685,7 @@ class BitableGroupWorkflow:
         *,
         platform: str,
         source_platform: str = "feishu",
+        document_mode: str | None = None,
         requester_open_id: str,
         requester_union_id: str = "",
         requester_user_id: str = "",
@@ -1604,16 +1720,18 @@ class BitableGroupWorkflow:
             raise RuntimeError(
                 "OAuth 用户与发起 @ 的用户不一致；为避免越权，未写入多维表格"
             )
-        app_token = await api.resolve_wiki_bitable_app_token(
-            access_token, BITABLE_WORKFLOW_WIKI_TOKEN
-        )
+        # The original direct workflow always targeted the Feishu table; the
+        # explicit document_mode is what selects the new Lark table.
+        mode = str(document_mode or "feishu").strip().lower()
+        wiki_token, table_id, text_field, assignee_field = self.target(mode)
+        app_token = await api.resolve_wiki_bitable_app_token(access_token, wiki_token)
         fields = await api.user_bitable_fields(
             access_token,
             app_token=app_token,
-            table_id=BITABLE_WORKFLOW_TABLE_ID,
+            table_id=table_id,
         )
         field_names = {str(item.get("field_name") or "") for item in fields}
-        missing = {"任务描述", "任务执行人"} - field_names
+        missing = {text_field, assignee_field} - field_names
         if missing:
             raise RuntimeError(
                 "测试表缺少字段：" + "、".join(sorted(missing))
@@ -1621,10 +1739,10 @@ class BitableGroupWorkflow:
         record = await api.create_user_bitable_record(
             access_token,
             app_token=app_token,
-            table_id=BITABLE_WORKFLOW_TABLE_ID,
+            table_id=table_id,
             fields={
-                "任务描述": text,
-                "任务执行人": [{"id": authorized_open_id}],
+                text_field: text,
+                assignee_field: [{"id": authorized_open_id}],
             },
         )
         # Keep the platform-scoped assignee available to the caller without
@@ -1638,20 +1756,23 @@ class BitableGroupWorkflow:
         *,
         platform: str,
         source_platform: str = "feishu",
+        document_mode: str | None = None,
         conversation_key: str,
         event: dict[str, Any],
     ) -> None:
         await self.relay.state.ensure_feishu_oauth_schema()
         requester_open_id = str(event.get("open_id") or "").strip()
         text = str(event.get("text") or "").strip()
+        selected_mode = str(document_mode or platform or "feishu").strip().lower()
         if not requester_open_id or not text:
             return
-        cached = await self.relay.state.user_token(platform, requester_open_id)
+        cached = await self.relay.state.user_token(selected_mode, requester_open_id)
         if cached and int(cached.get("expires_at") or 0) > _now() + 60:
             try:
                 record = await self._write_row(
-                    platform=platform,
+                    platform=selected_mode,
                     source_platform=source_platform,
+                    document_mode=selected_mode,
                     requester_open_id=requester_open_id,
                     requester_union_id=str(event.get("union_id") or ""),
                     requester_user_id=str(event.get("user_id") or ""),
@@ -1660,7 +1781,7 @@ class BitableGroupWorkflow:
                 )
                 await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
                     str(event["message_id"]),
-                    f"已使用你之前的 {platform} 授权写入多维表格，任务执行人="
+                    f"已使用你之前的 {selected_mode} 授权写入多维表格，任务执行人="
                     f"{record.get('_authorized_open_id') or requester_open_id}，"
                     f"record_id={record.get('record_id')}",
                 )
@@ -1668,9 +1789,9 @@ class BitableGroupWorkflow:
             except Exception as exc:
                 # A revoked/expired token should fall through to a fresh
                 # authorization instead of silently using a different user.
-                print(f"Cached {platform} user token was not usable: {_safe_error(exc)}")
+                print(f"Cached {selected_mode} user token was not usable: {_safe_error(exc)}")
         url = await self._authorization_url(
-            platform=platform,
+            platform=selected_mode,
             source_platform=source_platform,
             conversation_key=conversation_key,
             event=event,
@@ -1689,6 +1810,7 @@ class BitableGroupWorkflow:
         record = await self._write_row(
             platform=platform,
             source_platform=source_platform,
+            document_mode=platform,
             requester_open_id=requester_open_id,
             requester_union_id=str(pending.get("requester_union_id") or ""),
             requester_user_id=str(pending.get("requester_user_id") or ""),
@@ -1772,10 +1894,7 @@ class CloudflareRelay:
             else None
         )
         self.bitable_workflow = BitableGroupWorkflow(self)
-        # Keep AgentRelayWorkflow defined above for a later opt-in, but do not
-        # instantiate it in the current deployment.  The test group must run
-        # only the explicit OAuth-to-Bitable workflow; a fallback to the Agent
-        # queue would incorrectly produce the old “正在处理，Agent…” reply.
+        self.agent_workflow = AgentRelayWorkflow(self)
 
     def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
         """Select the API client from the event's platform-prefixed key."""
@@ -3259,7 +3378,20 @@ class CloudflareRelay:
             print(f"{prefix}_BOT_OPEN_ID is not configured; event ignored")
             return _response({"code": 0})
         try:
-            event = _normalize_event(body, bot_id)
+            raw_event = body.get("event") if isinstance(body.get("event"), dict) else {}
+            raw_message = (
+                raw_event.get("message")
+                if isinstance(raw_event.get("message"), dict)
+                else {}
+            )
+            target_chat_id = str(raw_message.get("chat_id") or "")
+            event = _normalize_event(
+                body,
+                bot_id,
+                allow_unmentioned_reply=self.bitable_workflow.is_target_group(
+                    target_chat_id
+                ),
+            )
             if event is None or not event["open_id"]:
                 return _response({"code": 0})
             parent = event["parent_id"]
@@ -3293,21 +3425,44 @@ class CloudflareRelay:
                 normalized,
             )
             if self.bitable_workflow.is_target_group(event["chat_id"]):
-                auth_platform = await self.detect_user_platform(event, normalized)
+                command = self.bitable_workflow.parse_document_command(event["text"])
+                if command is not None:
+                    selected_mode, payload = command
+                    await self.state.save_bitable_group_mode(
+                        source_platform=normalized,
+                        chat_id=str(event["chat_id"]),
+                        requester_open_id=str(event["open_id"]),
+                        mode=selected_mode,
+                    )
+                    if not payload:
+                        await self.bitable_workflow.reply_mode_prompt(
+                            normalized, event, selected_mode
+                        )
+                        return _response({"code": 0})
+                    event = dict(event)
+                    event["text"] = payload
+                else:
+                    selected_mode = await self.state.bitable_group_mode(
+                        source_platform=normalized,
+                        chat_id=str(event["chat_id"]),
+                        requester_open_id=str(event["open_id"]),
+                    )
+                    if selected_mode is None:
+                        await self.bitable_workflow.reply_mode_required(normalized, event)
+                        return _response({"code": 0})
                 await self.bitable_workflow.handle_event(
-                    platform=auth_platform,
+                    platform=selected_mode,
                     source_platform=normalized,
+                    document_mode=selected_mode,
                     conversation_key=conversation_key,
                     event=event,
                 )
                 return _response({"code": 0})
-            # Agent relay is intentionally disabled for this deployment.  Do
-            # not enqueue, create a placeholder, or mix the unrelated Agent
-            # workflow into a group message while the direct Bitable flow is
-            # being verified.
-            await self.api_for_conversation(f"{normalized}:workflow").reply(
-                str(event["message_id"]),
-                "当前暂时只处理指定测试群的多维表格任务；Agent 流程已暂停。",
+            await self.agent_workflow.handle_event(
+                platform=normalized,
+                conversation_key=conversation_key,
+                event=event,
+                request_id=request_id,
             )
         except Exception as exc:
             # Always acknowledge after validation to avoid an endless Feishu retry

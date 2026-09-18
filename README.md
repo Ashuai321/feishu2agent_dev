@@ -132,12 +132,13 @@ python -m feishu2agents.main
 ### 指定测试群：以 @ 发起人的身份写入多维表格
 
 `BITABLE_WORKFLOW_GROUP_CHAT_ID` 默认是
-`oc_5e9132f3638772d53d92d6fc5e953abc`。在这个群里明确 @机器人并发送文字时，
-Worker 根据事件进入的 `/feishu/events` 或 `/lark/events` 判定平台，保存发送人的
-`open_id`，并回复该平台的 OAuth 授权链接。用户完成授权后，回调会再次调用对应平台的
-`user_info`，只有返回的 `open_id` 与发起 @ 的人一致才会继续；随后以该用户 token 将
-文字写入 Wiki 节点对应多维表格「测试」表的「任务描述」，并把发起人的 open_id 写入
-「任务执行人」。不同平台的 token、API 域名和用户身份严格隔离。
+`oc_5e9132f3638772d53d92d6fc5e953abc`。这个群只接受两种模式指令：`[飞书文档]` 和
+`[lark文档]`（也兼容不带方括号的写法）。输入模式后，机器人会提示同一用户继续
+`@` 机器人发送要写入的文字；也可以在指令后直接附带文字。飞书文档模式沿用原来的
+Feishu OAuth 和「测试」表，将文字写入「任务描述」、用户写入「任务执行人」。Lark
+文档模式使用 Lark OAuth，将文字写入 Lark Wiki 节点
+`UmGRwFFDQiegHckOVh0j0DIrpRc` 下的表 `tblmd8DAQwM00t7B` 的「文本」，并将用户写入
+「测试3」。不同平台的 token、API 域名和用户身份严格隔离。
 
 机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的 `user_access_token`，所以
 第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1

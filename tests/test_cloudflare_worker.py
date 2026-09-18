@@ -143,6 +143,19 @@ def test_worker_requires_an_mention_even_when_replying_to_a_bot_message():
     assert event is None
 
 
+def test_target_group_can_continue_with_a_quoted_reply_without_new_mention():
+    worker = _load_worker_module()
+    event = worker._normalize_event(
+        _event("text", {"text": "继续刚才的问题"}, text_mention=False, parent_id="om_bot_card"),
+        "ou_bot",
+        allow_unmentioned_reply=True,
+    )
+
+    assert event is not None
+    assert event["text"] == "继续刚才的问题"
+    assert event["parent_id"] == "om_bot_card"
+
+
 def test_worker_keeps_parent_for_an_mentioned_reply():
     worker = _load_worker_module()
 
@@ -170,6 +183,24 @@ def test_target_group_workflow_uses_the_configured_group_and_platform():
     assert workflow.is_target_group("oc_other") is False
     assert workflow._auth_base("feishu") == "https://accounts.feishu.cn"
     assert workflow._auth_base("lark") == "https://accounts.larksuite.com"
+
+
+def test_target_group_document_commands_select_mode_and_optional_payload():
+    worker = _load_worker_module()
+
+    assert worker.BitableGroupWorkflow.parse_document_command("[飞书文档]") == (
+        "feishu",
+        "",
+    )
+    assert worker.BitableGroupWorkflow.parse_document_command("[lark文档] 要写入") == (
+        "lark",
+        "要写入",
+    )
+    assert worker.BitableGroupWorkflow.parse_document_command("lark文档：测试") == (
+        "lark",
+        "测试",
+    )
+    assert worker.BitableGroupWorkflow.parse_document_command("其他内容") is None
 
 
 def test_external_sender_seen_by_feishu_is_routed_to_lark_oauth():
@@ -369,6 +400,52 @@ def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
     assert relay.api.fields["任务执行人"] == [{"id": "ou_lark_user"}]
 
 
+def test_lark_document_writes_text_and_user_to_lark_target_fields():
+    worker = _load_worker_module()
+
+    class FakeAPI:
+        async def user_info(self, access_token):
+            return {"open_id": "ou_lark_user"}
+
+        async def resolve_wiki_bitable_app_token(self, access_token, wiki_token):
+            self.wiki_token = wiki_token
+            return "lark_app_token"
+
+        async def user_bitable_fields(self, access_token, *, app_token, table_id):
+            self.table_id = table_id
+            return [{"field_name": "文本"}, {"field_name": "测试3"}]
+
+        async def create_user_bitable_record(self, access_token, *, app_token, table_id, fields):
+            self.fields = fields
+            return {"record_id": "rec_lark_document"}
+
+    class Relay:
+        env = SimpleNamespace()
+
+        def __init__(self):
+            self.api = FakeAPI()
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    result = asyncio.run(
+        worker.BitableGroupWorkflow(relay)._write_row(
+            platform="lark",
+            source_platform="feishu",
+            document_mode="lark",
+            requester_open_id="ou_external_projection",
+            text="lark 文档内容",
+            access_token="lark-user-token",
+        )
+    )
+
+    assert result["record_id"] == "rec_lark_document"
+    assert relay.api.wiki_token == worker.LARK_DOCUMENT_WIKI_TOKEN
+    assert relay.api.table_id == worker.LARK_DOCUMENT_TABLE_ID
+    assert relay.api.fields == {"文本": "lark 文档内容", "测试3": [{"id": "ou_lark_user"}]}
+
+
 def test_agent_input_uses_text_relay_envelope():
     worker = _load_worker_module()
 
@@ -388,6 +465,13 @@ def test_agent_input_uses_text_relay_envelope():
     )
     assert "Completion contract:" in input_text
     assert "User task:\n测试" in input_text
+
+
+def test_non_target_groups_keep_the_agent_relay_workflow_available():
+    worker = _load_worker_module()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, SimpleNamespace())
+
+    assert isinstance(relay.agent_workflow, worker.AgentRelayWorkflow)
 
 
 def test_agent_input_tells_agent_how_to_use_attached_image():

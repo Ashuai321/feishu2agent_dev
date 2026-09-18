@@ -6,7 +6,7 @@ R2 billing subscription is activated. Use the deployment instructions in
 [`../README.md`](../README.md); this directory is not a separate Worker project.
 
 The configured test group (`BITABLE_WORKFLOW_GROUP_CHAT_ID`, default
-`oc_5e9132f3638772d53d92d6fc5e953abc`) has a separate path: an @ message is
-bound to the platform that delivered it, the sender's `open_id` is recorded, and
-the sender must authorize that same Feishu/Lark platform before the text is
-written to the Bitable. All other groups continue through the Agent queue.
+`oc_5e9132f3638772d53d92d6fc5e953abc`) has a separate path. It accepts the
+`[飞书文档]` and `[lark文档]` mode commands, then uses the selected platform's
+OAuth token to write the requester's follow-up text to the corresponding target
+table. All other groups continue through the Agent queue.
