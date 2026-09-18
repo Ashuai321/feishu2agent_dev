@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.feishu-user-token.json
 
 # Virtual environments
 .venv/
