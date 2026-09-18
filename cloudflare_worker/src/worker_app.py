@@ -1632,7 +1632,10 @@ class CloudflareRelay:
             else None
         )
         self.bitable_workflow = BitableGroupWorkflow(self)
-        self.agent_workflow = AgentRelayWorkflow(self)
+        # Keep AgentRelayWorkflow defined above for a later opt-in, but do not
+        # instantiate it in the current deployment.  The test group must run
+        # only the explicit OAuth-to-Bitable workflow; a fallback to the Agent
+        # queue would incorrectly produce the old “正在处理，Agent…” reply.
 
     def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
         """Select the API client from the event's platform-prefixed key."""
@@ -3082,11 +3085,13 @@ class CloudflareRelay:
                     event=event,
                 )
                 return _response({"code": 0})
-            await self.agent_workflow.handle_event(
-                platform=normalized,
-                conversation_key=conversation_key,
-                event=event,
-                request_id=request_id,
+            # Agent relay is intentionally disabled for this deployment.  Do
+            # not enqueue, create a placeholder, or mix the unrelated Agent
+            # workflow into a group message while the direct Bitable flow is
+            # being verified.
+            await self.api_for_conversation(f"{normalized}:workflow").reply(
+                str(event["message_id"]),
+                "当前暂时只处理指定测试群的多维表格任务；Agent 流程已暂停。",
             )
         except Exception as exc:
             # Always acknowledge after validation to avoid an endless Feishu retry
