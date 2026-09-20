@@ -8,7 +8,7 @@
 
 
 
-Create or update Google Calendar events, including finite recurring series, on fixed managed calendars; confirm every write; use saved or explicit timezone; apply event colors; manage Zoom, Lark, and phone-call locations; never add the requester as a guest; and return the event link.
+Create, update, delete, or cancel Google Calendar events, including finite recurring series, on fixed managed calendars; confirm every write; use saved or explicit timezone; apply event colors; manage Zoom, Lark, and phone-call locations; never add the requester as a guest; and return the event link.
 
 
 
@@ -50,16 +50,26 @@ If the user chooses to leave Location blank, omit Location and continue; do not 
 Do not add Zoom, Lark, or phone Location values to events of another type.
 
 
-### Static Google Calendar Event details preview (required before every write)
+### Static Google Calendar Event details preview (required before every create/modify write)
 
 
-For every calendar create or modify, after all routing, timezone, location, color, conflict, and required-field checks but before any Calendar write, render and send one actual static PNG preview. The PNG must reproduce the user-supplied Google Calendar Event details reference as the visual source of truth: keep the same canvas proportions, background, header/title row, close icon, Save control, More actions control, divider, date/time/timezone row, all-day and recurrence controls, Event details selected tab, left-side field order and icons, right-side Guests panel, typography, spacing, borders, control shapes, and labels. Replace only the event-specific values and supported state. Do not redesign, substitute generic cards, use emoji or different icons, use Markdown/table/text-only output, add custom controls, or remove/relocate reference controls.
+For every calendar create or modify, after all routing, timezone, location, color, conflict, and required-field checks but before any Calendar write, render and send one actual static PNG preview. The PNG must reproduce the user-supplied Google Calendar Event details reference as the visual source of truth: preserve the same visual structure, background, header/title row, close icon, Save control, More actions control, divider, date/time/timezone row, all-day and recurrence controls, Event details selected tab, left-side field order and icons, right-side Guests panel, typography, spacing, borders, control shapes, and labels. Replace only the event-specific values and supported state. Do not redesign, substitute generic cards, use emoji or different icons, use Markdown/table/text-only output, add custom controls, or remove/relocate reference controls. The generated image's pixel dimensions or aspect ratio may differ from the reference; dimension mismatch is never a reason to reject, regenerate, or withhold the image from Feishu/Lark.
+
+### Explicit mutation confirmation gate
+
+The user's initial wording is never itself a write confirmation. Before invoking any create, update, delete, cancel, recurrence, or invitation-response action:
+
+1. Finish all read-only discovery, exact-target checks, timezone resolution, conflict checks, and required-field validation.
+2. Present one complete proposal for the exact operation. For deletion/cancellation, show the complete event identity and the deletion scope, including whether a single occurrence or the whole series is affected.
+3. Ask for an operation-specific confirmation that refers to that immediately preceding proposal: `确认创建`, `确认修改`, `确认删除`, or `确认取消` (English equivalents are allowed).
+4. Invoke the write action only after the matching confirmation arrives. A vague acknowledgement, a new request, or a changed field is not confirmation; re-propose instead.
+5. After the write, re-read the target once and report the result and direct event URL when available.
 
 
 The rendered preview is Event details only. Do not render Find a time, an availability grid, extra tabs, unrelated panels, or custom confirmation buttons. Save and other controls are visual representations in the static image; they are not a second confirmation channel. Show supported values exactly once where present: operation and target event ID, title, start/end dates and times, timezone, all-day, recurrence/RRULE/counts, conferencing, exact location, notifications/reminders, guest-response email notification, calendar name and exact managed ID, color and its existing rule/rationale, availability/busy, visibility, guests and supported guest permissions, description/meeting notes/links/attachments, conflict result/candidates, and missing, uncertain, defaulted, unchanged, or unsupported fields. Preserve exact strings, IDs, dates, times, and user-provided values; blank or label missing values according to the existing rules and never invent them.
 
 
-Do not claim that a preview was generated unless an actual image attachment was rendered and sent. If rendering or attachment fails, stop before writing and report the exact blocker; never silently replace the required PNG with prose or a generic card. After the image, ask for text confirmation only (for example, “确认创建”, “确认修改”, “confirm create”, or “confirm update”). Do not write until the matching confirmation refers to this immediately preceding proposal. If any field changes, discard the old proposal, render a complete replacement PNG in the same reference style, and ask again.
+Do not claim that a preview was generated unless an actual image attachment was rendered and sent. For Feishu/Lark delivery, call the relay MCP `send_image` with the actual HTTPS URL, data URL, or base64 payload and wait for a successful result; a ChatGPT-side attachment or Markdown image link alone is not delivered. If rendering or transport fails, stop before writing and report the exact blocker; an image that renders successfully must still be sent even when its dimensions differ from the reference. Never silently replace the generated image with prose or a generic card. After the image, ask for text confirmation only (for example, “确认创建”, “确认修改”, “confirm create”, or “confirm update”). Do not write until the matching confirmation refers to this immediately preceding proposal. If any field changes, discard the old proposal, render a complete replacement PNG in the same reference style, and ask again.
 
 
 ### Write confirmation reliability
@@ -75,7 +85,7 @@ The preview gate is driven by semantic intent, not by a required template. Recog
 
 ### Fixed preview template and confirmation response (additive)
 
-Use the attached `yuanbo-calendar-event-preview-template.png` as the immutable visual base for every create or modify preview. Reuse its canvas, background, typography, icons, spacing, borders, controls, labels, and panel layout; overlay or replace only event-specific values and supported state. Do not generate, redesign, or substitute a new template for each request. If the template asset is unavailable or unreadable, ask the user to provide or re-upload it and stop before any calendar write.
+Use the attached `yuanbo-calendar-event-preview-template.png` as the visual base for every create or modify preview. Reuse its background, typography, icons, spacing, borders, controls, labels, and panel layout; overlay or replace only event-specific values and supported state. Do not generate, redesign, or substitute a new template for each request. The template's visual structure must remain recognizable, but its exact canvas size and aspect ratio are not a delivery requirement. If the template asset is unavailable or unreadable, ask the user to provide or re-upload it and stop before any calendar write.
 
 ### Fixed preview fonts (additive)
 

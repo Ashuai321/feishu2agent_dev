@@ -27,6 +27,22 @@ MAX_CLIENTS = 50
 TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
 BITABLE_AUTOMATION_WEBHOOK_PATH = "/bitable/automation/webhook"
 BITABLE_AUTOMATION_MAX_TEXT_LENGTH = 10000
+CALENDAR_CONFIRMATION_GATE = (
+    "When using connected calendar tools, treat create, update, delete, cancel, recurrence, "
+    "and invitation-response actions as calendar mutations. Complete read-only discovery, "
+    "exact-target/timezone/conflict checks, and a complete proposal first. The user's original "
+    "request is never confirmation. Before a mutation, show the exact calendar, event title/ID, "
+    "local time/timezone, changed fields, and deletion or recurrence scope, then ask for an "
+    "operation-specific explicit confirmation (确认创建/确认修改/确认删除/确认取消 or an "
+    "English equivalent). Invoke the write tool only after the matching confirmation for the "
+    "immediately preceding proposal; if anything changes, re-propose. Re-read after success. "
+    "If a calendar preview or other Agent image is produced, call the relay send_image tool "
+    "with an actual HTTPS URL, data URL, or base64 payload and wait for success before "
+    "record_result; a ChatGPT-side attachment or Markdown image link alone is not delivered "
+    "to Feishu/Lark. Preserve the requested template's visual structure, but never reject or "
+    "withhold a successfully rendered image only because its pixel dimensions or aspect ratio "
+    "differs from the reference; send the generated image as-is."
+)
 
 
 def _format_user_question(question: Any, choices: Any = None) -> str:
@@ -1726,6 +1742,7 @@ def _conversation_input(
                 "to carry out the user's request, then call the relay MCP record_result so the answer "
                 "is returned to the quoted Feishu message."
             ),
+            CALENDAR_CONFIRMATION_GATE,
             f"The relay MCP server is {MCP_NAME} at https://bot.boooe.com{MCP_PATH}; call record_result there before ending the turn.",
             "",
             "User task:",
@@ -1739,6 +1756,7 @@ def _conversation_input(
             "After reading the user task, call update_conversation_title once for a new conversation, then record_plan with a user-visible step plan.",
             "After completing several steps, call record_progress with step_updates.",
             "Call record_result exactly once when this turn is truly over: status=done when delivered, status=failed on an execution error, status=blocked only for an external hard blocker.",
+            CALENDAR_CONFIRMATION_GATE,
             (
                 f"The relay MCP server is {MCP_NAME} at https://bot.boooe.com{MCP_PATH}. "
                 "It is the required Feishu reply channel; do not only answer in the ChatGPT conversation."
@@ -3020,6 +3038,54 @@ class CloudflareRelay:
         _image_upload_metadata(data, filename_prefix="image")
         return data
 
+    async def _send_agent_image(
+        self, request_id: str, conversation_key: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Upload one Agent image and reply to the originating message."""
+
+        run = await self._require_run(request_id, conversation_key)
+        source_message_id = str(run.get("source_message_id") or "").strip()
+        if not source_message_id:
+            raise ValueError("the current relay run has no source message")
+        data = await self._image_bytes_from_args(args)
+        api = self.api_for_conversation(conversation_key)
+        image_key = await api.upload_message_image(data)
+        outbound_id = await api.reply_image(source_message_id, image_key)
+        await self.state.save_reply(outbound_id, conversation_key)
+        caption = str(args.get("caption") or "").strip()
+        caption_id = None
+        if caption:
+            caption_id = await api.reply(source_message_id, caption)
+            await self.state.save_reply(caption_id, conversation_key)
+        return {
+            "success": True,
+            "request_id": request_id,
+            "conversation_key": conversation_key,
+            "message_id": outbound_id,
+            "caption_message_id": caption_id,
+        }
+
+    @staticmethod
+    def _result_image_args(args: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize optional image payloads accepted by ``record_result``."""
+
+        values: list[dict[str, Any]] = []
+        images = args.get("images")
+        if isinstance(images, dict):
+            images = [images]
+        if isinstance(images, list):
+            values.extend(item for item in images if isinstance(item, dict))
+        if args.get("image_url") or args.get("image_base64"):
+            values.insert(
+                0,
+                {
+                    key: args[key]
+                    for key in ("image_url", "image_base64", "mime_type", "caption")
+                    if args.get(key)
+                },
+            )
+        return values
+
     def tool_definitions(self) -> list[dict[str, Any]]:
         string = {"type": "string"}
         read_only = {"readOnlyHint": True}
@@ -3059,7 +3125,11 @@ class CloudflareRelay:
             },
             {
                 "name": "record_result",
-                "description": "Record the final result exactly once.",
+                "description": (
+                    "Record the final result exactly once. If the Agent produced an image, "
+                    "send it in images (or image_url/image_base64) so the relay forwards it "
+                    "to the quoted Feishu/Lark message before the text result is delivered."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "required": ["request_id", "conversation_key", "status", "title", "markdown"],
@@ -3069,6 +3139,22 @@ class CloudflareRelay:
                         "status": {"type": "string", "enum": ["done", "failed", "blocked"]},
                         "title": string,
                         "markdown": string,
+                        "image_url": string,
+                        "image_base64": string,
+                        "mime_type": string,
+                        "caption": string,
+                        "images": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "image_url": string,
+                                    "image_base64": string,
+                                    "mime_type": string,
+                                    "caption": string,
+                                },
+                            },
+                        },
                     },
                 },
             },
@@ -3371,6 +3457,30 @@ class CloudflareRelay:
                         "already_recorded": True,
                     }
                 )
+            image_results: list[dict[str, Any]] = []
+            try:
+                for image_args in self._result_image_args(args):
+                    image_results.append(
+                        await self._send_agent_image(
+                            request_id, conversation_key, image_args
+                        )
+                    )
+            except Exception as exc:
+                # Keep the run open when an explicitly supplied image could not
+                # be delivered. The Agent can retry or return an explicit
+                # failed result with the actual blocker.
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "image_send_failed",
+                            "message": _safe_error(exc),
+                        },
+                        "result_not_recorded": True,
+                        "images_sent": image_results,
+                    },
+                    True,
+                )
             status = str(args.get("status") or "failed")
             if status not in {"done", "failed", "blocked"}:
                 status = "failed"
@@ -3382,7 +3492,14 @@ class CloudflareRelay:
                 completed_at=_now(),
             )
             await self._enqueue({"kind": "deliver_result", "request_id": request_id})
-            return self._tool_result({"success": True, "request_id": request_id, "status": status})
+            return self._tool_result(
+                {
+                    "success": True,
+                    "request_id": request_id,
+                    "status": status,
+                    "images_sent": image_results,
+                }
+            )
         if name == "update_conversation_title":
             await self._require_run(request_id, conversation_key)
             await self.state.update_run(request_id, title=str(args.get("title") or ""))
@@ -3498,30 +3615,10 @@ class CloudflareRelay:
                 content=content,
             )
         if name == "send_image":
-            run = await self._require_run(request_id, conversation_key)
-            source_message_id = str(run.get("source_message_id") or "").strip()
-            if not source_message_id:
-                return self._tool_result(
-                    {
-                        "success": False,
-                        "error": {
-                            "code": "source_message_missing",
-                            "message": "the current relay run has no source message",
-                        },
-                    },
-                    True,
-                )
             try:
-                data = await self._image_bytes_from_args(args)
-                api = self.api_for_conversation(conversation_key)
-                image_key = await api.upload_message_image(data)
-                outbound_id = await api.reply_image(source_message_id, image_key)
-                await self.state.save_reply(outbound_id, conversation_key)
-                caption = str(args.get("caption") or "").strip()
-                caption_id = None
-                if caption:
-                    caption_id = await api.reply(source_message_id, caption)
-                    await self.state.save_reply(caption_id, conversation_key)
+                result = await self._send_agent_image(
+                    request_id, conversation_key, args
+                )
             except Exception as exc:
                 return self._tool_result(
                     {
@@ -3530,15 +3627,7 @@ class CloudflareRelay:
                     },
                     True,
                 )
-            return self._tool_result(
-                {
-                    "success": True,
-                    "request_id": request_id,
-                    "conversation_key": conversation_key,
-                    "message_id": outbound_id,
-                    "caption_message_id": caption_id,
-                }
-            )
+            return self._tool_result(result)
         if name == "create_private_group":
             row = await self.state.requester(conversation_key)
             if not row or not row.get("open_id"):

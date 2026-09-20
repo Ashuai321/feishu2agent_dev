@@ -25,6 +25,29 @@ TRIGGER_USER_AGENT = "workspace-agent-relay-mcp/1.0 (+https://github.com/envvar/
 # The trigger API is asynchronous.  This beta response field gives the relay
 # an execution id for diagnostics without changing the normal callback flow.
 TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
+CALENDAR_CONFIRMATION_GATE = (
+    "When using connected calendar tools, treat create, update, delete, cancel, recurrence, "
+    "and invitation-response actions as calendar mutations. Complete read-only discovery, "
+    "exact-target/timezone/conflict checks, and a complete proposal first. The user's original "
+    "request is never confirmation. Before a mutation, show the exact calendar, event title/ID, "
+    "local time/timezone, changed fields, and deletion or recurrence scope, then ask for an "
+    "operation-specific explicit confirmation (确认创建/确认修改/确认删除/确认取消 or an "
+    "English equivalent). Invoke the write tool only after the matching confirmation for the "
+    "immediately preceding proposal; if anything changes, re-propose. Re-read after success. "
+    "If a calendar preview or other Agent image is produced, call the relay send_image tool "
+    "with an actual HTTPS URL, data URL, or base64 payload and wait for success before "
+    "record_result; a ChatGPT-side attachment or Markdown image link alone is not delivered "
+    "to Feishu/Lark. Preserve the requested template's visual structure, but never reject or "
+    "withhold a successfully rendered image only because its pixel dimensions or aspect ratio "
+    "differs from the reference; send the generated image as-is."
+)
+
+
+def requires_calendar_confirmation(agent_name: object) -> bool:
+    """Limit the calendar gate to the managed Yuanbo calendar Agent."""
+
+    normalized = str(agent_name or "").casefold()
+    return "yuanbo" in normalized and "calendar" in normalized
 
 
 def generate_request_id(prefix: str = "relay") -> str:
@@ -125,6 +148,7 @@ def build_trigger_input(
     working_directory: str | None = None,
     local_context: dict[str, Any] | None = None,
     available_skills: list[dict[str, Any]] | None = None,
+    calendar_confirmation_required: bool = False,
 ) -> str:
     if mode == "steer":
         turn_mode = "answer" if answer else "steer"
@@ -153,6 +177,7 @@ def build_trigger_input(
             "Use the working_directory header above as the default cwd for this request. Verify it before filesystem/git operations; do not guess a different repository. If you must leave that directory, explain why in progress/result.",
             "",
         ]
+    calendar_gate = [CALENDAR_CONFIRMATION_GATE] if calendar_confirmation_required else []
     if mode == "steer":
         # Mid-turn follow-up: the operator is guiding THIS turn. We can
         # only send triggers, so this is another trigger to the same conversation,
@@ -197,6 +222,7 @@ def build_trigger_input(
                 "Do not use record_progress as the final answer channel; progress is only intermediate state.",
                 "Keep record_plan user-visible: do not include relay binding, server_info, or routine tool setup as plan steps.",
                 "If notion-local-ops-mcp was bound earlier this turn, keep using it; if it is unavailable, still call record_progress/record_result so the operator stays informed.",
+                *calendar_gate,
                 "",
                 label,
                 user_input.strip(),
@@ -213,6 +239,7 @@ def build_trigger_input(
                 *rendered_context,
                 *local_context_instruction,
                 *cwd_instruction,
+                *calendar_gate,
                 "Same relay protocol as before: record_plan → notion-local-ops-mcp.bind_relay_run → record_progress(step_updates) → record_result, using the request_id above. Keep record_plan user-visible: do not list relay binding, server_info, or routine tool setup as plan steps. If notion-local-ops-mcp is unavailable, skip bind_relay_run and still call record_progress/record_result so the operator stays informed.",
                 "",
                 "User task:",
@@ -239,6 +266,7 @@ def build_trigger_input(
                 "This is an interactive Feishu/Lark turn. Use the connected calendar tools to carry out the user's request, "
                 "then call workspace-agent-relay-mcp.record_result so the answer is returned to the quoted message."
             ),
+            *calendar_gate,
             "Call workspace-agent-relay-mcp.record_result exactly once when this turn is truly over: status=done when delivered, status=failed on an execution error, status=blocked ONLY for an external hard blocker (missing access/resource/dependency) — never use blocked to mean 'the plan changed' or 'the user gave a new direction'.",
             "Do not only answer in the ChatGPT conversation.",
             "",

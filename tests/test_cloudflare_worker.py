@@ -828,6 +828,9 @@ def test_agent_input_uses_text_relay_envelope():
     assert "User task:\n测试" in input_text
     assert "https://bot.boooe.com/mcp" in input_text
     assert "record_result" in input_text
+    assert "The user's original request is never confirmation" in input_text
+    assert "确认创建/确认修改/确认删除/确认取消" in input_text
+    assert "never reject or withhold a successfully rendered image" in input_text
 
 
 def test_non_target_groups_keep_the_agent_relay_workflow_available():
@@ -931,6 +934,69 @@ def test_cloudflare_mcp_sends_agent_image_as_a_message_reply():
     assert result["isError"] is False
     assert result["structuredContent"]["message_id"] == "om_image_reply"
     assert state.saved == ("om_image_reply", "feishu:app:chat:1")
+
+
+def test_record_result_forwards_structured_agent_image_before_text_result():
+    worker = _load_worker_module()
+    image = b"\x89PNG\r\n\x1a\nagent-image"
+
+    class FakeQueue:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, body):
+            self.messages.append(body)
+
+    class FakeState:
+        db = object()
+
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "conversation_key": "feishu:app:chat:1",
+                "source_message_id": "om_source",
+            }
+
+        async def update_run(self, request_id, **fields):
+            self.updated = (request_id, fields)
+
+        async def save_reply(self, outbound_id, conversation_key):
+            self.saved = (outbound_id, conversation_key)
+
+    class FakeFeishu:
+        async def upload_message_image(self, data):
+            assert data == image
+            return "img_v1_outbound"
+
+        async def reply_image(self, message_id, image_key):
+            assert (message_id, image_key) == ("om_source", "img_v1_outbound")
+            return "om_image_reply"
+
+    queue = FakeQueue()
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(AGENT_QUEUE=queue), None, state)
+    relay.feishu = FakeFeishu()
+    result = asyncio.run(
+        relay.call_tool(
+            "record_result",
+            {
+                "request_id": "req_1",
+                "conversation_key": "feishu:app:chat:1",
+                "status": "done",
+                "title": "预览已发送",
+                "markdown": "请确认创建。",
+                "images": [
+                    {"image_base64": base64.b64encode(image).decode("ascii")}
+                ],
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["images_sent"][0]["message_id"] == "om_image_reply"
+    assert state.updated[0] == "req_1"
+    assert state.updated[1]["status"] == "done"
+    assert queue.messages == [{"kind": "deliver_result", "request_id": "req_1"}]
 
 
 def test_worker_config_points_directly_to_python_entrypoint():

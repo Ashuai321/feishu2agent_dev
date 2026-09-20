@@ -274,8 +274,12 @@ MCP 地址，并启用日历相关工具以及 `get_user_images`、`send_image`�
 
 图片交互通过 relay MCP 完成：用户发送的图片由 Agent 调用 `get_user_images` 取得为
 MCP 图片内容；Agent 生成或取得图片后，必须调用 `send_image`，传入 HTTPS 图片地址、
-base64 数据或 data URL，Worker 会使用对应的 Feishu/Lark 机器人上传并回复图片。仅在
-最终 Markdown 中放图片链接不会把图片发送到群里。
+base64 数据或 data URL，Worker 会使用对应的 Feishu/Lark 机器人上传并回复图片。也可以
+在 `record_result` 的 `images`（或单个 `image_url`/`image_base64`）字段中传入同样的图片载荷，
+Worker 会先发送图片，再投递最终文字。仅在最终 Markdown 中放图片链接不会把图片发送到群里；
+如果图片载荷发送失败，最终结果不会被标记为已完成，Agent 必须重试或明确返回失败原因。
+图片应尽量保持模板的内容、控件和布局；但生成图片的像素尺寸或宽高比可以不同，不能因为尺寸
+不同而拒绝回传。Worker 会按收到的原始图片字节上传，不会为了尺寸检查而丢弃图片。
 
 如果使用 Cloudflare 的 GitHub 自动部署，仓库根目录保持 `/`，生产分支使用 `main`，构建命令留空，部署命令填写 `uv run pywrangler deploy`。D1、Queue 资源和 Worker Secrets 仍需在同一个 Cloudflare 账户中准备好；以后激活 R2 后再把 `AVATARS` 绑定加入配置。
 

@@ -67,6 +67,38 @@ def test_build_trigger_input_injects_protocol(tmp_path):
     assert "查天气" in text
 
 
+def test_calendar_agent_trigger_requires_operation_specific_confirmation():
+    text = build_trigger_input(
+        request_id="req_calendar",
+        conversation_key="feishu:app:chat_1",
+        user_input="删除明天的日程",
+        calendar_confirmation_required=True,
+    )
+
+    assert "The user's original request is never confirmation" in text
+    assert "确认创建/确认修改/确认删除/确认取消" in text
+    assert "Re-read after success" in text
+    assert "never reject or withhold a successfully rendered image" in text
+
+
+def test_non_calendar_agent_trigger_does_not_receive_calendar_gate():
+    text = build_trigger_input(
+        request_id="req_general",
+        conversation_key="feishu:app:chat_1",
+        user_input="创建一个群",
+    )
+
+    assert "The user's original request is never confirmation" not in text
+
+
+def test_calendar_agent_name_match_is_narrow():
+    from feishu2agents.relay.trigger import requires_calendar_confirmation
+
+    assert requires_calendar_confirmation("Yuanbo Calendar Manager") is True
+    assert requires_calendar_confirmation("You World 群聊管理工具") is False
+    assert requires_calendar_confirmation("Calendar Manager") is False
+
+
 def test_always_triggers_agent_starts_new_conversation(tmp_path):
     handler, store, bridge, dispatcher = make_handler(tmp_path)
     posted = []

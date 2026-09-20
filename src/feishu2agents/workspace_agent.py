@@ -29,6 +29,7 @@ from feishu2agents.relay.trigger import (
     TriggerClient,
     build_trigger_input,
     generate_request_id,
+    requires_calendar_confirmation,
 )
 
 from .bot_handler import should_process
@@ -286,6 +287,9 @@ class WorkspaceAgentMessageHandler:
                 is_continuation=is_continuation,
                 working_directory=run.get("working_directory_snapshot"),
                 local_context=run.get("local_context"),
+                calendar_confirmation_required=requires_calendar_confirmation(
+                    agent.get("name")
+                ),
             )
             self._store.mark_run_trigger_sent(request_id)
             self._settings.dispatcher.dispatch(

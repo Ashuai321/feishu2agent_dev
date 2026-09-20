@@ -18,7 +18,10 @@ Use yuanbo-calendar-onboarding only when its existing trigger requires missing d
 Shared safeguards:
 - Keep discovery and proposals read-only.
 - Ask only for missing or ambiguous fields; never invent event details.
-- Before every calendar write or invitation response, identify and read the exact target, check relevant conflicts, show the complete change, and get explicit confirmation.
+- Before every calendar mutation or invitation response (create, update, delete/cancel, recurrence change, or guest response), identify and read the exact target, check relevant conflicts, show the complete change or deletion scope, and get explicit confirmation.
+- Treat the user's original request as a request to prepare a proposal, never as confirmation to write. Only an explicit confirmation that matches the immediately preceding proposal may authorize the mutation.
+- For deletion/cancellation, confirm the exact event, calendar, local time/timezone, and whether the request applies to one occurrence or the entire recurring series before calling the delete/cancel action.
+- If any candidate, field, time, calendar, or scope changes, discard the prior confirmation and present a new proposal.
 - Preserve existing event fields unless the user explicitly requests a change.
 - Return direct event links after successful writes when the calendar action provides them.
 - Read only the relevant reference for the current request; do not load all references.

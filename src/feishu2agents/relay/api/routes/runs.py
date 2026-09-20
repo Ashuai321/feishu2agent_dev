@@ -17,6 +17,7 @@ from ...trigger import (
     TriggerClient,
     build_trigger_input,
     generate_request_id,
+    requires_calendar_confirmation,
 )
 from ...workspace_directories import browse_workspace_files
 from ..deps import json_body
@@ -175,6 +176,9 @@ def run_routes(store: Any, config: Any, event_bus: RunEventBus) -> list[tuple]:
             working_directory=run.get("working_directory_snapshot"),
             local_context=run.get("local_context"),
             available_skills=available_skills,
+            calendar_confirmation_required=requires_calendar_confirmation(
+                agent.get("name")
+            ),
         )
         trigger_client = getattr(request.app.state, "trigger_client", None) or TriggerClient()
         run = store.mark_run_trigger_sent(request_id)
@@ -268,6 +272,9 @@ def run_routes(store: Any, config: Any, event_bus: RunEventBus) -> list[tuple]:
             answer=is_answer,
             working_directory=run.get("working_directory_snapshot"),
             local_context=local_context,
+            calendar_confirmation_required=requires_calendar_confirmation(
+                agent.get("name")
+            ),
         )
         trigger_client = getattr(request.app.state, "trigger_client", None) or TriggerClient()
         schedule_trigger_dispatch(
