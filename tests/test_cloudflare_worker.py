@@ -1033,6 +1033,132 @@ def test_result_delivery_falls_back_to_a_new_reply_when_edit_fails():
     assert state.saved == ("om_result", "feishu:app:chat:x")
 
 
+def test_ask_user_queues_a_question_without_closing_the_run():
+    worker = _load_worker_module()
+
+    class FakeQueue:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, body):
+            self.messages.append(body)
+
+    class FakeState:
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "conversation_key": "feishu:app:chat:x",
+            }
+
+        async def update_run(self, request_id, **fields):
+            self.updated = (request_id, fields)
+
+    queue = FakeQueue()
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(AGENT_QUEUE=queue), None, state)
+
+    result = asyncio.run(
+        relay.call_tool(
+            "ask_user",
+            {
+                "request_id": "req_1",
+                "conversation_key": "feishu:app:chat:x",
+                "question": "请选择日历",
+                "choices": ["工作", "个人"],
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert state.updated == (
+        "req_1",
+        {
+            "status": "needs_user",
+            "progress_message": "请选择日历\n可选项：\n- 工作\n- 个人",
+        },
+    )
+    assert queue.messages == [{"kind": "deliver_question", "request_id": "req_1"}]
+
+
+def test_question_delivery_updates_placeholder_and_keeps_run_resumable():
+    worker = _load_worker_module()
+
+    class FakeState:
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "source_message_id": "om_source",
+                "placeholder_message_id": "om_placeholder",
+                "status": "needs_user",
+                "progress_message": "请确认创建日程？",
+                "conversation_key": "feishu:app:chat:x",
+            }
+
+        async def save_reply(self, outbound_id, conversation_key):
+            self.saved = (outbound_id, conversation_key)
+
+    class FakeFeishu:
+        def __init__(self):
+            self.updates = []
+
+        async def update(self, message_id, text):
+            self.updates.append((message_id, text))
+
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = FakeFeishu()
+
+    asyncio.run(relay.deliver_question("req_1"))
+
+    assert relay.feishu.updates == [("om_placeholder", "请确认创建日程？")]
+    assert state.saved == ("om_placeholder", "feishu:app:chat:x")
+
+
+def test_question_delivery_falls_back_to_a_reply_and_rebinds_placeholder():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.updated = []
+
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "source_message_id": "om_source",
+                "placeholder_message_id": "om_placeholder",
+                "status": "needs_user",
+                "progress_message": "请确认创建日程？",
+                "conversation_key": "feishu:app:chat:x",
+            }
+
+        async def update_run(self, request_id, **fields):
+            self.updated.append((request_id, fields))
+
+        async def save_reply(self, outbound_id, conversation_key):
+            self.saved = (outbound_id, conversation_key)
+
+    class FakeFeishu:
+        def __init__(self):
+            self.replies = []
+
+        async def update(self, message_id, text):
+            raise RuntimeError("Feishu update temporarily failed")
+
+        async def reply(self, message_id, text):
+            self.replies.append((message_id, text))
+            return "om_question"
+
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = FakeFeishu()
+
+    asyncio.run(relay.deliver_question("req_1"))
+
+    assert relay.feishu.replies == [("om_source", "请确认创建日程？")]
+    assert state.updated == [("req_1", {"placeholder_message_id": "om_question"})]
+    assert state.saved == ("om_question", "feishu:app:chat:x")
+
+
 def test_feishu_text_update_uses_put_message_edit_api():
     worker = _load_worker_module()
 

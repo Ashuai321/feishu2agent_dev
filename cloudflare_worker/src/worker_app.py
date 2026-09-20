@@ -29,6 +29,23 @@ BITABLE_AUTOMATION_WEBHOOK_PATH = "/bitable/automation/webhook"
 BITABLE_AUTOMATION_MAX_TEXT_LENGTH = 10000
 
 
+def _format_user_question(question: Any, choices: Any = None) -> str:
+    """Render an Agent question as the text sent back to the Feishu thread.
+
+    ``ask_user`` is a pause point in an Agent turn, so the question must be
+    persisted in the same run that later receives the user's quoted reply.
+    Keep the rendering deliberately plain text because the existing
+    placeholder is a plain text message and is edited in place.
+    """
+    text = str(question or "").strip() or "请补充必要信息。"
+    if not isinstance(choices, list):
+        return text
+    options = [str(choice).strip() for choice in choices if str(choice).strip()]
+    if not options:
+        return text
+    return f"{text}\n可选项：\n" + "\n".join(f"- {choice}" for choice in options)
+
+
 def _image_upload_metadata(
     data: bytes, *, filename_prefix: str = "avatar"
 ) -> tuple[str, str]:
@@ -2911,6 +2928,8 @@ class CloudflareRelay:
                     "serverInfo": {"name": MCP_NAME, "version": "3.0.0"},
                     "instructions": (
                         "Use record_plan, record_progress and record_result for every relay turn. "
+                        "If input is required, use ask_user; it delivers the question to the "
+                        "current Feishu/Lark reply and keeps the run resumable. "
                         "The relay name is workspace-agent-relay-mcp-prd."
                     ),
                 }
@@ -3068,7 +3087,11 @@ class CloudflareRelay:
             },
             {
                 "name": "ask_user",
-                "description": "Pause the current turn with a question for the operator.",
+                "description": (
+                    "Pause the current turn with a question for the Feishu/Lark user. "
+                    "The relay delivers it to the current reply and resumes the same "
+                    "conversation when the user answers."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "required": ["request_id", "conversation_key", "question"],
@@ -3367,13 +3390,21 @@ class CloudflareRelay:
         if name == "ask_user":
             await self._require_run(request_id, conversation_key)
             question = str(args.get("question") or "")
-            await self.state.update_run(request_id, status="needs_user", progress_message=question)
+            choices = args.get("choices") or []
+            question_text = _format_user_question(question, choices)
+            await self.state.update_run(
+                request_id, status="needs_user", progress_message=question_text
+            )
+            # ``ask_user`` is a pause point, not a terminal Agent result.  Put
+            # a separate delivery job on the same queue so the question is
+            # visible in Feishu while the run stays resumable.
+            await self._enqueue({"kind": "deliver_question", "request_id": request_id})
             return self._tool_result(
                 {
                     "success": True,
                     "status": "needs_user",
                     "question": question,
-                    "choices": args.get("choices") or [],
+                    "choices": choices,
                 }
             )
         if name == "get_run_context":
@@ -3956,6 +3987,11 @@ class CloudflareRelay:
                 await self.deliver_result(str(body.get("request_id") or ""))
             except Exception as exc:
                 print(f"Local result delivery failed: {_safe_error(exc)}")
+        elif body.get("kind") == "deliver_question":
+            try:
+                await self.deliver_question(str(body.get("request_id") or ""))
+            except Exception as exc:
+                print(f"Local question delivery failed: {_safe_error(exc)}")
         else:
             await self.run_agent_job(body)
 
@@ -4079,6 +4115,45 @@ class CloudflareRelay:
                 _now(),
                 request_id,
             )
+            await self.state.save_reply(outbound, str(run["conversation_key"]))
+        except Exception as exc:
+            await self.state.update_run(request_id, trigger_error=_safe_error(exc))
+            raise
+
+    async def deliver_question(self, request_id: str) -> None:
+        """Deliver an ``ask_user`` question without closing the Agent run.
+
+        The in-progress placeholder is the reply anchor for the current
+        conversation.  Editing it preserves the existing thread/reply
+        mapping; if Feishu rejects the edit, send a new reply and bind that
+        message to the same conversation so a quoted answer still resumes
+        the run's conversation.
+        """
+        run = await self.state.get_run(request_id)
+        if not run or str(run.get("status") or "") != "needs_user":
+            return
+        text = str(run.get("progress_message") or "请补充必要信息。")
+        try:
+            placeholder = str(run.get("placeholder_message_id") or "")
+            if placeholder:
+                try:
+                    await self.api_for_conversation(str(run["conversation_key"])).update(
+                        placeholder, text
+                    )
+                    outbound = placeholder
+                except Exception as exc:
+                    print(f"Feishu question update failed; sending a reply: {_safe_error(exc)}")
+                    outbound = await self.api_for_conversation(
+                        str(run["conversation_key"])
+                    ).reply(str(run["source_message_id"]), text)
+                    await self.state.update_run(
+                        request_id, placeholder_message_id=str(outbound)
+                    )
+            else:
+                outbound = await self.api_for_conversation(
+                    str(run["conversation_key"])
+                ).reply(str(run["source_message_id"]), text)
+                await self.state.update_run(request_id, placeholder_message_id=str(outbound))
             await self.state.save_reply(outbound, str(run["conversation_key"]))
         except Exception as exc:
             await self.state.update_run(request_id, trigger_error=_safe_error(exc))
@@ -4304,6 +4379,8 @@ class Default(WorkerEntrypoint):
                 request_id = str(body.get("request_id") or "")
                 if body.get("kind") == "deliver_result":
                     await relay.deliver_result(request_id)
+                elif body.get("kind") == "deliver_question":
+                    await relay.deliver_question(request_id)
                 else:
                     await relay.run_agent_job(body)
                 message.ack()
