@@ -132,15 +132,19 @@ python -m feishu2agents.main
 ### 指定测试群：以 @ 发起人的身份写入多维表格
 
 `BITABLE_WORKFLOW_GROUP_CHAT_ID` 默认是
-`oc_5e9132f3638772d53d92d6fc5e953abc`。在这个群里明确 @机器人并发送文字时，
-Worker 根据事件进入的 `/feishu/events` 或 `/lark/events` 判定平台，保存发送人的
-`open_id`，并回复该平台的 OAuth 授权链接。用户完成授权后，回调会再次调用对应平台的
-`user_info`，只有返回的 `open_id` 与发起 @ 的人一致才会继续；随后以该用户 token 将
-文字写入 Wiki 节点对应多维表格「测试」表的「任务描述」，并把发起人的 open_id 写入
-「任务执行人」。不同平台的 token、API 域名和用户身份严格隔离。
+`oc_5e9132f3638772d53d92d6fc5e953abc`。这个群只接受两种模式指令：`[飞书文档]` 和
+`[lark文档]`（也兼容不带方括号的写法）。输入模式后，机器人会提示同一用户继续
+`@` 机器人发送要写入的文字；也可以在指令后直接附带文字。飞书文档模式沿用原来的
+Feishu 文档模式使用请求人所属平台的 OAuth，并将文字写入 Feishu「测试」表的「任务描述」、
+用户写入「任务执行人」。Lark 文档模式将文字写入 Lark Wiki 节点
+`UmGRwFFDQiegHckOVh0j0DIrpRc` 下的表 `tblmd8DAQwM00t7B` 的「文本」，并将用户写入
+「测试3」。这里的文档指令只决定目标文档；授权平台始终根据实际发起 @ 的账号属于
+Feishu 还是 Lark 来决定，不会因为选择 `[lark文档]` 就把 Feishu 用户改为 Lark OAuth。
+不同平台的 token、API 域名和用户身份严格隔离。
 
-机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的 `user_access_token`，所以
-第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1
+授权卡片通过临时消息卡片发送，只对触发 @ 的用户显示；飞书客户端要求该用户在线，群内
+其他成员不会看到卡片内容。机器人事件本身只能提供发送人的 `open_id`，不会携带该用户的
+`user_access_token`，所以第一次操作必须点击授权。成功授权的 token 会按 `平台 + open_id` 保存在 Worker 的 D1
 中，后续同一用户可直接复用；撤销或过期后会再次要求授权。若 Lark 用户无权访问这个
 Feishu 租户中的 Wiki/多维表格，API 会返回权限错误，系统不会降级使用 Feishu 机器人
 或其他人的 token。
@@ -161,6 +165,20 @@ python -m scripts.xiaoc_group_mention_all --platform feishu --text "请确认收
 
 指定群之外的消息仍交给原来的 Workspace Agent Relay；该 Agent 路径已单独封装，避免与
 授权写表流程互相影响。
+
+### 多维表格 AI 分析结果转发到群
+
+多维表格自动化在 `AI 分析` 后添加“发送 HTTP 请求”动作，POST 到：
+
+```text
+https://bot.boooe.com/bitable/automation/webhook
+```
+
+请求体可直接选择 AI 分析节点的结果/响应体变量，也可以发送 JSON。Worker 会提取常见
+结果字段并由小 C 发到 `BITABLE_WORKFLOW_GROUP_CHAT_ID` 指定的群。该接口使用机器人租户
+令牌，不会读取或修改用户 OAuth。需要保护入口时，设置
+`BITABLE_AUTOMATION_WEBHOOK_TOKEN`，并在 HTTP 请求 Headers 中加入同名
+`X-Bitable-Webhook-Token`。
 
 ## Cloudflare Python Worker 部署
 

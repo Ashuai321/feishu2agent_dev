@@ -25,6 +25,8 @@ MCP_NAME = "workspace-agent-relay-mcp-prd"
 PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
 TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
+BITABLE_AUTOMATION_WEBHOOK_PATH = "/bitable/automation/webhook"
+BITABLE_AUTOMATION_MAX_TEXT_LENGTH = 10000
 
 
 def _image_upload_metadata(data: bytes) -> tuple[str, str]:
@@ -224,6 +226,7 @@ CREATE TABLE IF NOT EXISTS feishu_oauth_states (
 CREATE TABLE IF NOT EXISTS bitable_pending_requests (
     state TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
+    document_mode TEXT NOT NULL DEFAULT 'feishu',
     source_platform TEXT NOT NULL DEFAULT 'feishu',
     redirect_uri TEXT NOT NULL,
     conversation_key TEXT NOT NULL,
@@ -233,6 +236,7 @@ CREATE TABLE IF NOT EXISTS bitable_pending_requests (
     requester_union_id TEXT NOT NULL DEFAULT '',
     requester_user_id TEXT NOT NULL DEFAULT '',
     input_text TEXT NOT NULL,
+    pending_items_json TEXT NOT NULL DEFAULT '[]',
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
@@ -245,6 +249,24 @@ CREATE TABLE IF NOT EXISTS bitable_user_tokens (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (platform, open_id)
 );
+CREATE TABLE IF NOT EXISTS bitable_group_modes (
+    source_platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    requester_open_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (source_platform, chat_id, requester_open_id)
+);
+CREATE TABLE IF NOT EXISTS bitable_group_mode_prompts (
+    prompt_message_id TEXT PRIMARY KEY,
+    source_platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    requester_open_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bitable_group_mode_prompts_lookup
+    ON bitable_group_mode_prompts(source_platform, chat_id, requester_open_id, created_at DESC);
 """
 
 
@@ -365,6 +387,48 @@ def _allowed_redirect(uri: str) -> bool:
 def _safe_error(value: Any, secret: str = "") -> str:
     text = str(value or "").strip()
     return text.replace(secret, "[REDACTED]") if secret else text
+
+
+def _format_bitable_automation_text(value: Any) -> str:
+    """Turn a Feishu automation payload into a bounded group-chat message.
+
+    The HTTP action can send either a raw value selected from the AI node or a
+    JSON object containing that value.  Prefer common result keys while still
+    preserving arbitrary JSON so the endpoint remains useful when Feishu adds
+    a new response shape.
+    """
+
+    candidate = value
+    if isinstance(value, dict):
+        for key in (
+            "text",
+            "message",
+            "content",
+            "result",
+            "output",
+            "analysis",
+            "summary",
+            "answer",
+            "response_body",
+        ):
+            selected = value.get(key)
+            if selected not in (None, "", [], {}):
+                candidate = selected
+                break
+
+    if isinstance(candidate, str):
+        text = candidate.strip()
+    else:
+        try:
+            text = json.dumps(candidate, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            text = str(candidate)
+        text = text.strip()
+
+    if not text:
+        text = "多维表格 AI 分析返回为空"
+    text = text[:BITABLE_AUTOMATION_MAX_TEXT_LENGTH]
+    return f"[多维表格 AI 分析]\n{text}"
 
 
 class D1State:
@@ -686,6 +750,7 @@ class D1State:
             """CREATE TABLE IF NOT EXISTS bitable_pending_requests (
                 state TEXT PRIMARY KEY,
                 platform TEXT NOT NULL,
+                document_mode TEXT NOT NULL DEFAULT 'feishu',
                 source_platform TEXT NOT NULL DEFAULT 'feishu',
                 redirect_uri TEXT NOT NULL,
                 conversation_key TEXT NOT NULL,
@@ -693,16 +758,21 @@ class D1State:
                 source_chat_id TEXT NOT NULL,
                 requester_open_id TEXT NOT NULL,
                 input_text TEXT NOT NULL,
+                pending_items_json TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             )""",
         )
         # Keep pending OAuth records compatible with the initial deployment,
-        # which only stored the authorization platform.
+        # which only stored the authorization platform. The document target
+        # is separate because a Feishu user can select the Lark document (and
+        # vice versa); the OAuth platform must remain tied to the requester.
         for column, definition in (
+            ("document_mode", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("source_platform", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("requester_union_id", "TEXT NOT NULL DEFAULT ''"),
             ("requester_user_id", "TEXT NOT NULL DEFAULT ''"),
+            ("pending_items_json", "TEXT NOT NULL DEFAULT '[]'"),
         ):
             with contextlib.suppress(Exception):
                 await _db_run(
@@ -721,12 +791,29 @@ class D1State:
                 PRIMARY KEY (platform, open_id)
             )""",
         )
+        await _db_run(
+            self.db,
+            """CREATE TABLE IF NOT EXISTS bitable_group_mode_prompts (
+                prompt_message_id TEXT PRIMARY KEY,
+                source_platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                requester_open_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )""",
+        )
+        await _db_run(
+            self.db,
+            """CREATE INDEX IF NOT EXISTS idx_bitable_group_mode_prompts_lookup
+                ON bitable_group_mode_prompts(source_platform, chat_id, requester_open_id, created_at DESC)""",
+        )
 
     async def save_bitable_pending(
         self,
         *,
         state: str,
         platform: str,
+        document_mode: str = "feishu",
         source_platform: str = "feishu",
         redirect_uri: str,
         conversation_key: str,
@@ -741,12 +828,14 @@ class D1State:
         await _db_run(
             self.db,
             """INSERT INTO bitable_pending_requests
-               (state, platform, source_platform, redirect_uri, conversation_key,
+               (state, platform, document_mode, source_platform, redirect_uri, conversation_key,
                 source_message_id, source_chat_id, requester_open_id,
-                requester_union_id, requester_user_id, input_text, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                requester_union_id, requester_user_id, input_text, pending_items_json,
+                expires_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             state,
             platform,
+            document_mode,
             source_platform,
             redirect_uri,
             conversation_key,
@@ -756,8 +845,47 @@ class D1State:
             requester_union_id,
             requester_user_id,
             input_text,
+            "[]",
             expires_at,
             _now(),
+        )
+
+    async def bitable_pending_authorization(
+        self, *, platform: str, requester_open_id: str
+    ) -> dict[str, Any] | None:
+        """Return an active authorization request for this platform user."""
+        return await _db_first(
+            self.db,
+            """SELECT * FROM bitable_pending_requests
+               WHERE platform = ? AND requester_open_id = ? AND expires_at > ?
+               ORDER BY created_at DESC LIMIT 1""",
+            platform,
+            requester_open_id,
+            _now(),
+        )
+
+    async def append_bitable_pending_item(
+        self, *, state: str, item: dict[str, Any]
+    ) -> None:
+        row = await _db_first(
+            self.db,
+            "SELECT pending_items_json FROM bitable_pending_requests WHERE state = ?",
+            state,
+        )
+        if row is None:
+            return
+        try:
+            items = json.loads(str(row.get("pending_items_json") or "[]"))
+        except (TypeError, ValueError):
+            items = []
+        if not isinstance(items, list):
+            items = []
+        items.append(item)
+        await _db_run(
+            self.db,
+            "UPDATE bitable_pending_requests SET pending_items_json = ? WHERE state = ?",
+            _json(items),
+            state,
         )
 
     async def consume_bitable_pending(self, state: str) -> dict[str, Any] | None:
@@ -805,6 +933,86 @@ class D1State:
             expires_at,
             _now(),
         )
+
+    async def save_bitable_group_mode(
+        self, *, source_platform: str, chat_id: str, requester_open_id: str, mode: str
+    ) -> None:
+        await _db_run(
+            self.db,
+            """INSERT INTO bitable_group_modes
+               (source_platform, chat_id, requester_open_id, mode, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(source_platform, chat_id, requester_open_id) DO UPDATE SET
+                 mode=excluded.mode, updated_at=excluded.updated_at""",
+            source_platform,
+            chat_id,
+            requester_open_id,
+            mode,
+            _now(),
+        )
+
+    async def bitable_group_mode(
+        self, *, source_platform: str, chat_id: str, requester_open_id: str
+    ) -> str | None:
+        row = await _db_first(
+            self.db,
+            """SELECT mode FROM bitable_group_modes
+               WHERE source_platform = ? AND chat_id = ? AND requester_open_id = ?""",
+            source_platform,
+            chat_id,
+            requester_open_id,
+        )
+        mode = str((row or {}).get("mode") or "").strip().lower()
+        return mode if mode in {"feishu", "lark"} else None
+
+    async def save_bitable_group_mode_prompt(
+        self,
+        *,
+        prompt_message_id: str,
+        source_platform: str,
+        chat_id: str,
+        requester_open_id: str,
+        mode: str,
+    ) -> None:
+        """Bind a two-turn document choice to the bot prompt message.
+
+        The legacy per-user mode remains as a fallback for a fresh @ message,
+        while this binding keeps two outstanding prompts independent when a
+        user selects different document targets before replying to either.
+        """
+        await _db_run(
+            self.db,
+            """INSERT OR REPLACE INTO bitable_group_mode_prompts
+               (prompt_message_id, source_platform, chat_id, requester_open_id, mode, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            prompt_message_id,
+            source_platform,
+            chat_id,
+            requester_open_id,
+            mode,
+            _now(),
+        )
+
+    async def bitable_group_mode_for_prompt(
+        self,
+        *,
+        prompt_message_id: str,
+        source_platform: str,
+        chat_id: str,
+        requester_open_id: str,
+    ) -> str | None:
+        row = await _db_first(
+            self.db,
+            """SELECT mode FROM bitable_group_mode_prompts
+               WHERE prompt_message_id = ? AND source_platform = ?
+                 AND chat_id = ? AND requester_open_id = ?""",
+            prompt_message_id,
+            source_platform,
+            chat_id,
+            requester_open_id,
+        )
+        mode = str((row or {}).get("mode") or "").strip().lower()
+        return mode if mode in {"feishu", "lark"} else None
 
 
 class FeishuAPI:
@@ -986,6 +1194,26 @@ class FeishuAPI:
             raise RuntimeError(f"{self.platform.title()} bot identity returned no open_id")
         return str(value)
 
+    async def send_text(self, chat_id: str, text: str) -> str:
+        """Send a bot-authored text message to a group chat."""
+        target = str(chat_id or "").strip()
+        if not target:
+            raise ValueError("chat_id is required")
+        payload = await self._request(
+            "POST",
+            "/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            json={
+                "receive_id": target,
+                "msg_type": "text",
+                "content": _json({"text": str(text or "")}),
+            },
+        )
+        outbound = payload.get("data", {}).get("message_id")
+        if not outbound:
+            raise RuntimeError("Feishu message response returned no message_id")
+        return str(outbound)
+
     async def reply(self, message_id: str, text: str) -> str:
         payload = await self._request(
             "POST",
@@ -1015,6 +1243,30 @@ class FeishuAPI:
         outbound = payload.get("data", {}).get("message_id")
         if not outbound:
             raise RuntimeError("Feishu card reply response returned no message_id")
+        return str(outbound)
+
+    async def send_ephemeral_card(
+        self, *, chat_id: str, open_id: str, card: dict[str, Any]
+    ) -> str:
+        """Send a group card that is visible only to one online user.
+
+        Feishu/Lark's ephemeral-card endpoint deliberately uses the group and
+        recipient IDs instead of replying to the source message.  This keeps
+        OAuth links private to the person who mentioned the bot.
+        """
+        payload = await self._request(
+            "POST",
+            "/open-apis/ephemeral/v1/send",
+            json={
+                "chat_id": str(chat_id),
+                "open_id": str(open_id),
+                "msg_type": "interactive",
+                "card": card,
+            },
+        )
+        outbound = payload.get("data", {}).get("message_id")
+        if not outbound:
+            raise RuntimeError("Feishu ephemeral card response returned no message_id")
         return str(outbound)
 
     async def update(self, message_id: str, text: str) -> None:
@@ -1324,7 +1576,9 @@ def _message_parts(message_type: str, content: Any) -> tuple[str, list[str]] | N
     return ("".join(text_parts), image_keys)
 
 
-def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] | None:
+def _normalize_event(
+    body: dict[str, Any], bot_open_id: str, *, allow_unmentioned_reply: bool = False
+) -> dict[str, Any] | None:
     event = body.get("event") if isinstance(body.get("event"), dict) else {}
     header = body.get("header") if isinstance(body.get("header"), dict) else {}
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
@@ -1345,6 +1599,7 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
     text, image_keys = parts
     if image_keys:
         text = f"{text}\n[用户发送了一张图片，已保存为必要文件]"
+    parent_id = str(message.get("parent_id") or message.get("root_id") or "")
     mentions = message.get("mentions") or []
     mentioned_bot = False
     for mention in mentions:
@@ -1355,12 +1610,13 @@ def _normalize_event(body: dict[str, Any], bot_open_id: str) -> dict[str, Any] |
             if key:
                 text = re.sub(re.escape(str(key)), "", text)
     text = text.strip()
-    parent_id = str(message.get("parent_id") or message.get("root_id") or "")
     # The bot must be explicitly @mentioned for every request.  When that
     # mention is attached to a reply quoting one of our messages, the handler
     # uses the parent mapping to continue the existing conversation; a fresh
     # @mention without a mapped parent starts a new conversation.
-    if not mentioned_bot or (not text and not image_keys):
+    if (not mentioned_bot and not (allow_unmentioned_reply and parent_id)) or (
+        not text and not image_keys
+    ):
         return None
     return {
         "message_id": message_id,
@@ -1454,6 +1710,8 @@ def _conversation_input(
 BITABLE_WORKFLOW_GROUP_CHAT_ID = "oc_5e9132f3638772d53d92d6fc5e953abc"
 BITABLE_WORKFLOW_WIKI_TOKEN = "AYNDwkmOUiZtbgkZ3BAcLchUnnb"
 BITABLE_WORKFLOW_TABLE_ID = "tblVyvH3RGHqwQBC"
+LARK_DOCUMENT_WIKI_TOKEN = "UmGRwFFDQiegHckOVh0j0DIrpRc"
+LARK_DOCUMENT_TABLE_ID = "tblmd8DAQwM00t7B"
 
 
 class BitableGroupWorkflow:
@@ -1486,6 +1744,76 @@ class BitableGroupWorkflow:
         return str(chat_id or "").strip() == self.target_group()
 
     @staticmethod
+    def parse_document_command(text: str) -> tuple[str, str] | None:
+        """Return the selected document platform and any inline payload.
+
+        The command can be sent as ``[飞书文档]``/``[lark文档]`` or without the
+        display brackets.  An optional payload after whitespace or a colon is
+        accepted so both the two-turn flow and a single-message flow work.
+        """
+        value = str(text or "").strip()
+        aliases = (
+            ("[飞书文档]", "feishu"),
+            ("飞书文档", "feishu"),
+            ("[lark文档]", "lark"),
+            ("lark文档", "lark"),
+        )
+        lowered = value.casefold()
+        for label, mode in aliases:
+            prefix = label.casefold()
+            if lowered == prefix:
+                return mode, ""
+            if not lowered.startswith(prefix):
+                continue
+            remainder = value[len(label) :]
+            if remainder and remainder[0] not in " \t\r\n:：,，":
+                continue
+            return mode, remainder.lstrip(" \t\r\n:：,，")
+        return None
+
+    @staticmethod
+    def mode_label(mode: str) -> str:
+        return "飞书文档" if str(mode or "").strip().lower() == "feishu" else "lark文档"
+
+    async def reply_mode_prompt(
+        self, source_platform: str, event: dict[str, Any], mode: str
+    ) -> str:
+        api = self.relay.api_for_conversation(f"{source_platform}:workflow")
+        return await api.reply(
+            str(event["message_id"]),
+            f"已选择 [{self.mode_label(mode)}]。请继续 @机器人发送要写入的内容。",
+        )
+
+    async def reply_mode_required(self, source_platform: str, event: dict[str, Any]) -> None:
+        api = self.relay.api_for_conversation(f"{source_platform}:workflow")
+        await api.reply(
+            str(event["message_id"]),
+            "此群只支持两种指令：请输入 [飞书文档] 或 [lark文档]，然后继续 @机器人发送内容。",
+        )
+
+    def target(self, mode: str) -> tuple[str, str, str, str]:
+        """Return wiki token, table id, text field, and assignee field."""
+        normalized = str(mode or "feishu").strip().lower()
+        env = getattr(self.relay, "env", None)
+        if normalized == "lark":
+            return (
+                _env(env, "LARK_DOCUMENT_WIKI_TOKEN", LARK_DOCUMENT_WIKI_TOKEN)
+                or LARK_DOCUMENT_WIKI_TOKEN,
+                _env(env, "LARK_DOCUMENT_TABLE_ID", LARK_DOCUMENT_TABLE_ID)
+                or LARK_DOCUMENT_TABLE_ID,
+                "文本",
+                "测试3",
+            )
+        return (
+            _env(env, "BITABLE_WORKFLOW_WIKI_TOKEN", BITABLE_WORKFLOW_WIKI_TOKEN)
+            or BITABLE_WORKFLOW_WIKI_TOKEN,
+            _env(env, "BITABLE_WORKFLOW_TABLE_ID", BITABLE_WORKFLOW_TABLE_ID)
+            or BITABLE_WORKFLOW_TABLE_ID,
+            "任务描述",
+            "任务执行人",
+        )
+
+    @staticmethod
     def _auth_base(platform: str) -> str:
         return (
             "https://accounts.larksuite.com"
@@ -1507,27 +1835,60 @@ class BitableGroupWorkflow:
         self,
         *,
         platform: str,
+        document_mode: str = "feishu",
         source_platform: str,
         conversation_key: str,
         event: dict[str, Any],
-    ) -> str:
+    ) -> str | None:
         callback_uri = self._callback_uri(platform)
+
+        # One active authorization is enough for all requests from the same
+        # account. Queue later requests behind that state instead of sending
+        # another card. The account platform remains the lookup key; the
+        # document mode is retained per queued item.
+        find_pending = getattr(self.relay.state, "bitable_pending_authorization", None)
+        append_item = getattr(self.relay.state, "append_bitable_pending_item", None)
+        requester_open_id = str(event["open_id"])
+        item = {
+            "platform": platform,
+            "document_mode": document_mode,
+            "source_platform": source_platform,
+            "conversation_key": conversation_key,
+            "source_message_id": str(event["message_id"]),
+            "source_chat_id": str(event["chat_id"]),
+            "requester_open_id": requester_open_id,
+            "requester_union_id": str(event.get("union_id") or ""),
+            "requester_user_id": str(event.get("user_id") or ""),
+            "input_text": str(event.get("text") or "").strip(),
+        }
+        if callable(find_pending) and callable(append_item):
+            existing = await find_pending(
+                platform=platform,
+                requester_open_id=requester_open_id,
+            )
+            if existing and str(existing.get("state") or ""):
+                await append_item(state=str(existing["state"]), item=item)
+                return None
+
         state = f"bitable_{platform}_" + secrets.token_urlsafe(32)
         expires_at = _now() + self.relay.feishu_oauth_ttl(platform)
         await self.relay.state.save_bitable_pending(
             state=state,
             platform=platform,
+            document_mode=document_mode,
             source_platform=source_platform,
             redirect_uri=callback_uri,
             conversation_key=conversation_key,
             source_message_id=str(event["message_id"]),
             source_chat_id=str(event["chat_id"]),
-            requester_open_id=str(event["open_id"]),
+            requester_open_id=requester_open_id,
             requester_union_id=str(event.get("union_id") or ""),
             requester_user_id=str(event.get("user_id") or ""),
             input_text=str(event.get("text") or "").strip(),
             expires_at=expires_at,
         )
+        if callable(append_item):
+            await append_item(state=state, item=item)
         prefix = platform.upper()
         return (
             f"{self._auth_base(platform)}/open-apis/authen/v1/authorize?"
@@ -1574,13 +1935,18 @@ class BitableGroupWorkflow:
                 },
             ],
         }
-        await api.reply_card(str(event["message_id"]), card)
+        await api.send_ephemeral_card(
+            chat_id=str(event["chat_id"]),
+            open_id=str(event["open_id"]),
+            card=card,
+        )
 
     async def _write_row(
         self,
         *,
         platform: str,
         source_platform: str = "feishu",
+        document_mode: str | None = None,
         requester_open_id: str,
         requester_union_id: str = "",
         requester_user_id: str = "",
@@ -1615,16 +1981,18 @@ class BitableGroupWorkflow:
             raise RuntimeError(
                 "OAuth 用户与发起 @ 的用户不一致；为避免越权，未写入多维表格"
             )
-        app_token = await api.resolve_wiki_bitable_app_token(
-            access_token, BITABLE_WORKFLOW_WIKI_TOKEN
-        )
+        # The original direct workflow always targeted the Feishu table; the
+        # explicit document_mode is what selects the new Lark table.
+        mode = str(document_mode or "feishu").strip().lower()
+        wiki_token, table_id, text_field, assignee_field = self.target(mode)
+        app_token = await api.resolve_wiki_bitable_app_token(access_token, wiki_token)
         fields = await api.user_bitable_fields(
             access_token,
             app_token=app_token,
-            table_id=BITABLE_WORKFLOW_TABLE_ID,
+            table_id=table_id,
         )
         field_names = {str(item.get("field_name") or "") for item in fields}
-        missing = {"任务描述", "任务执行人"} - field_names
+        missing = {text_field, assignee_field} - field_names
         if missing:
             raise RuntimeError(
                 "测试表缺少字段：" + "、".join(sorted(missing))
@@ -1632,10 +2000,10 @@ class BitableGroupWorkflow:
         record = await api.create_user_bitable_record(
             access_token,
             app_token=app_token,
-            table_id=BITABLE_WORKFLOW_TABLE_ID,
+            table_id=table_id,
             fields={
-                "任务描述": text,
-                "任务执行人": [{"id": authorized_open_id}],
+                text_field: text,
+                assignee_field: [{"id": authorized_open_id}],
             },
         )
         # Keep the platform-scoped assignee available to the caller without
@@ -1649,20 +2017,31 @@ class BitableGroupWorkflow:
         *,
         platform: str,
         source_platform: str = "feishu",
+        document_mode: str | None = None,
         conversation_key: str,
         event: dict[str, Any],
     ) -> None:
         await self.relay.state.ensure_feishu_oauth_schema()
         requester_open_id = str(event.get("open_id") or "").strip()
         text = str(event.get("text") or "").strip()
+        # ``platform`` is the requester's actual account platform and controls
+        # OAuth, token storage, identity verification, and API client choice.
+        # ``document_mode`` only selects the destination document/table.
+        auth_platform = str(platform or "feishu").strip().lower()
+        selected_mode = str(document_mode or "feishu").strip().lower()
+        if auth_platform not in {"feishu", "lark"}:
+            auth_platform = "feishu"
+        if selected_mode not in {"feishu", "lark"}:
+            selected_mode = "feishu"
         if not requester_open_id or not text:
             return
-        cached = await self.relay.state.user_token(platform, requester_open_id)
+        cached = await self.relay.state.user_token(auth_platform, requester_open_id)
         if cached and int(cached.get("expires_at") or 0) > _now() + 60:
             try:
                 record = await self._write_row(
-                    platform=platform,
+                    platform=auth_platform,
                     source_platform=source_platform,
+                    document_mode=selected_mode,
                     requester_open_id=requester_open_id,
                     requester_union_id=str(event.get("union_id") or ""),
                     requester_user_id=str(event.get("user_id") or ""),
@@ -1671,7 +2050,7 @@ class BitableGroupWorkflow:
                 )
                 await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
                     str(event["message_id"]),
-                    f"已使用你之前的 {platform} 授权写入多维表格，任务执行人="
+                    f"已使用你之前的 {auth_platform} 授权写入 {self.mode_label(selected_mode)}，任务执行人="
                     f"{record.get('_authorized_open_id') or requester_open_id}，"
                     f"record_id={record.get('record_id')}",
                 )
@@ -1679,33 +2058,125 @@ class BitableGroupWorkflow:
             except Exception as exc:
                 # A revoked/expired token should fall through to a fresh
                 # authorization instead of silently using a different user.
-                print(f"Cached {platform} user token was not usable: {_safe_error(exc)}")
+                print(f"Cached {auth_platform} user token was not usable: {_safe_error(exc)}")
         url = await self._authorization_url(
-            platform=platform,
+            platform=auth_platform,
+            document_mode=selected_mode,
             source_platform=source_platform,
             conversation_key=conversation_key,
             event=event,
         )
-        await self._reply_auth(source_platform, event, url)
+        if url:
+            await self._reply_auth(source_platform, event, url)
 
     async def complete_oauth(
         self, pending: dict[str, Any], token_data: dict[str, Any]
     ) -> dict[str, Any]:
         platform = str(pending.get("platform") or "").strip().lower()
-        source_platform = str(pending.get("source_platform") or platform).strip().lower()
         requester_open_id = str(pending.get("requester_open_id") or "").strip()
         access_token = str(token_data.get("access_token") or "").strip()
         if platform not in {"feishu", "lark"} or not access_token:
             raise RuntimeError("OAuth callback data is missing platform or access_token")
-        record = await self._write_row(
-            platform=platform,
-            source_platform=source_platform,
-            requester_open_id=requester_open_id,
-            requester_union_id=str(pending.get("requester_union_id") or ""),
-            requester_user_id=str(pending.get("requester_user_id") or ""),
-            text=str(pending.get("input_text") or "").strip(),
-            access_token=access_token,
+
+        # Requests received while the authorization card is open are stored
+        # as a JSON array on the same pending OAuth state.  Keep the old
+        # single-request row shape as a fallback so states created before the
+        # queue column was deployed still complete normally.
+        raw_items = pending.get("pending_items_json")
+        if isinstance(raw_items, str):
+            try:
+                queued_items = json.loads(raw_items)
+            except (TypeError, ValueError):
+                queued_items = []
+        else:
+            queued_items = raw_items
+        items = (
+            [dict(item) for item in queued_items if isinstance(item, dict)]
+            if isinstance(queued_items, list)
+            else []
         )
+        if not items:
+            items = [dict(pending)]
+
+        processed: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        for item in items:
+            item_platform = str(item.get("platform") or platform).strip().lower()
+            item_mode = str(item.get("document_mode") or "feishu").strip().lower()
+            item_source_platform = str(
+                item.get("source_platform") or platform
+            ).strip().lower()
+            item_open_id = str(
+                item.get("requester_open_id") or requester_open_id
+            ).strip()
+            item_message_id = str(item.get("source_message_id") or "").strip()
+            try:
+                if item_platform != platform:
+                    raise RuntimeError("待处理请求的授权平台与当前授权不一致")
+                record = await self._write_row(
+                    platform=platform,
+                    source_platform=item_source_platform,
+                    document_mode=item_mode,
+                    requester_open_id=item_open_id,
+                    requester_union_id=str(item.get("requester_union_id") or ""),
+                    requester_user_id=str(item.get("requester_user_id") or ""),
+                    text=str(item.get("input_text") or "").strip(),
+                    access_token=access_token,
+                )
+            except Exception as exc:
+                message = _safe_error(exc, access_token)
+                failures.append(
+                    {
+                        "source_message_id": item_message_id,
+                        "document_mode": item_mode,
+                        "message": message,
+                    }
+                )
+                try:
+                    if item_message_id:
+                        await self.relay.api_for_conversation(
+                            f"{item_source_platform}:workflow"
+                        ).reply(
+                            item_message_id,
+                            f"授权完成，但未能写入 {self.mode_label(item_mode)}：{message}",
+                        )
+                except Exception as reply_exc:
+                    print(
+                        "Bitable queued error reply failed: "
+                        f"{_safe_error(reply_exc)}"
+                    )
+                continue
+
+            result = {
+                "source_message_id": item_message_id,
+                "document_mode": item_mode,
+                "source_platform": item_source_platform,
+                "open_id": str(
+                    record.get("_authorized_open_id") or item_open_id
+                ),
+                "record_id": str(record.get("record_id") or ""),
+            }
+            processed.append(result)
+            try:
+                if item_message_id:
+                    await self.relay.api_for_conversation(
+                        f"{item_source_platform}:workflow"
+                    ).reply(
+                        item_message_id,
+                        f"授权成功，已按你的 {platform} 账号写入 "
+                        f"{self.mode_label(item_mode)}，任务执行人="
+                        f"{result['open_id']}，record_id={result['record_id']}",
+                    )
+            except Exception as reply_exc:
+                print(
+                    "Bitable queued success reply failed: "
+                    f"{_safe_error(reply_exc)}"
+                )
+
+        if not processed:
+            details = failures[0]["message"] if failures else "没有可处理的请求"
+            raise RuntimeError(f"所有待处理请求均写入失败：{details}")
+
         expires_in = int(token_data.get("expires_in") or 7200)
         await self.relay.state.save_user_token(
             platform=platform,
@@ -1714,17 +2185,17 @@ class BitableGroupWorkflow:
             refresh_token=str(token_data.get("refresh_token") or ""),
             expires_at=_now() + max(expires_in, 60),
         )
-        await self.relay.api_for_conversation(f"{source_platform}:workflow").reply(
-            str(pending.get("source_message_id") or ""),
-            f"授权成功，已按你的 {platform} 账号写入多维表格，任务执行人="
-            f"{record.get('_authorized_open_id') or requester_open_id}，"
-            f"record_id={record.get('record_id')}",
-        )
+        first = processed[0]
         return {
             "platform": platform,
-            "source_platform": source_platform,
-            "open_id": str(record.get("_authorized_open_id") or requester_open_id),
-            "record_id": str(record.get("record_id") or ""),
+            "document_mode": first["document_mode"],
+            "source_platform": first["source_platform"],
+            "open_id": first["open_id"],
+            "record_id": first["record_id"],
+            "processed_count": len(processed),
+            "failed_count": len(failures),
+            "records": processed,
+            "failures": failures,
         }
 
 
@@ -1787,6 +2258,88 @@ class CloudflareRelay:
         # other groups use the Workspace Agent relay, including the calendar
         # Agent configured by WORKSPACE_AGENT_RELAY_TRIGGER_URL.
         self.agent_workflow = AgentRelayWorkflow(self)
+
+    async def bitable_automation_webhook(self, request: Any) -> Response:
+        """Receive a Bitable AI/workflow HTTP action and post it to 小 C's group.
+
+        This endpoint intentionally uses the Feishu bot tenant token.  The
+        workflow is an outbound notification from the table, so it must not
+        consume or impersonate any user's OAuth token.
+        """
+
+        if str(request.method or "").upper() != "POST":
+            return _response(
+                {
+                    "success": False,
+                    "error": "method_not_allowed",
+                    "message": "Bitable automation webhook accepts POST requests only",
+                },
+                status=405,
+                headers={"allow": "POST"},
+            )
+
+        expected = str(_env(self.env, "BITABLE_AUTOMATION_WEBHOOK_TOKEN", "") or "").strip()
+        if expected:
+            provided = str(
+                request.headers.get("x-bitable-webhook-token")
+                or request.headers.get("authorization")
+                or ""
+            ).strip()
+            if provided.lower().startswith("bearer "):
+                provided = provided[7:].strip()
+            if not hmac.compare_digest(provided, expected):
+                return _response(
+                    {"success": False, "error": "invalid_webhook_token"},
+                    status=401,
+                )
+
+        try:
+            # Cloudflare Request bodies are single-use streams.  Reading
+            # ``json()`` and then falling back to ``text()`` can raise
+            # ``Body already used`` even when the original payload is valid.
+            # Read the stream once and decode it locally instead.
+            raw = await request.text()
+            try:
+                body = json.loads(raw)
+            except (TypeError, ValueError):
+                body = raw
+            if body in (None, "", [], {}):
+                return _response(
+                    {
+                        "success": False,
+                        "error": "missing_body",
+                        "message": "The HTTP action must send the AI analysis result in its request body",
+                    },
+                    status=400,
+                )
+
+            text = _format_bitable_automation_text(body)
+            chat_id = str(
+                _env(
+                    self.env,
+                    "BITABLE_WORKFLOW_GROUP_CHAT_ID",
+                    BITABLE_WORKFLOW_GROUP_CHAT_ID,
+                )
+                or BITABLE_WORKFLOW_GROUP_CHAT_ID
+            ).strip()
+            message_id = await self.feishu.send_text(chat_id, text)
+            return _response(
+                {
+                    "success": True,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                }
+            )
+        except Exception as exc:
+            print(f"Bitable automation webhook forwarding failed: {_safe_error(exc, expected)}")
+            return _response(
+                {
+                    "success": False,
+                    "error": "forward_failed",
+                    "message": _safe_error(exc, expected),
+                },
+                status=502,
+            )
 
     def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
         """Select the API client from the event's platform-prefixed key."""
@@ -1867,6 +2420,32 @@ class CloudflareRelay:
         if len(resolved) == 1:
             return resolved[0]
         return source
+
+    async def _bitable_document_mode(
+        self, *, source_platform: str, event: dict[str, Any]
+    ) -> str | None:
+        """Resolve a two-turn document choice without changing account auth.
+
+        A reply to a mode prompt is authoritative for that message. The
+        per-user mode table is retained as a compatibility fallback for a
+        fresh @ message that is not threaded under a prompt.
+        """
+        parent_id = str(event.get("parent_id") or "").strip()
+        if parent_id:
+            selected = await self.state.bitable_group_mode_for_prompt(
+                prompt_message_id=parent_id,
+                source_platform=source_platform,
+                chat_id=str(event.get("chat_id") or ""),
+                requester_open_id=str(event.get("open_id") or ""),
+            )
+            if selected in {"feishu", "lark"}:
+                return selected
+        selected = await self.state.bitable_group_mode(
+            source_platform=source_platform,
+            chat_id=str(event.get("chat_id") or ""),
+            requester_open_id=str(event.get("open_id") or ""),
+        )
+        return selected if selected in {"feishu", "lark"} else None
 
     def base_url(self) -> str:
         return _env(self.env, "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL", PUBLIC_BASE_URL).rstrip("/")
@@ -3271,7 +3850,20 @@ class CloudflareRelay:
             print(f"{prefix}_BOT_OPEN_ID is not configured; event ignored")
             return _response({"code": 0})
         try:
-            event = _normalize_event(body, bot_id)
+            raw_event = body.get("event") if isinstance(body.get("event"), dict) else {}
+            raw_message = (
+                raw_event.get("message")
+                if isinstance(raw_event.get("message"), dict)
+                else {}
+            )
+            target_chat_id = str(raw_message.get("chat_id") or "")
+            event = _normalize_event(
+                body,
+                bot_id,
+                allow_unmentioned_reply=self.bitable_workflow.is_target_group(
+                    target_chat_id
+                ),
+            )
             if event is None or not event["open_id"]:
                 return _response({"code": 0})
             parent = event["parent_id"]
@@ -3307,10 +3899,58 @@ class CloudflareRelay:
                 normalized,
             )
             if self.bitable_workflow.is_target_group(event["chat_id"]):
-                auth_platform = await self.detect_user_platform(event, normalized)
+                command = self.bitable_workflow.parse_document_command(event["text"])
+                if command is not None:
+                    selected_mode, payload = command
+                    await self.state.save_bitable_group_mode(
+                        source_platform=normalized,
+                        chat_id=str(event["chat_id"]),
+                        requester_open_id=str(event["open_id"]),
+                        mode=selected_mode,
+                    )
+                    if not payload:
+                        prompt_message_id = await self.bitable_workflow.reply_mode_prompt(
+                            normalized, event, selected_mode
+                        )
+                        # Keep each outstanding two-turn choice attached to the
+                        # exact bot prompt (and the command message itself, in
+                        # case the client quotes that message) that the user
+                        # can reply to. The per-user mode above remains the
+                        # fallback for a new unthreaded @ message.
+                        await self.state.save_bitable_group_mode_prompt(
+                            prompt_message_id=prompt_message_id,
+                            source_platform=normalized,
+                            chat_id=str(event["chat_id"]),
+                            requester_open_id=str(event["open_id"]),
+                            mode=selected_mode,
+                        )
+                        if prompt_message_id != str(event["message_id"]):
+                            await self.state.save_bitable_group_mode_prompt(
+                                prompt_message_id=str(event["message_id"]),
+                                source_platform=normalized,
+                                chat_id=str(event["chat_id"]),
+                                requester_open_id=str(event["open_id"]),
+                                mode=selected_mode,
+                            )
+                        return _response({"code": 0})
+                    event = dict(event)
+                    event["text"] = payload
+                else:
+                    selected_mode = await self._bitable_document_mode(
+                        source_platform=normalized,
+                        event=event,
+                    )
+                    if selected_mode is None:
+                        await self.bitable_workflow.reply_mode_required(normalized, event)
+                        return _response({"code": 0})
+                # The command chooses the destination document only. Resolve
+                # Feishu vs Lark from the sender/event identity so selecting
+                # ``[lark文档]`` can never force a Feishu user into Lark OAuth.
+                account_platform = await self.detect_user_platform(event, normalized)
                 await self.bitable_workflow.handle_event(
-                    platform=auth_platform,
+                    platform=account_platform,
                     source_platform=normalized,
+                    document_mode=selected_mode,
                     conversation_key=conversation_key,
                     event=event,
                 )
@@ -3350,6 +3990,7 @@ class Default(WorkerEntrypoint):
                     "ok": True,
                     "service": MCP_NAME,
                     "endpoints": [
+                        BITABLE_AUTOMATION_WEBHOOK_PATH,
                         "/feishu/events",
                         "/feishu/oauth/authorize",
                         "/feishu/oauth/callback",
@@ -3361,6 +4002,8 @@ class Default(WorkerEntrypoint):
                     ],
                 }
             )
+        if path == BITABLE_AUTOMATION_WEBHOOK_PATH:
+            return await relay.bitable_automation_webhook(request)
         if path in {"/feishu/oauth/authorize", "/feishu/oauth/callback"}:
             return await relay.feishu_oauth(request, path, "feishu")
         if path in {"/lark/oauth/authorize", "/lark/oauth/callback"}:

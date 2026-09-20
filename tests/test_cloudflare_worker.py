@@ -113,6 +113,72 @@ def test_worker_detects_actual_image_format_for_avatar_upload():
     )
 
 
+def test_bitable_automation_formatter_prefers_ai_result_text():
+    worker = _load_worker_module()
+
+    assert worker._format_bitable_automation_text(
+        {"result": "本周任务完成率为 80%", "trace_id": "ignored"}
+    ) == "[多维表格 AI 分析]\n本周任务完成率为 80%"
+
+
+def test_bitable_automation_formatter_preserves_arbitrary_json():
+    worker = _load_worker_module()
+
+    text = worker._format_bitable_automation_text({"rows": 3, "status": "ok"})
+    assert text.startswith("[多维表格 AI 分析]\n")
+    assert '"rows": 3' in text
+    assert '"status": "ok"' in text
+
+
+def test_bitable_automation_webhook_reads_request_body_once(monkeypatch):
+    worker = _load_worker_module()
+    responses = []
+    monkeypatch.setattr(
+        worker,
+        "_response",
+        lambda payload, status=200, headers=None: responses.append(
+            (payload, status, headers)
+        )
+        or responses[-1],
+    )
+
+    class Request:
+        method = "POST"
+        headers = {}
+
+        def __init__(self):
+            self.reads = 0
+
+        async def text(self):
+            self.reads += 1
+            return json.dumps({"text": "来自 AI 分析"}, ensure_ascii=False)
+
+        async def json(self):
+            raise AssertionError("the single-use body must not be read as JSON first")
+
+    class FakeFeishu:
+        async def send_text(self, chat_id, text):
+            assert chat_id == worker.BITABLE_WORKFLOW_GROUP_CHAT_ID
+            assert text == "[多维表格 AI 分析]\n来自 AI 分析"
+            return "om_forwarded"
+
+    relay = worker.CloudflareRelay(
+        SimpleNamespace(
+            BITABLE_WORKFLOW_GROUP_CHAT_ID=worker.BITABLE_WORKFLOW_GROUP_CHAT_ID,
+            BITABLE_AUTOMATION_WEBHOOK_TOKEN="",
+        ),
+        None,
+        SimpleNamespace(),
+    )
+    relay.feishu = FakeFeishu()
+    request = Request()
+
+    result = asyncio.run(relay.bitable_automation_webhook(request))
+
+    assert request.reads == 1
+    assert result == ({"success": True, "chat_id": worker.BITABLE_WORKFLOW_GROUP_CHAT_ID, "message_id": "om_forwarded"}, 200, None)
+
+
 def test_worker_parses_caption_and_image_post_message():
     worker = _load_worker_module()
     content = {
@@ -143,6 +209,19 @@ def test_worker_requires_an_mention_even_when_replying_to_a_bot_message():
     assert event is None
 
 
+def test_target_group_can_continue_with_a_quoted_reply_without_new_mention():
+    worker = _load_worker_module()
+    event = worker._normalize_event(
+        _event("text", {"text": "继续刚才的问题"}, text_mention=False, parent_id="om_bot_card"),
+        "ou_bot",
+        allow_unmentioned_reply=True,
+    )
+
+    assert event is not None
+    assert event["text"] == "继续刚才的问题"
+    assert event["parent_id"] == "om_bot_card"
+
+
 def test_worker_keeps_parent_for_an_mentioned_reply():
     worker = _load_worker_module()
 
@@ -170,6 +249,55 @@ def test_target_group_workflow_uses_the_configured_group_and_platform():
     assert workflow.is_target_group("oc_other") is False
     assert workflow._auth_base("feishu") == "https://accounts.feishu.cn"
     assert workflow._auth_base("lark") == "https://accounts.larksuite.com"
+
+
+def test_target_group_document_commands_select_mode_and_optional_payload():
+    worker = _load_worker_module()
+
+    assert worker.BitableGroupWorkflow.parse_document_command("[飞书文档]") == (
+        "feishu",
+        "",
+    )
+    assert worker.BitableGroupWorkflow.parse_document_command("[lark文档] 要写入") == (
+        "lark",
+        "要写入",
+    )
+    assert worker.BitableGroupWorkflow.parse_document_command("lark文档：测试") == (
+        "lark",
+        "测试",
+    )
+    assert worker.BitableGroupWorkflow.parse_document_command("其他内容") is None
+
+
+def test_document_mode_reply_uses_prompt_binding_before_latest_user_mode():
+    worker = _load_worker_module()
+
+    class State:
+        async def bitable_group_mode_for_prompt(self, **kwargs):
+            return {
+                "om_prompt_lark": "lark",
+                "om_prompt_feishu": "feishu",
+            }.get(kwargs["prompt_message_id"])
+
+        async def bitable_group_mode(self, **kwargs):
+            # The latest per-user choice is deliberately the wrong value for
+            # the first prompt; threaded prompt binding must win.
+            return "feishu"
+
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, State())
+    event = {
+        "chat_id": "oc_group",
+        "open_id": "ou_requester",
+        "parent_id": "om_prompt_lark",
+    }
+    assert asyncio.run(
+        relay._bitable_document_mode(source_platform="feishu", event=event)
+    ) == "lark"
+
+    event["parent_id"] = "om_prompt_feishu"
+    assert asyncio.run(
+        relay._bitable_document_mode(source_platform="feishu", event=event)
+    ) == "feishu"
 
 
 def test_external_sender_seen_by_feishu_is_routed_to_lark_oauth():
@@ -220,8 +348,8 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
             self.replies.append((message_id, text))
             return "om_reply"
 
-        async def reply_card(self, message_id, card):
-            self.card_replies.append((message_id, card))
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
             return "om_card_reply"
 
     class Relay:
@@ -259,8 +387,11 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     )
     assert relay.state.pending["platform"] == "feishu"
     assert relay.state.pending["requester_open_id"] == "ou_requester"
-    assert relay.api.card_replies[0][0] == "om_source"
-    card = relay.api.card_replies[0][1]
+    assert relay.api.card_replies[0][0:2] == (
+        "oc_5e9132f3638772d53d92d6fc5e953abc",
+        "ou_requester",
+    )
+    card = relay.api.card_replies[0][2]
     assert card["elements"][1]["actions"][0]["text"]["content"] == "授权并继续"
     auth_url = card["elements"][1]["actions"][0]["url"]
     assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in auth_url
@@ -284,8 +415,8 @@ def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
         def __init__(self):
             self.card_replies = []
 
-        async def reply_card(self, message_id, card):
-            self.card_replies.append((message_id, card))
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
             return "om_card_reply"
 
     class Relay:
@@ -321,11 +452,271 @@ def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
             },
         )
     )
-    card = relay.api.card_replies[0][1]
+    assert relay.api.card_replies[0][0:2] == (
+        "oc_5e9132f3638772d53d92d6fc5e953abc",
+        "ou_requester",
+    )
+    card = relay.api.card_replies[0][2]
     action = card["elements"][1]["actions"][0]
     assert "accounts.larksuite.com/open-apis/authen/v1/authorize" in action["url"]
     assert "app_id=cli_lark" in action["url"]
     assert "授权平台：**Lark**" in card["elements"][0]["text"]["content"]
+
+
+def test_lark_document_selection_keeps_feishu_requester_on_feishu_oauth():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.pending = None
+            self.token_lookup = None
+
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            self.token_lookup = (platform, open_id)
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = kwargs
+
+    class FakeAPI:
+        def __init__(self):
+            self.card_replies = []
+
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
+            return "om_card_reply"
+
+    class Relay:
+        env = type("Env", (), {"FEISHU_APP_ID": "cli_feishu"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    asyncio.run(
+        worker.BitableGroupWorkflow(relay).handle_event(
+            # The requester is Feishu; only the destination document is Lark.
+            platform="feishu",
+            document_mode="lark",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={
+                "message_id": "om_source",
+                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "open_id": "ou_requester",
+                "text": "测试任务",
+            },
+        )
+    )
+
+    assert relay.state.token_lookup == ("feishu", "ou_requester")
+    assert relay.state.pending["platform"] == "feishu"
+    assert relay.state.pending["document_mode"] == "lark"
+    card = relay.api.card_replies[0][2]
+    auth_url = card["elements"][1]["actions"][0]["url"]
+    assert "accounts.feishu.cn/open-apis/authen/v1/authorize" in auth_url
+    assert "accounts.larksuite.com" not in auth_url
+    assert "授权平台：**Feishu**" in card["elements"][0]["text"]["content"]
+
+
+def test_pending_authorization_sends_one_card_and_queues_later_requests():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.pending = None
+            self.items = []
+
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            return None
+
+        async def save_bitable_pending(self, **kwargs):
+            self.pending = dict(kwargs)
+
+        async def bitable_pending_authorization(self, *, platform, requester_open_id):
+            if (
+                self.pending
+                and self.pending["platform"] == platform
+                and self.pending["requester_open_id"] == requester_open_id
+            ):
+                return self.pending
+            return None
+
+        async def append_bitable_pending_item(self, *, state, item):
+            assert self.pending and self.pending["state"] == state
+            self.items.append(dict(item))
+
+    class FakeAPI:
+        def __init__(self):
+            self.card_replies = []
+
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            self.card_replies.append((chat_id, open_id, card))
+            return "om_card_reply"
+
+    class Relay:
+        env = type("Env", (), {"LARK_APP_ID": "cli_lark"})()
+
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            return "bitable:app wiki:wiki:readonly"
+
+        def feishu_oauth_ttl(self, platform):
+            return 600
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    workflow = worker.BitableGroupWorkflow(relay)
+    common = {
+        "chat_id": worker.BITABLE_WORKFLOW_GROUP_CHAT_ID,
+        "open_id": "ou_requester",
+    }
+    asyncio.run(
+        workflow.handle_event(
+            platform="lark",
+            document_mode="lark",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={**common, "message_id": "om_lark", "text": "Lark请求"},
+        )
+    )
+    asyncio.run(
+        workflow.handle_event(
+            platform="lark",
+            document_mode="feishu",
+            source_platform="feishu",
+            conversation_key="feishu:chat:1",
+            event={**common, "message_id": "om_feishu", "text": "飞书请求"},
+        )
+    )
+
+    assert len(relay.api.card_replies) == 1
+    assert [item["document_mode"] for item in relay.state.items] == [
+        "lark",
+        "feishu",
+    ]
+    assert [item["source_message_id"] for item in relay.state.items] == [
+        "om_lark",
+        "om_feishu",
+    ]
+
+
+def test_complete_oauth_processes_all_queued_document_requests_once():
+    worker = _load_worker_module()
+
+    class FakeState:
+        def __init__(self):
+            self.saved_tokens = []
+
+        async def save_user_token(self, **kwargs):
+            self.saved_tokens.append(kwargs)
+
+    class FakeAPI:
+        def __init__(self):
+            self.records = []
+            self.replies = []
+
+        async def user_info(self, access_token):
+            return {"open_id": "ou_lark_authorized"}
+
+        async def resolve_wiki_bitable_app_token(self, access_token, wiki_token):
+            return f"app:{wiki_token}"
+
+        async def user_bitable_fields(self, access_token, *, app_token, table_id):
+            if table_id == worker.LARK_DOCUMENT_TABLE_ID:
+                return [{"field_name": "文本"}, {"field_name": "测试3"}]
+            return [{"field_name": "任务描述"}, {"field_name": "任务执行人"}]
+
+        async def create_user_bitable_record(
+            self, access_token, *, app_token, table_id, fields
+        ):
+            record_id = f"rec_{len(self.records) + 1}"
+            self.records.append((table_id, fields))
+            return {"record_id": record_id}
+
+        async def reply(self, message_id, text):
+            self.replies.append((message_id, text))
+            return "om_reply"
+
+    class Relay:
+        def __init__(self):
+            self.state = FakeState()
+            self.api = FakeAPI()
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    pending = {
+        "platform": "lark",
+        "source_platform": "feishu",
+        "requester_open_id": "ou_external_projection",
+        "pending_items_json": json.dumps(
+            [
+                {
+                    "platform": "lark",
+                    "document_mode": "lark",
+                    "source_platform": "feishu",
+                    "source_message_id": "om_lark",
+                    "requester_open_id": "ou_external_projection",
+                    "input_text": "Lark内容",
+                },
+                {
+                    "platform": "lark",
+                    "document_mode": "feishu",
+                    "source_platform": "feishu",
+                    "source_message_id": "om_feishu",
+                    "requester_open_id": "ou_external_projection",
+                    "input_text": "飞书内容",
+                },
+            ]
+        ),
+    }
+
+    result = asyncio.run(
+        worker.BitableGroupWorkflow(relay).complete_oauth(
+            pending, {"access_token": "lark-token", "expires_in": 7200}
+        )
+    )
+
+    assert result["processed_count"] == 2
+    assert result["failed_count"] == 0
+    assert [table_id for table_id, fields in relay.api.records] == [
+        worker.LARK_DOCUMENT_TABLE_ID,
+        worker.BITABLE_WORKFLOW_TABLE_ID,
+    ]
+    assert [message_id for message_id, text in relay.api.replies] == [
+        "om_lark",
+        "om_feishu",
+    ]
+    assert len(relay.state.saved_tokens) == 1
 
 
 def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
@@ -369,6 +760,52 @@ def test_cross_platform_oauth_uses_lark_identity_for_bitable_assignee():
     assert relay.api.fields["任务执行人"] == [{"id": "ou_lark_user"}]
 
 
+def test_lark_document_writes_text_and_user_to_lark_target_fields():
+    worker = _load_worker_module()
+
+    class FakeAPI:
+        async def user_info(self, access_token):
+            return {"open_id": "ou_lark_user"}
+
+        async def resolve_wiki_bitable_app_token(self, access_token, wiki_token):
+            self.wiki_token = wiki_token
+            return "lark_app_token"
+
+        async def user_bitable_fields(self, access_token, *, app_token, table_id):
+            self.table_id = table_id
+            return [{"field_name": "文本"}, {"field_name": "测试3"}]
+
+        async def create_user_bitable_record(self, access_token, *, app_token, table_id, fields):
+            self.fields = fields
+            return {"record_id": "rec_lark_document"}
+
+    class Relay:
+        env = SimpleNamespace()
+
+        def __init__(self):
+            self.api = FakeAPI()
+
+        def api_for_conversation(self, key):
+            return self.api
+
+    relay = Relay()
+    result = asyncio.run(
+        worker.BitableGroupWorkflow(relay)._write_row(
+            platform="lark",
+            source_platform="feishu",
+            document_mode="lark",
+            requester_open_id="ou_external_projection",
+            text="lark 文档内容",
+            access_token="lark-user-token",
+        )
+    )
+
+    assert result["record_id"] == "rec_lark_document"
+    assert relay.api.wiki_token == worker.LARK_DOCUMENT_WIKI_TOKEN
+    assert relay.api.table_id == worker.LARK_DOCUMENT_TABLE_ID
+    assert relay.api.fields == {"文本": "lark 文档内容", "测试3": [{"id": "ou_lark_user"}]}
+
+
 def test_agent_input_uses_text_relay_envelope():
     worker = _load_worker_module()
 
@@ -390,6 +827,13 @@ def test_agent_input_uses_text_relay_envelope():
     assert "User task:\n测试" in input_text
     assert "https://bot.boooe.com/mcp" in input_text
     assert "record_result" in input_text
+
+
+def test_non_target_groups_keep_the_agent_relay_workflow_available():
+    worker = _load_worker_module()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, SimpleNamespace())
+
+    assert isinstance(relay.agent_workflow, worker.AgentRelayWorkflow)
 
 
 def test_agent_input_tells_agent_how_to_use_attached_image():
