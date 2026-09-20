@@ -29,25 +29,28 @@ BITABLE_AUTOMATION_WEBHOOK_PATH = "/bitable/automation/webhook"
 BITABLE_AUTOMATION_MAX_TEXT_LENGTH = 10000
 
 
-def _image_upload_metadata(data: bytes) -> tuple[str, str]:
+def _image_upload_metadata(
+    data: bytes, *, filename_prefix: str = "avatar"
+) -> tuple[str, str]:
     """Return a filename and MIME type matching the actual image bytes.
 
     Feishu validates the multipart metadata against the image data. Sending
     PNG bytes as ``avatar.jpg``/``image/jpeg`` produces a 400 parameter error.
     """
+    prefix = str(filename_prefix or "avatar").strip() or "avatar"
     signatures: tuple[tuple[bytes, str, str], ...] = (
-        (b"\x89PNG\r\n\x1a\n", "avatar.png", "image/png"),
-        (b"GIF87a", "avatar.gif", "image/gif"),
-        (b"GIF89a", "avatar.gif", "image/gif"),
-        (b"BM", "avatar.bmp", "image/bmp"),
+        (b"\x89PNG\r\n\x1a\n", f"{prefix}.png", "image/png"),
+        (b"GIF87a", f"{prefix}.gif", "image/gif"),
+        (b"GIF89a", f"{prefix}.gif", "image/gif"),
+        (b"BM", f"{prefix}.bmp", "image/bmp"),
     )
     for signature, filename, content_type in signatures:
         if data.startswith(signature):
             return filename, content_type
     if data.startswith(b"\xff\xd8\xff"):
-        return "avatar.jpg", "image/jpeg"
+        return f"{prefix}.jpg", "image/jpeg"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "avatar.webp", "image/webp"
+        return f"{prefix}.webp", "image/webp"
     # HEIC/HEIF files use the ISO-BMFF container.  Feishu accepts these for
     # image uploads and converts them to JPEG, so do not reject them merely
     # because they do not have a JPEG/PNG magic header.
@@ -59,11 +62,11 @@ def _image_upload_metadata(data: bytes) -> tuple[str, str]:
         b"mif1",
         b"msf1",
     }:
-        return "avatar.heic", "image/heic"
+        return f"{prefix}.heic", "image/heic"
     if data.startswith((b"II*\x00", b"MM\x00*")):
-        return "avatar.tiff", "image/tiff"
+        return f"{prefix}.tiff", "image/tiff"
     if data.startswith(b"\x00\x00\x01\x00"):
-        return "avatar.ico", "image/x-icon"
+        return f"{prefix}.ico", "image/x-icon"
     raise RuntimeError(
         "avatar image format is unsupported or cannot be detected; "
         "send a JPEG, PNG, WEBP, GIF, TIFF, BMP, or ICO image"
@@ -1226,6 +1229,22 @@ class FeishuAPI:
             raise RuntimeError("Feishu reply response returned no message_id")
         return str(outbound)
 
+    async def reply_image(self, message_id: str, image_key: str) -> str:
+        """Reply to a message with an uploaded image."""
+        key = str(image_key or "").strip()
+        if not key:
+            raise ValueError("image_key is required")
+        payload = await self._request(
+            "POST",
+            f"/open-apis/im/v1/messages/{message_id}/reply",
+            params={"user_id_type": "open_id"},
+            json={"msg_type": "image", "content": _json({"image_key": key})},
+        )
+        outbound = payload.get("data", {}).get("message_id")
+        if not outbound:
+            raise RuntimeError("Feishu image reply response returned no message_id")
+        return str(outbound)
+
     async def reply_card(self, message_id: str, card: dict[str, Any]) -> str:
         """Reply with an interactive card.
 
@@ -1388,20 +1407,24 @@ class FeishuAPI:
             json=body,
         )
 
-    async def upload_avatar_image(self, data: bytes) -> str:
-        """Upload image bytes to Feishu and return the avatar image_key."""
+    async def _upload_image(
+        self, data: bytes, *, image_type: str, filename_prefix: str
+    ) -> str:
+        """Upload image bytes and return the platform ``image_key``."""
         if not data:
-            raise RuntimeError("cannot upload an empty avatar image")
+            raise RuntimeError("cannot upload an empty image")
         if len(data) > 10 * 1024 * 1024:
-            raise RuntimeError("avatar image exceeds Feishu's 10MB limit")
-        filename, content_type = _image_upload_metadata(data)
+            raise RuntimeError("image exceeds Feishu's 10MB limit")
+        filename, content_type = _image_upload_metadata(
+            data, filename_prefix=filename_prefix
+        )
         token = await self._tenant_token()
         async with httpx.AsyncClient(timeout=30) as client:
             async def send(file_content_type: str) -> httpx.Response:
                 return await client.post(
                     f"{self.base}/open-apis/im/v1/images",
                     headers={"Authorization": f"Bearer {token}"},
-                    data={"image_type": "avatar"},
+                    data={"image_type": image_type},
                     files={"image": (filename, data, file_content_type)},
                 )
 
@@ -1435,8 +1458,20 @@ class FeishuAPI:
             )
         image_key = str((payload.get("data") or {}).get("image_key") or "")
         if not image_key:
-            raise RuntimeError("Feishu avatar upload returned no image_key")
+            raise RuntimeError("Feishu image upload returned no image_key")
         return image_key
+
+    async def upload_avatar_image(self, data: bytes) -> str:
+        """Upload image bytes as a group avatar and return its image_key."""
+        return await self._upload_image(
+            data, image_type="avatar", filename_prefix="avatar"
+        )
+
+    async def upload_message_image(self, data: bytes) -> str:
+        """Upload image bytes for a chat message and return its image_key."""
+        return await self._upload_image(
+            data, image_type="message", filename_prefix="image"
+        )
 
     async def search_contacts(self, query: str) -> list[dict[str, Any]]:
         """Resolve Feishu contacts from a mobile number or email address.
@@ -1700,8 +1735,12 @@ def _conversation_input(
         body.extend(
             [
                 "",
-                "The Feishu message includes an image. If the user asks to use it as a group avatar, "
-                "call update_group with set_avatar_from_stored=true; do not ask the user to resend it.",
+                "The Feishu message includes one or more user images. Call "
+                "workspace-agent-relay-mcp.get_user_images with the current request_id and "
+                "conversation_key before trying to inspect or use them. Do not claim to have "
+                "seen an image unless that tool returns an image attachment.",
+                "If the user asks to use an image as a group avatar, the avatar workflow can "
+                "still call update_group with set_avatar_from_stored=true.",
             ]
         )
     return "\n".join([*header, "", *body])
@@ -2903,6 +2942,65 @@ class CloudflareRelay:
                 200,
             )
 
+    @staticmethod
+    async def _image_bytes_from_args(args: dict[str, Any]) -> bytes:
+        """Decode an image supplied to the outbound image MCP tool.
+
+        Workspace Agents cannot pass a binary attachment directly as an MCP
+        argument, so accept either a data URL/base64 payload or an HTTPS image
+        URL.  The bytes are validated against their actual image signature
+        before they are uploaded to Feishu/Lark.
+        """
+        image_url = str(
+            args.get("image_url") or args.get("data_url") or ""
+        ).strip()
+        image_base64 = str(
+            args.get("image_base64") or args.get("base64") or ""
+        ).strip()
+        data: bytes
+        if image_url.startswith("data:"):
+            try:
+                header, encoded = image_url.split(",", 1)
+            except ValueError as exc:
+                raise ValueError("image_url data URL is malformed") from exc
+            if ";base64" not in header.lower():
+                raise ValueError("image_url data URL must use base64 encoding")
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError("image_url data URL contains invalid base64") from exc
+        elif image_url:
+            parsed = urlparse(image_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("image_url must be an http(s) URL or a data URL")
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                response = await client.get(image_url)
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"image URL download failed with HTTP {response.status_code}"
+                )
+            data = response.content
+        elif image_base64:
+            if image_base64.startswith("data:"):
+                try:
+                    _, encoded = image_base64.split(",", 1)
+                except ValueError as exc:
+                    raise ValueError("image_base64 data URL is malformed") from exc
+            else:
+                encoded = image_base64
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise ValueError("image_base64 contains invalid base64") from exc
+        else:
+            raise ValueError("provide image_url or image_base64")
+        if not data:
+            raise ValueError("image is empty")
+        if len(data) > 10 * 1024 * 1024:
+            raise ValueError("image exceeds Feishu's 10MB limit")
+        _image_upload_metadata(data, filename_prefix="image")
+        return data
+
     def tool_definitions(self) -> list[dict[str, Any]]:
         string = {"type": "string"}
         read_only = {"readOnlyHint": True}
@@ -3002,6 +3100,45 @@ class CloudflareRelay:
                     "properties": {"conversation_key": string},
                 },
                 "annotations": read_only,
+            },
+            {
+                "name": "get_user_images",
+                "description": (
+                    "Return the image attachments from the current Feishu/Lark user message "
+                    "as MCP image content so the Agent can inspect them. Call this before "
+                    "claiming to have seen or analyzed a user image."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["request_id", "conversation_key"],
+                    "properties": {
+                        "request_id": string,
+                        "conversation_key": string,
+                    },
+                },
+                "annotations": read_only,
+            },
+            {
+                "name": "send_image",
+                "description": (
+                    "Send an Agent-produced image back to the user's quoted Feishu/Lark "
+                    "message. Provide image_url (HTTPS or a base64 data URL) or image_base64. "
+                    "The image is uploaded through the correct platform bot and sent as an "
+                    "image reply; use this tool instead of only embedding a Markdown image "
+                    "link in record_result."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["request_id", "conversation_key"],
+                    "properties": {
+                        "request_id": string,
+                        "conversation_key": string,
+                        "image_url": string,
+                        "image_base64": string,
+                        "mime_type": string,
+                        "caption": string,
+                    },
+                },
             },
             {
                 "name": "create_private_group",
@@ -3255,6 +3392,120 @@ class CloudflareRelay:
                         "code": "requester_not_found",
                         "message": "no requester registered for this conversation",
                     },
+                }
+            )
+        if name == "get_user_images":
+            run = await self._require_run(request_id, conversation_key)
+            image_keys = run.get("image_keys") if isinstance(run.get("image_keys"), list) else []
+            source_message_id = str(run.get("source_message_id") or "").strip()
+            if not image_keys or not source_message_id:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "user_images_missing",
+                            "message": "the current Feishu/Lark message has no image attachment",
+                        },
+                    },
+                    True,
+                )
+            api = self.api_for_conversation(conversation_key)
+            content: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": _json(
+                        {
+                            "success": True,
+                            "request_id": request_id,
+                            "conversation_key": conversation_key,
+                            "image_count": len(image_keys),
+                            "message": "The following image blocks are the user's current attachments.",
+                        }
+                    ),
+                }
+            ]
+            metadata: list[dict[str, Any]] = []
+            try:
+                for image_key in image_keys[:3]:
+                    key = str(image_key or "").strip()
+                    if not key:
+                        continue
+                    data = await api.download_image(source_message_id, key)
+                    if len(data) > 10 * 1024 * 1024:
+                        raise RuntimeError("an attached image exceeds Feishu's 10MB limit")
+                    _filename, mime_type = _image_upload_metadata(
+                        data, filename_prefix="image"
+                    )
+                    metadata.append(
+                        {"image_key": key, "mime_type": mime_type, "size": len(data)}
+                    )
+                    content.append(
+                        {
+                            "type": "image",
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "mimeType": mime_type,
+                        }
+                    )
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "user_image_download_failed",
+                            "message": _safe_error(exc),
+                        },
+                    },
+                    True,
+                )
+            return self._tool_result(
+                {
+                    "success": True,
+                    "request_id": request_id,
+                    "conversation_key": conversation_key,
+                    "images": metadata,
+                },
+                content=content,
+            )
+        if name == "send_image":
+            run = await self._require_run(request_id, conversation_key)
+            source_message_id = str(run.get("source_message_id") or "").strip()
+            if not source_message_id:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "source_message_missing",
+                            "message": "the current relay run has no source message",
+                        },
+                    },
+                    True,
+                )
+            try:
+                data = await self._image_bytes_from_args(args)
+                api = self.api_for_conversation(conversation_key)
+                image_key = await api.upload_message_image(data)
+                outbound_id = await api.reply_image(source_message_id, image_key)
+                await self.state.save_reply(outbound_id, conversation_key)
+                caption = str(args.get("caption") or "").strip()
+                caption_id = None
+                if caption:
+                    caption_id = await api.reply(source_message_id, caption)
+                    await self.state.save_reply(caption_id, conversation_key)
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {"code": "image_send_failed", "message": _safe_error(exc)},
+                    },
+                    True,
+                )
+            return self._tool_result(
+                {
+                    "success": True,
+                    "request_id": request_id,
+                    "conversation_key": conversation_key,
+                    "message_id": outbound_id,
+                    "caption_message_id": caption_id,
                 }
             )
         if name == "create_private_group":
@@ -3653,9 +3904,14 @@ class CloudflareRelay:
         )
 
     @staticmethod
-    def _tool_result(value: dict[str, Any], is_error: bool = False) -> dict[str, Any]:
+    def _tool_result(
+        value: dict[str, Any],
+        is_error: bool = False,
+        *,
+        content: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
-            "content": [{"type": "text", "text": _json(value)}],
+            "content": content or [{"type": "text", "text": _json(value)}],
             "structuredContent": value,
             "isError": is_error,
         }

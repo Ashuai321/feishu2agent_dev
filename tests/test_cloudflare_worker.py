@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import sys
@@ -847,6 +848,89 @@ def test_agent_input_tells_agent_how_to_use_attached_image():
     )
 
     assert "set_avatar_from_stored=true" in input_text
+    assert "get_user_images" in input_text
+
+
+def test_cloudflare_mcp_returns_user_images_as_mcp_image_content():
+    worker = _load_worker_module()
+
+    class FakeState:
+        db = object()
+
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "conversation_key": "feishu:app:chat:1",
+                "source_message_id": "om_source",
+                "image_keys": ["img_v1_user"],
+            }
+
+    class FakeFeishu:
+        async def download_image(self, message_id, image_key):
+            assert (message_id, image_key) == ("om_source", "img_v1_user")
+            return b"\x89PNG\r\n\x1a\nuser-image"
+
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, FakeState())
+    relay.feishu = FakeFeishu()
+    result = asyncio.run(
+        relay.call_tool(
+            "get_user_images",
+            {
+                "request_id": "req_1",
+                "conversation_key": "feishu:app:chat:1",
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["images"][0]["mime_type"] == "image/png"
+    assert result["content"][1]["type"] == "image"
+    assert result["content"][1]["mimeType"] == "image/png"
+
+
+def test_cloudflare_mcp_sends_agent_image_as_a_message_reply():
+    worker = _load_worker_module()
+    image = b"\x89PNG\r\n\x1a\nagent-image"
+
+    class FakeState:
+        db = object()
+
+        async def get_run(self, request_id):
+            return {
+                "request_id": request_id,
+                "conversation_key": "feishu:app:chat:1",
+                "source_message_id": "om_source",
+            }
+
+        async def save_reply(self, outbound_id, conversation_key):
+            self.saved = (outbound_id, conversation_key)
+
+    class FakeFeishu:
+        async def upload_message_image(self, data):
+            assert data == image
+            return "img_v1_outbound"
+
+        async def reply_image(self, message_id, image_key):
+            assert (message_id, image_key) == ("om_source", "img_v1_outbound")
+            return "om_image_reply"
+
+    state = FakeState()
+    relay = worker.CloudflareRelay(SimpleNamespace(), None, state)
+    relay.feishu = FakeFeishu()
+    result = asyncio.run(
+        relay.call_tool(
+            "send_image",
+            {
+                "request_id": "req_1",
+                "conversation_key": "feishu:app:chat:1",
+                "image_base64": base64.b64encode(image).decode("ascii"),
+            },
+        )
+    )
+
+    assert result["isError"] is False
+    assert result["structuredContent"]["message_id"] == "om_image_reply"
+    assert state.saved == ("om_image_reply", "feishu:app:chat:1")
 
 
 def test_worker_config_points_directly_to_python_entrypoint():
@@ -1126,6 +1210,7 @@ def test_cloudflare_mcp_marks_non_mutating_tools_read_only():
         "get_group_info",
         "get_group_status",
         "get_stored_image",
+        "get_user_images",
     }
     assert all(
         not annotations[name].get("readOnlyHint", False)
@@ -1138,6 +1223,7 @@ def test_cloudflare_mcp_marks_non_mutating_tools_read_only():
             "create_private_group",
             "create_group",
             "update_group",
+            "send_image",
         }
     )
 

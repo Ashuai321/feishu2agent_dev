@@ -269,8 +269,13 @@ https://bot.boooe.com/mcp
 `Yuanbo Calendar Manager` 使用同一条飞书交互链路：触发输入会携带
 `request_id` 和 `conversation_key`，Agent 完成日程操作后必须调用 relay MCP 的
 `record_result`，结果才会回到飞书原消息。请在该 Agent 的工具配置中连接上面的
-MCP 地址，并启用日历相关工具；Workspace Agent 的 trigger API 只负责异步入队，
-不会直接返回 Agent 正文。
+MCP 地址，并启用日历相关工具以及 `get_user_images`、`send_image`；Workspace Agent
+的 trigger API 只负责异步入队，不会直接返回 Agent 正文。
+
+图片交互通过 relay MCP 完成：用户发送的图片由 Agent 调用 `get_user_images` 取得为
+MCP 图片内容；Agent 生成或取得图片后，必须调用 `send_image`，传入 HTTPS 图片地址、
+base64 数据或 data URL，Worker 会使用对应的 Feishu/Lark 机器人上传并回复图片。仅在
+最终 Markdown 中放图片链接不会把图片发送到群里。
 
 如果使用 Cloudflare 的 GitHub 自动部署，仓库根目录保持 `/`，生产分支使用 `main`，构建命令留空，部署命令填写 `uv run pywrangler deploy`。D1、Queue 资源和 Worker Secrets 仍需在同一个 Cloudflare 账户中准备好；以后激活 R2 后再把 `AVATARS` 绑定加入配置。
 
@@ -297,8 +302,8 @@ pytest
 
 ## 当前行为与限制
 
-- 只处理群聊 `text` 消息。
-- 私聊、图片、文件、富文本和卡片暂不处理。
+- 机器人只处理群聊消息；Workspace Agent relay 支持文本、图片和带图片的富文本消息。
+- 文件、卡片和私聊消息仍不进入 Agent relay。
 - Bot 或应用身份发送的事件会被忽略，避免消息循环。
 - 使用 `message_id` 做进程内 TTL 去重：默认保留 10 分钟，最多 10,000 项。
 - 处理失败会释放去重记录，以便飞书重推后再次处理。
