@@ -24,6 +24,7 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_NAME = "workspace-agent-relay-mcp-prd"
 PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
+TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
 
 
 def _image_upload_metadata(data: bytes) -> tuple[str, str]:
@@ -1412,6 +1413,12 @@ def _conversation_input(
         body = [
             "Same relay protocol as before: record_plan → record_progress(step_updates) → record_result, using the request_id above.",
             "Keep record_plan user-visible. If the relay tool is unavailable, still call record_progress/record_result so the operator is informed.",
+            (
+                "This is an interactive Feishu turn. Use the connected Feishu/Lark and calendar tools "
+                "to carry out the user's request, then call the relay MCP record_result so the answer "
+                "is returned to the quoted Feishu message."
+            ),
+            f"The relay MCP server is {MCP_NAME} at https://bot.boooe.com{MCP_PATH}; call record_result there before ending the turn.",
             "",
             "User task:",
             text.strip(),
@@ -1424,7 +1431,11 @@ def _conversation_input(
             "After reading the user task, call update_conversation_title once for a new conversation, then record_plan with a user-visible step plan.",
             "After completing several steps, call record_progress with step_updates.",
             "Call record_result exactly once when this turn is truly over: status=done when delivered, status=failed on an execution error, status=blocked only for an external hard blocker.",
-            "Do not only answer in the ChatGPT conversation.",
+            (
+                f"The relay MCP server is {MCP_NAME} at https://bot.boooe.com{MCP_PATH}. "
+                "It is the required Feishu reply channel; do not only answer in the ChatGPT conversation."
+            ),
+            "Use get_requester_info with the conversation_key when the task depends on the person who mentioned the bot.",
             "",
             "User task:",
             text.strip(),
@@ -1772,10 +1783,10 @@ class CloudflareRelay:
             else None
         )
         self.bitable_workflow = BitableGroupWorkflow(self)
-        # Keep AgentRelayWorkflow defined above for a later opt-in, but do not
-        # instantiate it in the current deployment.  The test group must run
-        # only the explicit OAuth-to-Bitable workflow; a fallback to the Agent
-        # queue would incorrectly produce the old “正在处理，Agent…” reply.
+        # The dedicated Bitable test group is handled synchronously below. All
+        # other groups use the Workspace Agent relay, including the calendar
+        # Agent configured by WORKSPACE_AGENT_RELAY_TRIGGER_URL.
+        self.agent_workflow = AgentRelayWorkflow(self)
 
     def api_for_conversation(self, conversation_key: str) -> FeishuAPI:
         """Select the API client from the event's platform-prefixed key."""
@@ -3164,6 +3175,7 @@ class CloudflareRelay:
                         "Authorization": f"Bearer {access_token}",
                         "Content-Type": "application/json",
                         "Idempotency-Key": str(body.get("idempotency_key") or request_id),
+                        "OpenAI-Beta": TRIGGER_RUNS_BETA,
                         "User-Agent": f"{MCP_NAME}/3.0",
                     },
                     json={
@@ -3267,8 +3279,10 @@ class CloudflareRelay:
             if not conversation_key:
                 conversation_key = f"{normalized}:{_env(self.env, f'{prefix}_APP_ID')}:{event['chat_id']}:{secrets.token_hex(6)}"
             request_id = _request_id(normalized)
-            if self.bitable_workflow.is_target_group(event["chat_id"]):
-                await self.state.ensure_schema()
+            # Both the direct Bitable flow and the Agent relay use the same
+            # durable event/run tables. Ensure them before claiming any event,
+            # including messages from non-test groups that enter the Agent path.
+            await self.state.ensure_schema()
             # Feishu rows already use the raw message id. Prefix only Lark
             # dedupe keys so old Feishu state remains readable while the two
             # platforms cannot suppress each other's messages.
@@ -3301,13 +3315,11 @@ class CloudflareRelay:
                     event=event,
                 )
                 return _response({"code": 0})
-            # Agent relay is intentionally disabled for this deployment.  Do
-            # not enqueue, create a placeholder, or mix the unrelated Agent
-            # workflow into a group message while the direct Bitable flow is
-            # being verified.
-            await self.api_for_conversation(f"{normalized}:workflow").reply(
-                str(event["message_id"]),
-                "当前暂时只处理指定测试群的多维表格任务；Agent 流程已暂停。",
+            await self.agent_workflow.handle_event(
+                platform=normalized,
+                conversation_key=conversation_key,
+                event=event,
+                request_id=request_id,
             )
         except Exception as exc:
             # Always acknowledge after validation to avoid an endless Feishu retry

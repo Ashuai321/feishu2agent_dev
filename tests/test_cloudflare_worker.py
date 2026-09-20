@@ -388,6 +388,8 @@ def test_agent_input_uses_text_relay_envelope():
     )
     assert "Completion contract:" in input_text
     assert "User task:\n测试" in input_text
+    assert "https://bot.boooe.com/mcp" in input_text
+    assert "record_result" in input_text
 
 
 def test_agent_input_tells_agent_how_to_use_attached_image():

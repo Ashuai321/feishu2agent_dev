@@ -248,6 +248,12 @@ ChatGPT 连接器的 MCP 地址填写：
 https://bot.boooe.com/mcp
 ```
 
+`Yuanbo Calendar Manager` 使用同一条飞书交互链路：触发输入会携带
+`request_id` 和 `conversation_key`，Agent 完成日程操作后必须调用 relay MCP 的
+`record_result`，结果才会回到飞书原消息。请在该 Agent 的工具配置中连接上面的
+MCP 地址，并启用日历相关工具；Workspace Agent 的 trigger API 只负责异步入队，
+不会直接返回 Agent 正文。
+
 如果使用 Cloudflare 的 GitHub 自动部署，仓库根目录保持 `/`，生产分支使用 `main`，构建命令留空，部署命令填写 `uv run pywrangler deploy`。D1、Queue 资源和 Worker Secrets 仍需在同一个 Cloudflare 账户中准备好；以后激活 R2 后再把 `AVATARS` 绑定加入配置。
 
 ## 测试

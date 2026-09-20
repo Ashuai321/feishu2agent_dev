@@ -22,6 +22,9 @@ REDACTED_SECRET = "[REDACTED]"
 # empirically: same URL/token/payload with this UA returns 202 in ~7-10s, while
 # the default Python-urllib UA hangs for the full 60s timeout.
 TRIGGER_USER_AGENT = "workspace-agent-relay-mcp/1.0 (+https://github.com/envvar/workspace-agent-relay-mcp)"
+# The trigger API is asynchronous.  This beta response field gives the relay
+# an execution id for diagnostics without changing the normal callback flow.
+TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
 
 
 def generate_request_id(prefix: str = "relay") -> str:
@@ -232,6 +235,10 @@ def build_trigger_input(
             "Then call notion-local-ops-mcp.bind_relay_run with this request_id so your tool calls are mirrored to the operator automatically. You do not need to pass a relay_url; it is already configured locally. If notion-local-ops-mcp is unavailable, skip bind_relay_run and still call record_progress/record_result so the operator stays informed.",
             "After completing several steps, call workspace-agent-relay-mcp.record_progress with step_updates to batch-sync step statuses, optionally with a one-line message summarizing what you did.",
             "If you need a human decision to continue, call workspace-agent-relay-mcp.ask_user (the turn pauses; it is NOT finished).",
+            (
+                "This is an interactive Feishu/Lark turn. Use the connected calendar tools to carry out the user's request, "
+                "then call workspace-agent-relay-mcp.record_result so the answer is returned to the quoted message."
+            ),
             "Call workspace-agent-relay-mcp.record_result exactly once when this turn is truly over: status=done when delivered, status=failed on an execution error, status=blocked ONLY for an external hard blocker (missing access/resource/dependency) — never use blocked to mean 'the plan changed' or 'the user gave a new direction'.",
             "Do not only answer in the ChatGPT conversation.",
             "",
@@ -283,6 +290,7 @@ class TriggerClient:
                 "Authorization": f"Bearer {access_token}",
                 "Content-Type": "application/json",
                 "Idempotency-Key": idempotency_key,
+                "OpenAI-Beta": TRIGGER_RUNS_BETA,
                 "User-Agent": TRIGGER_USER_AGENT,
             },
             method="POST",
