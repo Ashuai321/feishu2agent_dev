@@ -6,7 +6,7 @@ R2 billing subscription is activated. Use the deployment instructions in
 [`../README.md`](../README.md); this directory is not a separate Worker project.
 
 The configured test group (`BITABLE_WORKFLOW_GROUP_CHAT_ID`, default
-`oc_5e9132f3638772d53d92d6fc5e953abc`) has a separate path. It accepts the
+`oc_35d72b82857ee2f639d24190c0d6ca2d`) has a separate path. It accepts the
 `[飞书文档]` and `[lark文档]` mode commands, then writes the requester's
 follow-up text to the corresponding target table. The command only selects the
 target document; OAuth is always selected from the requester's actual Feishu or

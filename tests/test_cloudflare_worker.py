@@ -246,7 +246,7 @@ def test_target_group_workflow_uses_the_configured_group_and_platform():
             return "https://bot.boooe.com"
 
     workflow = worker.BitableGroupWorkflow(Relay())
-    assert workflow.is_target_group("oc_5e9132f3638772d53d92d6fc5e953abc") is True
+    assert workflow.is_target_group("oc_35d72b82857ee2f639d24190c0d6ca2d") is True
     assert workflow.is_target_group("oc_other") is False
     assert workflow._auth_base("feishu") == "https://accounts.feishu.cn"
     assert workflow._auth_base("lark") == "https://accounts.larksuite.com"
@@ -380,7 +380,7 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
             conversation_key="feishu:chat:1",
             event={
                 "message_id": "om_source",
-                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "chat_id": "oc_35d72b82857ee2f639d24190c0d6ca2d",
                 "open_id": "ou_requester",
                 "text": "测试任务",
             },
@@ -389,7 +389,7 @@ def test_bitable_group_workflow_builds_platform_specific_authorization_link():
     assert relay.state.pending["platform"] == "feishu"
     assert relay.state.pending["requester_open_id"] == "ou_requester"
     assert relay.api.card_replies[0][0:2] == (
-        "oc_5e9132f3638772d53d92d6fc5e953abc",
+        "oc_35d72b82857ee2f639d24190c0d6ca2d",
         "ou_requester",
     )
     card = relay.api.card_replies[0][2]
@@ -447,14 +447,14 @@ def test_bitable_group_workflow_auth_card_uses_lark_authorization_url():
             conversation_key="feishu:chat:1",
             event={
                 "message_id": "om_source",
-                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "chat_id": "oc_35d72b82857ee2f639d24190c0d6ca2d",
                 "open_id": "ou_requester",
                 "text": "测试任务",
             },
         )
     )
     assert relay.api.card_replies[0][0:2] == (
-        "oc_5e9132f3638772d53d92d6fc5e953abc",
+        "oc_35d72b82857ee2f639d24190c0d6ca2d",
         "ou_requester",
     )
     card = relay.api.card_replies[0][2]
@@ -519,7 +519,7 @@ def test_lark_document_selection_keeps_feishu_requester_on_feishu_oauth():
             conversation_key="feishu:chat:1",
             event={
                 "message_id": "om_source",
-                "chat_id": "oc_5e9132f3638772d53d92d6fc5e953abc",
+                "chat_id": "oc_35d72b82857ee2f639d24190c0d6ca2d",
                 "open_id": "ou_requester",
                 "text": "测试任务",
             },
