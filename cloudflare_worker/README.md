@@ -28,12 +28,8 @@ Configure the HTTP action after the table's `AI 分析` step. Set the request
 body to the AI step's result/response-body variable (Feishu's `+` picker can
 insert it into the JSON body). The callback accepts either that raw value or a
 JSON object and forwards the result as a text message to the configured 小 C
-group (`BITABLE_WORKFLOW_GROUP_CHAT_ID`). When `BITABLE_AUTOMATION_APP_ID` and
-`BITABLE_AUTOMATION_APP_SECRET` are configured, it uses that dedicated Feishu
-bot's tenant token; all other Feishu flows continue using `FEISHU_APP_ID` and
-`FEISHU_APP_SECRET`. If the dedicated credentials are absent, it falls back to
-the existing Feishu bot for backward compatibility. The callback does not use
-or change any user's OAuth state.
+group (`BITABLE_WORKFLOW_GROUP_CHAT_ID`). It uses the Feishu bot's tenant token
+and does not use or change any user's OAuth state.
 
 For a protected callback, set the Worker secret
 `BITABLE_AUTOMATION_WEBHOOK_TOKEN` and add the same value as the

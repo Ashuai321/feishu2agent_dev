@@ -1052,21 +1052,12 @@ class D1State:
 
 
 class FeishuAPI:
-    def __init__(
-        self,
-        env: Any,
-        platform: str = "feishu",
-        *,
-        credential_prefix: str | None = None,
-    ) -> None:
+    def __init__(self, env: Any, platform: str = "feishu") -> None:
         self.env = env
         self.platform = str(platform or "feishu").strip().lower() or "feishu"
         if self.platform not in {"feishu", "lark"}:
             raise ValueError("platform must be feishu or lark")
-        # Most clients use the platform's normal credentials. A dedicated bot
-        # can opt into an independent credential namespace while sharing the
-        # same Feishu API implementation and endpoint behavior.
-        prefix = str(credential_prefix or self.platform.upper()).strip().upper()
+        prefix = self.platform.upper()
         self.base = _env(
             env,
             f"{prefix}_API_BASE",
@@ -2331,19 +2322,6 @@ class CloudflareRelay:
         self.ctx = ctx
         self.state = db_state
         self.feishu = FeishuAPI(env)
-        automation_app_id = str(_env(env, "BITABLE_AUTOMATION_APP_ID", "") or "").strip()
-        automation_app_secret = str(
-            _env(env, "BITABLE_AUTOMATION_APP_SECRET", "") or ""
-        ).strip()
-        # The Bitable automation callback has its own bot identity. Keep the
-        # existing Feishu client as a compatibility fallback when the new bot
-        # secrets are not configured (for local development and old deploys);
-        # production uses the dedicated credentials once both are present.
-        self.bitable_automation_bot = (
-            FeishuAPI(env, "feishu", credential_prefix="BITABLE_AUTOMATION")
-            if automation_app_id and automation_app_secret
-            else self.feishu
-        )
         self.lark = (
             FeishuAPI(env, "lark")
             if _env(env, "LARK_APP_ID") and _env(env, "LARK_APP_SECRET")
@@ -2418,7 +2396,7 @@ class CloudflareRelay:
                 )
                 or BITABLE_WORKFLOW_GROUP_CHAT_ID
             ).strip()
-            message_id = await self.bitable_automation_bot.send_text(chat_id, text)
+            message_id = await self.feishu.send_text(chat_id, text)
             return _response(
                 {
                     "success": True,
