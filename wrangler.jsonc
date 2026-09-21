@@ -10,6 +10,7 @@
     "FEISHU_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access",
     "LARK_OAUTH_REDIRECT_URI": "https://bot.boooe.com/lark/oauth/callback",
     "LARK_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access",
+    "WORKSPACE_AGENT_RELAY_OAUTH_TOKEN_TTL_SECONDS": "315360000",
     "BITABLE_WORKFLOW_GROUP_CHAT_ID": "oc_5e9132f3638772d53d92d6fc5e953abc",
     "LARK_DOCUMENT_WIKI_TOKEN": "UmGRwFFDQiegHckOVh0j0DIrpRc",
     "LARK_DOCUMENT_TABLE_ID": "tblmd8DAQwM00t7B"
