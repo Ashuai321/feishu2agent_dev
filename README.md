@@ -175,8 +175,10 @@ https://bot.boooe.com/bitable/automation/webhook
 ```
 
 请求体可直接选择 AI 分析节点的结果/响应体变量，也可以发送 JSON。Worker 会提取常见
-结果字段并由小 C 发到 `BITABLE_WORKFLOW_GROUP_CHAT_ID` 指定的群。该接口使用机器人租户
-令牌，不会读取或修改用户 OAuth。需要保护入口时，设置
+结果字段并由小 C 发到 `BITABLE_WORKFLOW_GROUP_CHAT_ID` 指定的群。可为该接口单独配置
+`BITABLE_AUTOMATION_APP_ID` 与 `BITABLE_AUTOMATION_APP_SECRET`；配置后只有这个接口使用
+新机器人的租户令牌，其他飞书流程仍使用 `FEISHU_APP_ID`/`FEISHU_APP_SECRET`。未配置时会
+回退到原飞书机器人。该接口不会读取或修改用户 OAuth。需要保护入口时，设置
 `BITABLE_AUTOMATION_WEBHOOK_TOKEN`，并在 HTTP 请求 Headers 中加入同名
 `X-Bitable-Webhook-Token`。
 
@@ -214,6 +216,8 @@ uv run pywrangler deploy
 ```bash
 npx wrangler secret put FEISHU_APP_ID
 npx wrangler secret put FEISHU_APP_SECRET
+npx wrangler secret put BITABLE_AUTOMATION_APP_ID
+npx wrangler secret put BITABLE_AUTOMATION_APP_SECRET
 npx wrangler secret put FEISHU_BOT_OPEN_ID
 npx wrangler secret put FEISHU_VERIFY_TOKEN
 npx wrangler secret put LARK_APP_ID

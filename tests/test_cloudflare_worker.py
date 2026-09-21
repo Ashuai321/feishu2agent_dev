@@ -180,6 +180,58 @@ def test_bitable_automation_webhook_reads_request_body_once(monkeypatch):
     assert result == ({"success": True, "chat_id": worker.BITABLE_WORKFLOW_GROUP_CHAT_ID, "message_id": "om_forwarded"}, 200, None)
 
 
+def test_bitable_automation_webhook_can_use_a_dedicated_bot(monkeypatch):
+    worker = _load_worker_module()
+    responses = []
+    monkeypatch.setattr(
+        worker,
+        "_response",
+        lambda payload, status=200, headers=None: responses.append(
+            (payload, status, headers)
+        )
+        or responses[-1],
+    )
+
+    class Request:
+        method = "POST"
+        headers = {}
+
+        async def text(self):
+            return json.dumps({"result": "专用机器人发送"}, ensure_ascii=False)
+
+    class DedicatedBot:
+        async def send_text(self, chat_id, text):
+            assert chat_id == worker.BITABLE_WORKFLOW_GROUP_CHAT_ID
+            assert text == "[多维表格 AI 分析]\n专用机器人发送"
+            return "om_dedicated"
+
+    relay = worker.CloudflareRelay(
+        SimpleNamespace(
+            BITABLE_WORKFLOW_GROUP_CHAT_ID=worker.BITABLE_WORKFLOW_GROUP_CHAT_ID,
+            BITABLE_AUTOMATION_APP_ID="cli_dedicated",
+            BITABLE_AUTOMATION_APP_SECRET="secret",
+            BITABLE_AUTOMATION_WEBHOOK_TOKEN="",
+        ),
+        None,
+        SimpleNamespace(),
+    )
+    assert relay.bitable_automation_bot.app_id_env == "BITABLE_AUTOMATION_APP_ID"
+    assert relay.bitable_automation_bot.app_secret_env == "BITABLE_AUTOMATION_APP_SECRET"
+    relay.bitable_automation_bot = DedicatedBot()
+
+    result = asyncio.run(relay.bitable_automation_webhook(Request()))
+
+    assert result == (
+        {
+            "success": True,
+            "chat_id": worker.BITABLE_WORKFLOW_GROUP_CHAT_ID,
+            "message_id": "om_dedicated",
+        },
+        200,
+        None,
+    )
+
+
 def test_worker_parses_caption_and_image_post_message():
     worker = _load_worker_module()
     content = {
