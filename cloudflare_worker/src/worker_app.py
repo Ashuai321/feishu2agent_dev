@@ -4084,6 +4084,37 @@ class CloudflareRelay:
         else:
             await self.run_agent_job(body)
 
+    async def _enqueue_feishu_event(self, body: dict[str, Any], platform: str) -> None:
+        """Move full Feishu/Lark event processing out of the webhook request.
+
+        Feishu requires the developer-server acknowledgement within a few
+        seconds.  Queue delivery is the durable hand-off; the local fallback
+        keeps tests and non-Queue development environments functional.
+        """
+        queue = getattr(self.env, "AGENT_QUEUE", None)
+        payload = {
+            "kind": "feishu_event",
+            "platform": platform,
+            "body": body,
+        }
+        if queue is not None:
+            await queue.send(payload)
+            return
+        await self._process_feishu_event(body, platform)
+
+    async def _schedule_feishu_event(self, body: dict[str, Any], platform: str) -> None:
+        """Schedule event processing without delaying the webhook response."""
+        task = self._enqueue_feishu_event(body, platform)
+        waiter = getattr(self.ctx, "wait_until", None) or getattr(
+            self.ctx, "waitUntil", None
+        )
+        if callable(waiter):
+            waiter(task)
+            return
+        # The Cloudflare runtime always exposes wait_until.  Awaiting here is
+        # only a deterministic fallback for local tests/dev harnesses.
+        await task
+
     async def _store_run_images(self, run: dict[str, Any]) -> None:
         """Persist only explicitly attached Feishu images in the optional R2 bucket."""
         image_keys = run.get("image_keys") if isinstance(run.get("image_keys"), list) else []
@@ -4249,6 +4280,13 @@ class CloudflareRelay:
             raise
 
     async def handle_feishu(self, request: Any, platform: str = "feishu") -> Response:
+        """Acknowledge a Feishu/Lark webhook before doing durable work.
+
+        The platform retries when this handler takes longer than its three
+        second request window.  Keep only body parsing, signature/challenge
+        validation, and the bot-id guard on the request path.  All D1, API,
+        reply, and Agent work is handed to the Queue consumer below.
+        """
         normalized = str(platform or "feishu").strip().lower() or "feishu"
         if normalized not in {"feishu", "lark"}:
             return _response({"code": 1, "error": "unsupported_platform"}, status=400)
@@ -4264,11 +4302,24 @@ class CloudflareRelay:
             return _response({"code": 0})
         bot_id = _env(self.env, f"{prefix}_BOT_OPEN_ID")
         if not bot_id:
-            # Do not make a Feishu API call in the webhook request.  A cold
-            # Worker must acknowledge within Feishu's timeout; resolve the
-            # value once with /open-apis/bot/v3/info and store it as a Secret.
+            # Do not make a Feishu API call in the webhook request.  Resolve
+            # the value once with /open-apis/bot/v3/info and store it as a
+            # Secret before enabling message processing.
             print(f"{prefix}_BOT_OPEN_ID is not configured; event ignored")
             return _response({"code": 0})
+        await self._schedule_feishu_event(body, normalized)
+        return _response({"code": 0})
+
+    async def _process_feishu_event(
+        self, body: dict[str, Any], platform: str = "feishu"
+    ) -> None:
+        """Run the former synchronous webhook body in the Queue consumer."""
+        normalized = str(platform or "feishu").strip().lower() or "feishu"
+        prefix = normalized.upper()
+        bot_id = _env(self.env, f"{prefix}_BOT_OPEN_ID")
+        if not bot_id:
+            print(f"{prefix}_BOT_OPEN_ID is not configured; event ignored")
+            return
         try:
             raw_event = body.get("event") if isinstance(body.get("event"), dict) else {}
             raw_message = (
@@ -4382,10 +4433,10 @@ class CloudflareRelay:
                 request_id=request_id,
             )
         except Exception as exc:
-            # Always acknowledge after validation to avoid an endless Feishu retry
-            # storm; the real error is retained in Worker logs.
+            # The webhook has already been acknowledged.  Keep the error in
+            # Worker logs and let Queue retry the message when it escapes.
             print(f"Feishu event processing failed: {_safe_error(exc)}")
-        return _response({"code": 0})
+            raise
 
 
 class Default(WorkerEntrypoint):
@@ -4466,7 +4517,12 @@ class Default(WorkerEntrypoint):
                     message.ack()
                     continue
                 request_id = str(body.get("request_id") or "")
-                if body.get("kind") == "deliver_result":
+                if body.get("kind") == "feishu_event":
+                    await relay._process_feishu_event(
+                        body.get("body") if isinstance(body.get("body"), dict) else {},
+                        str(body.get("platform") or "feishu"),
+                    )
+                elif body.get("kind") == "deliver_result":
                     await relay.deliver_result(request_id)
                 elif body.get("kind") == "deliver_question":
                     await relay.deliver_question(request_id)

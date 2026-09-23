@@ -101,6 +101,65 @@ def test_worker_keeps_image_key_for_queued_r2_storage():
     assert "必要文件" in event["text"]
 
 
+def test_feishu_webhook_ack_schedules_queue_without_running_d1_work():
+    worker = _load_worker_module()
+    worker.Response.json = staticmethod(lambda payload, **kwargs: payload)
+
+    class FakeQueue:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, body):
+            self.messages.append(body)
+
+    class FakeContext:
+        def __init__(self):
+            self.tasks = []
+
+        def wait_until(self, task):
+            self.tasks.append(task)
+
+    class FakeRequest:
+        method = "POST"
+        headers = {}
+        url = "https://example.test/feishu/events"
+
+        async def json(self):
+            return {
+                "header": {"event_type": "im.message.receive_v1"},
+                "event": {
+                    "sender": {"sender_id": {"open_id": "ou_requester"}},
+                    "message": {
+                        "message_id": "om_123",
+                        "chat_id": "oc_123",
+                        "chat_type": "group",
+                        "message_type": "text",
+                        "content": json.dumps({"text": "@_user_bot hello"}),
+                        "mentions": [
+                            {"key": "@_user_bot", "id": {"open_id": "ou_bot"}}
+                        ],
+                    },
+                },
+            }
+
+    queue = FakeQueue()
+    context = FakeContext()
+    relay = worker.CloudflareRelay(
+        types.SimpleNamespace(FEISHU_BOT_OPEN_ID="ou_bot", AGENT_QUEUE=queue),
+        context,
+        types.SimpleNamespace(),
+    )
+    asyncio.run(relay.handle_feishu(FakeRequest(), "feishu"))
+
+    # The HTTP handler only schedules the Queue hand-off.  It must not await
+    # D1/API work before returning the Feishu acknowledgement.
+    assert len(context.tasks) == 1
+    assert queue.messages == []
+    asyncio.run(context.tasks.pop())
+    assert queue.messages[0]["kind"] == "feishu_event"
+    assert queue.messages[0]["platform"] == "feishu"
+
+
 def test_worker_detects_actual_image_format_for_avatar_upload():
     worker = _load_worker_module()
 
