@@ -881,6 +881,78 @@ def test_feishu_requester_is_resolved_in_oauth_app_namespace():
     assert result == {"platform": "feishu", "open_id": "ou_feishu_oauth_app_user"}
 
 
+def test_unresolvable_lark_requester_gets_union_bound_oauth_identity(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class FakeAPI:
+        async def resolve_user_id(self, _identifier, *, user_id_type):
+            raise RuntimeError(f"Lark contact lookup unavailable for {user_id_type}")
+
+    class FakeIdentityRelay:
+        lark = FakeAPI()
+        feishu = None
+
+        async def detect_user_platform(self, _event, _source_platform):
+            return "lark"
+
+    class FakeState:
+        db = object()
+
+    async def no_link(_db, _sql, *_params):
+        return None
+
+    monkeypatch.setattr(worker, "_db_first", no_link)
+    relay.identity_relay = FakeIdentityRelay()
+    relay.state = FakeState()
+    result = asyncio.run(
+        relay._resolve_account_identity(
+            {"open_id": "ou_external_event", "union_id": "on_requester_stable"}
+        )
+    )
+
+    assert result == {
+        "platform": "lark",
+        "open_id": "pending_union:on_requester_stable",
+        "source_union_id": "on_requester_stable",
+    }
+
+
+def test_lark_requester_reuses_oauth_identity_link(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class FakeAPI:
+        async def resolve_user_id(self, *_args, **_kwargs):
+            raise AssertionError("linked user should not need another contact lookup")
+
+    class FakeIdentityRelay:
+        lark = FakeAPI()
+        feishu = None
+
+        async def detect_user_platform(self, _event, _source_platform):
+            return "lark"
+
+    class FakeState:
+        db = object()
+
+    async def linked_identity(_db, sql, *params):
+        assert "xiaot_bitable_identity_links" in sql
+        assert params == ("lark", "on_requester_stable")
+        return {"account_open_id": "ou_lark_oauth_app"}
+
+    monkeypatch.setattr(worker, "_db_first", linked_identity)
+    relay.identity_relay = FakeIdentityRelay()
+    relay.state = FakeState()
+    result = asyncio.run(
+        relay._resolve_account_identity(
+            {"open_id": "ou_external_event", "union_id": "on_requester_stable"}
+        )
+    )
+
+    assert result == {"platform": "lark", "open_id": "ou_lark_oauth_app"}
+
+
 def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch):
     worker = _load_xiaot_module()
     relay = object.__new__(worker.XiaotCloudflareRelay)
@@ -934,21 +1006,26 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
             event=event,
             conversation_key="xiaot:cli_xiaot:oc_group:abc",
             request_id="xiaot_req_1",
-            account_identity={"platform": "lark", "open_id": "ou_lark_canonical"},
+            account_identity={
+                "platform": "lark",
+                "open_id": "ou_lark_canonical",
+                "source_union_id": "on_requester_stable",
+            },
         )
     )
     monkeypatch.setattr(worker, "_db_run", original_db_run)
 
     sql, params = next(item for item in statements if "INSERT INTO xiaot_bitable_oauth_states" in item[0])
-    assert params[2:7] == (
+    assert params[2:8] == (
         "lark",
         "ou_lark_canonical",
+        "on_requester_stable",
         "xiaot_req_1",
         "xiaot:cli_xiaot:oc_group:abc",
         "om_original",
     )
-    assert params[7] == "https://bot.boooe.com/lark/oauth/callback"
-    assert '"text":"查询我的 task"' in params[8]
+    assert params[8] == "https://bot.boooe.com/lark/oauth/callback"
+    assert '"text":"查询我的 task"' in params[9]
     card = replies[0][1]
     auth_url = card["elements"][1]["actions"][0]["url"]
     assert auth_url.startswith("https://accounts.larksuite.com/")
@@ -997,7 +1074,8 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     relay = object.__new__(worker.XiaotCloudflareRelay)
     pending = {
         "platform": "lark",
-        "account_open_id": "ou_lark_verified",
+        "account_open_id": "pending_union:on_requester_stable",
+        "source_union_id": "on_requester_stable",
         "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
         "expires_at": int(worker.time.time()) + 600,
         "event_json": '{"message_id":"om_original","text":"查询 task"}',
@@ -1028,7 +1106,10 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     class FakeAPI:
         async def user_info(self, access_token):
             assert access_token == "lark-user-token"
-            return {"open_id": "ou_lark_verified"}
+            return {
+                "open_id": "ou_lark_verified",
+                "union_id": "on_requester_stable",
+            }
 
     class FakeIdentityRelay:
         env = worker.XiaotLarkOAuthEnvironment(
@@ -1068,12 +1149,15 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
         assert params[1:3] == ("xiaot_lark_nonce", "lark")
         return [{"state": "xiaot_lark_nonce"}]
 
-    async def no_op(_db, _sql, *_params):
+    statements = []
+
+    async def capture_sql(_db, sql, *params):
+        statements.append((sql, params))
         return None
 
     monkeypatch.setattr(worker, "_db_first", lookup)
     monkeypatch.setattr(worker, "_db_all", consume)
-    monkeypatch.setattr(worker, "_db_run", no_op)
+    monkeypatch.setattr(worker, "_db_run", capture_sql)
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: FakeClient())
     monkeypatch.setattr(
         worker,
@@ -1103,6 +1187,10 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     assert exchange_calls[0][1]["data"]["redirect_uri"] == pending["redirect_uri"]
     assert saved_tokens[0]["platform"] == "lark"
     assert saved_tokens[0]["open_id"] == "ou_lark_verified"
+    identity_link = next(
+        item for item in statements if "INSERT INTO xiaot_bitable_identity_links" in item[0]
+    )
+    assert identity_link[1][:3] == ("lark", "on_requester_stable", "ou_lark_verified")
     assert resumed == [
         {
             "platform": "lark",
@@ -1111,6 +1199,102 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
             "request_id": pending["request_id"],
         }
     ]
+
+
+def test_lark_oauth_callback_rejects_different_union_id(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    pending = {
+        "platform": "lark",
+        "account_open_id": "pending_union:on_requester_stable",
+        "source_union_id": "on_requester_stable",
+        "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
+        "expires_at": int(worker.time.time()) + 600,
+        "event_json": '{"message_id":"om_original","text":"查询我的 task"}',
+        "request_id": "xiaot_original_request",
+        "conversation_key": "xiaot:cli_xiaot:oc_group:thread",
+    }
+    saved_tokens = []
+    resumed = []
+    statements = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": {"access_token": "lark-user-token", "expires_in": 3600}}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, **_kwargs):
+            return FakeResponse()
+
+    class FakeAPI:
+        async def user_info(self, _access_token):
+            return {"open_id": "ou_another_user", "union_id": "on_another_user"}
+
+    class FakeIdentityRelay:
+        env = worker.XiaotLarkOAuthEnvironment(
+            SimpleNamespace(XIAOT_LARK_APP_ID="cli_lark_app", XIAOT_LARK_APP_SECRET="secret")
+        )
+
+        def api_for_conversation(self, _conversation_key):
+            return FakeAPI()
+
+    class FakeState:
+        db = object()
+
+        async def save_user_token(self, **kwargs):
+            saved_tokens.append(kwargs)
+
+    class FakeWorkflow:
+        async def handle_event(self, **kwargs):
+            resumed.append(kwargs)
+
+    async def lookup(_db, _sql, *_params):
+        return pending
+
+    async def consume(_db, _sql, *_params):
+        return [{"state": "xiaot_lark_nonce"}]
+
+    async def capture_sql(_db, sql, *params):
+        statements.append((sql, params))
+        return None
+
+    monkeypatch.setattr(worker, "_db_first", lookup)
+    monkeypatch.setattr(worker, "_db_all", consume)
+    monkeypatch.setattr(worker, "_db_run", capture_sql)
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: FakeClient())
+    monkeypatch.setattr(
+        worker,
+        "_response",
+        lambda payload, status=200, headers=None: {
+            "payload": payload,
+            "status": status,
+            "headers": headers or {},
+        },
+    )
+    relay.state = FakeState()
+    relay.identity_relay = FakeIdentityRelay()
+    relay.agent_workflow = FakeWorkflow()
+    relay._ensure_xiaot_oauth_schema = lambda: asyncio.sleep(0)
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/lark/oauth/callback?code=auth-code&state=xiaot_lark_nonce",
+    )
+
+    result = asyncio.run(relay.handle_user_oauth_callback(request, "lark"))
+
+    assert result["status"] == 403
+    assert result["payload"]["error"] == "requester_mismatch"
+    assert saved_tokens == []
+    assert resumed == []
+    assert not any("xiaot_bitable_identity_links" in sql for sql, _ in statements)
 
 
 def test_xiaot_lark_oauth_environment_only_overrides_lark_credentials():
