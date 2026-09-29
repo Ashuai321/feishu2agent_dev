@@ -118,9 +118,11 @@ class XiaotEnvironment:
 
 
 class XiaotLarkOAuthEnvironment:
-    """Use 小T's Lark app for XiaoT identity resolution and OAuth only."""
+    """Use 小T's platform-specific apps for identity resolution and OAuth."""
 
     _aliases = {
+        "FEISHU_APP_ID": "XIAOT_FEISHU_APP_ID",
+        "FEISHU_APP_SECRET": "XIAOT_FEISHU_APP_SECRET",
         "LARK_APP_ID": "XIAOT_LARK_APP_ID",
         "LARK_APP_SECRET": "XIAOT_LARK_APP_SECRET",
     }
@@ -475,9 +477,8 @@ class XiaotCloudflareRelay(CloudflareRelay):
     def __init__(self, env: Any, ctx: Any, db_state: D1State) -> None:
         super().__init__(env, ctx, db_state)
         raw_env = env.raw if isinstance(env, XiaotEnvironment) else env
-        # The XiaoT bot receives/replies to the Feishu group message. Lark
-        # identity resolution and OAuth use XiaoT's own Lark app, while the
-        # existing Feishu user-OAuth app stays unchanged.
+        # The XiaoT Feishu bot receives/replies to the group message. Account
+        # detection and OAuth use XiaoT's own Feishu/Lark apps, never 小C's.
         self.identity_relay = CloudflareRelay(
             XiaotLarkOAuthEnvironment(raw_env), ctx, db_state
         )

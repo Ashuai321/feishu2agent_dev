@@ -1366,28 +1366,36 @@ def test_lark_oauth_callback_rejects_different_union_id(monkeypatch):
     assert not any("xiaot_bitable_identity_links" in sql for sql, _ in statements)
 
 
-def test_xiaot_lark_oauth_environment_only_overrides_lark_credentials():
+def test_xiaot_oauth_environment_only_uses_xiaot_platform_credentials():
     worker = _load_xiaot_module()
     env = worker.XiaotLarkOAuthEnvironment(
         SimpleNamespace(
             FEISHU_APP_ID="cli_feishu_shared",
+            FEISHU_APP_SECRET="shared-feishu-secret",
             LARK_APP_ID="cli_lark_shared",
             LARK_APP_SECRET="shared-secret",
+            XIAOT_FEISHU_APP_ID="cli_feishu_xiaot",
+            XIAOT_FEISHU_APP_SECRET="xiaot-feishu-secret",
             XIAOT_LARK_APP_ID="cli_lark_xiaot",
             XIAOT_LARK_APP_SECRET="xiaot-secret",
         )
     )
 
+    assert env.FEISHU_APP_ID == "cli_feishu_xiaot"
+    assert env.FEISHU_APP_SECRET == "xiaot-feishu-secret"
     assert env.LARK_APP_ID == "cli_lark_xiaot"
     assert env.LARK_APP_SECRET == "xiaot-secret"
-    assert env.FEISHU_APP_ID == "cli_feishu_shared"
 
     unconfigured = worker.XiaotLarkOAuthEnvironment(
         SimpleNamespace(
+            FEISHU_APP_ID="cli_feishu_shared",
+            FEISHU_APP_SECRET="shared-feishu-secret",
             LARK_APP_ID="cli_lark_shared",
             LARK_APP_SECRET="shared-secret",
         )
     )
+    assert unconfigured.FEISHU_APP_ID is None
+    assert unconfigured.FEISHU_APP_SECRET is None
     assert unconfigured.LARK_APP_ID is None
     assert unconfigured.LARK_APP_SECRET is None
 
