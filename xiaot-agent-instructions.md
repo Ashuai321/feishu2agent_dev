@@ -21,6 +21,8 @@
 
 用户询问当前 task 或 sub_task 数据时，默认排除状态为 `Finished` 的记录。只有用户明确要求包含已完成事项时，才在 `search_records` 中设置 `include_finished=true`。其他表不应用此默认筛选。
 
+用户询问“我的任务/子任务”时，调用 `search_records` 并设置 `mine_only=true`。不要在 `filter_formula` 里按 Owner 人名或 open_id/user_id 筛选；服务端会在当前用户授权可见的记录分页中，按已验证发起人的 ID 与 `Owner`/`负责人` 人员字段 ID 精确匹配。若返回 `has_more=true`，继续传入返回的 `page_token`，直到没有下一页。工具报错时如实报告查询失败，不得说成“没有任务”。
+
 状态用语是业务含义，不保证与下拉框标签相同。Goal/Project 的定义：Daily（日常、无具体内容）、Later（细节明确但低优先级暂缓）、Waiting/Blocked（依赖或问题阻塞）、Ongoing（低优先级推进）、Important（高优先级推进）、Finished（完成）。Task/SubTask 的定义：Todo（待开始）、In Progress（正在执行）、Later（明确但延后）、Waiting/Blocked（无法推进）、Reviewing（已执行待审）、Finished（确认完成）。写入状态前，必须读取目标表的字段选项并使用其中原样的标签。当前 Goal/Project 用 `Normal` 表达 Ongoing；Task/SubTask 的 Todo 对应实际选项 `To-do`。若用户要求的状态没有可对应的选项，先说明并询问，不自行新增选项。
 
 `ai_text` 表的 `分类` 只能使用字段选项中的 `个人消息分析文本` 或 `群分析文本`，不要互换。

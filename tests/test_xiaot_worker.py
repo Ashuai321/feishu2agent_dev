@@ -82,6 +82,10 @@ def test_xiaot_dedicated_mcp_has_only_xiaot_tools_and_correct_identity(monkeypat
         "type": "boolean",
         "default": False,
     }
+    assert search["inputSchema"]["properties"]["mine_only"] == {
+        "type": "boolean",
+        "default": False,
+    }
 
     async def no_auth(self, _request, **_kwargs):
         return None
@@ -336,6 +340,157 @@ def test_task_and_subtask_searches_exclude_finished_unless_explicitly_requested(
         'AND(CurrentValue.[Status]!="Finished", CurrentValue.[Owner]="Bo")',
         'CurrentValue.[Owner]="Bo"',
     ]
+
+
+def test_mine_only_search_matches_person_ids_across_pages_and_uses_local_cursor():
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    current_run = {
+        "request_id": "xiaot_req_current",
+        "conversation_key": "xiaot:cli_xiaot:oc_group:current",
+        "input_markdown": "User task:\n查我的任务",
+    }
+
+    async def require_run(args):
+        assert args["request_id"] == current_run["request_id"]
+        assert args["conversation_key"] == current_run["conversation_key"]
+        return current_run
+
+    async def requester_for_run(_request_id, _conversation_key):
+        return {"platform": "feishu", "open_id": "ou_current_user"}
+
+    class FakeState:
+        db = object()
+
+        async def ensure_feishu_oauth_schema(self):
+            return None
+
+        async def user_token(self, platform, open_id):
+            assert (platform, open_id) == ("feishu", "ou_current_user")
+            return {"access_token": "user-token", "expires_at": 4_000_000_000}
+
+    class FakeBitable:
+        def __init__(self):
+            self.calls = []
+
+        async def fields(self, table_key, *, access_token, platform="feishu"):
+            assert table_key == "task"
+            assert access_token == "user-token"
+            assert platform == "feishu"
+            return [
+                {"field_name": "Status", "type": 3},
+                {"field_name": "Owner", "type": 11, "ui_type": "User"},
+            ]
+
+        async def records(
+            self,
+            table_key,
+            *,
+            access_token,
+            platform="feishu",
+            page_size,
+            page_token,
+            filter_formula,
+        ):
+            assert table_key == "task"
+            assert access_token == "user-token"
+            assert platform == "feishu"
+            assert page_size == 500
+            assert filter_formula == 'CurrentValue.[Status]!="Finished"'
+            self.calls.append(page_token)
+            if not page_token:
+                return {
+                    "items": [
+                        {
+                            "record_id": "rec_other",
+                            "fields": {
+                                "Task ID": "T680",
+                                "Task Name": "文帅-同名但不是本人",
+                                "Status": "To-do",
+                                "Owner": [{"id": "ou_other_user", "name": "文帅"}],
+                            },
+                        },
+                        {
+                            "record_id": "rec_first_owned",
+                            "fields": {
+                                "Task ID": "T681",
+                                "Task Name": "文帅-测试",
+                                "Status": "Waiting/Blocked",
+                                "Owner": [{"id": "ou_current_user", "name": "文帅"}],
+                            },
+                        },
+                    ],
+                    "has_more": True,
+                    "page_token": "api-page-2",
+                }
+            assert page_token == "api-page-2"
+            return {
+                "items": [
+                    {
+                        "record_id": "rec_second_owned",
+                        "fields": {
+                            "Task ID": "T700",
+                            "Task Name": "本人第二项",
+                            "Status": "In Progress",
+                            "Owner": [{"id": "ou_current_user", "name": "其他显示名"}],
+                        },
+                    },
+                    {
+                        "record_id": "rec_same_name",
+                        "fields": {
+                            "Task ID": "T701",
+                            "Task Name": "其他人的同名任务",
+                            "Status": "To-do",
+                            "Owner": [{"id": "ou_other_user", "name": "文帅"}],
+                        },
+                    },
+                ],
+                "has_more": False,
+                "page_token": "",
+            }
+
+    relay.state = FakeState()
+    relay.xiaot_bitable = FakeBitable()
+    relay._require_xiaot_run = require_run
+    relay._requester_for_run = requester_for_run
+
+    async def scenario():
+        first = await relay.call_tool(
+            "search_records",
+            {
+                "request_id": current_run["request_id"],
+                "conversation_key": current_run["conversation_key"],
+                "table_key": "task",
+                "mine_only": True,
+                "page_size": 1,
+            },
+        )
+        assert first["structuredContent"].get("success") is True, first
+        second = await relay.call_tool(
+            "search_records",
+            {
+                "request_id": current_run["request_id"],
+                "conversation_key": current_run["conversation_key"],
+                "table_key": "task",
+                "mine_only": True,
+                "page_size": 1,
+                "page_token": first["structuredContent"]["page_token"],
+            },
+        )
+        return first["structuredContent"], second["structuredContent"]
+
+    first, second = asyncio.run(scenario())
+
+    assert first["success"] is True
+    assert first["mine_only"] is True
+    assert [item["record_id"] for item in first["items"]] == ["rec_first_owned"]
+    assert first["has_more"] is True
+    assert first["page_token"] == "xiaot-owner:1"
+    assert second["success"] is True
+    assert [item["record_id"] for item in second["items"]] == ["rec_second_owned"]
+    assert second["has_more"] is False
+    assert second["page_token"] == ""
+    assert relay.xiaot_bitable.calls == ["", "api-page-2", "", "api-page-2"]
 
 
 def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():

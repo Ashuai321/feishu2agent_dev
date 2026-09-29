@@ -431,6 +431,15 @@ class XiaotAgentRelayWorkflow:
                     "Finished records."
                 ),
                 (
+                    "For a request about the current user's own tasks or subtasks, call "
+                    "search_records with mine_only=true. Do not filter Owner in filter_formula "
+                    "and do not match the person's display name. The service compares the "
+                    "Owner/负责人 person-field ID to the verified requester's ID while paging "
+                    "through records visible to that user's authorization. Continue with the "
+                    "returned page_token until has_more is false. If a search tool returns an "
+                    "error, report the search failure; never describe it as zero matching tasks."
+                ),
+                (
                     "When a user replies with a clear confirmation to a pending proposal, call "
                     "confirm_mutation first using the pending proposal_id. Do not start a new "
                     "proposal or re-read fields first; the service rechecks the target record and "
@@ -498,6 +507,89 @@ class XiaotCloudflareRelay(CloudflareRelay):
 
     def memory_scope(self) -> str:
         return XIAOT_AGENT_SCOPE
+
+    @staticmethod
+    def _record_owned_by(
+        record: dict[str, Any], *, owner_field: str, requester_open_id: str
+    ) -> bool:
+        fields = record.get("fields") if isinstance(record.get("fields"), dict) else {}
+        owners = fields.get(owner_field)
+        if isinstance(owners, dict):
+            owners = [owners]
+        if not isinstance(owners, list):
+            return False
+        return any(
+            isinstance(owner, dict)
+            and str(owner.get("id") or "").strip() == requester_open_id
+            for owner in owners
+        )
+
+    @staticmethod
+    def _owner_page_offset(page_token: str) -> int:
+        if not page_token:
+            return 0
+        match = re.fullmatch(r"xiaot-owner:(\d+)", page_token)
+        if not match:
+            raise ValueError(
+                "mine_only 查询的 page_token 必须使用上一页返回的人员筛选游标"
+            )
+        offset = int(match.group(1))
+        if offset > 1_000_000:
+            raise ValueError("mine_only 查询游标超出允许范围")
+        return offset
+
+    async def _search_records_owned_by_requester(
+        self,
+        *,
+        table_key: str,
+        access_token: str,
+        platform: str,
+        owner_field: str,
+        requester_open_id: str,
+        page_size: int,
+        page_token: str,
+        filter_formula: str,
+    ) -> dict[str, Any]:
+        """Filter person-field IDs after reading each permission-visible API page."""
+        offset = self._owner_page_offset(page_token)
+        matches: list[dict[str, Any]] = []
+        api_page_token = ""
+        has_more_matches = False
+
+        while True:
+            data = await self.xiaot_bitable.records(
+                table_key,
+                access_token=access_token,
+                platform=platform,
+                page_size=500,
+                page_token=api_page_token,
+                filter_formula=filter_formula,
+            )
+            items = data.get("items") or []
+            for item in items:
+                if self._record_owned_by(
+                    item,
+                    owner_field=owner_field,
+                    requester_open_id=requester_open_id,
+                ):
+                    matches.append(item)
+                    if len(matches) > offset + page_size:
+                        has_more_matches = True
+                        break
+            if has_more_matches or not data.get("has_more"):
+                break
+            next_token = str(data.get("page_token") or "")
+            if not next_token or next_token == api_page_token:
+                raise RuntimeError("多维表格分页未返回有效 page_token")
+            api_page_token = next_token
+
+        items = matches[offset : offset + page_size]
+        next_page_token = f"xiaot-owner:{offset + page_size}" if has_more_matches else ""
+        return {
+            "items": items,
+            "has_more": has_more_matches,
+            "page_token": next_page_token,
+        }
 
     async def run_agent_job(self, body: dict[str, Any]) -> None:
         request_id = str(body.get("request_id") or "")
@@ -1285,6 +1377,8 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 "description": (
                     "查询允许表中的记录，支持 Feishu Bitable filter formula 和分页。"
                     "task/sub_task 默认排除 Status=Finished；仅用户明确要求时设置 include_finished=true。"
+                    "查询‘我的任务/子任务’时设置 mine_only=true；服务端按当前发起人的人员字段 ID 精确匹配，"
+                    "不要在 filter_formula 中按 Owner 人名或用户 ID 筛选。"
                 ),
                     "inputSchema": {
                         "type": "object",
@@ -1297,6 +1391,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
                             "page_token": string,
                             "filter_formula": string,
                             "include_finished": {"type": "boolean", "default": False},
+                            "mine_only": {"type": "boolean", "default": False},
                         },
                     },
                     "annotations": {"readOnlyHint": True},
@@ -1440,20 +1535,47 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 table_key = str(args.get("table_key") or "")
                 filter_formula = str(args.get("filter_formula") or "")
                 include_finished = args.get("include_finished") is True
-                if table_key.lower().replace("-", "_").replace(" ", "_") in {
+                normalized_table_key = table_key.lower().replace("-", "_").replace(" ", "_")
+                mine_only = args.get("mine_only") is True
+                is_task_table = normalized_table_key in {
                     "task",
                     "sub_task",
                     "subtask",
-                } and not include_finished:
+                }
+                if mine_only and not is_task_table:
+                    raise ValueError("mine_only 仅支持 task 和 sub_task 表")
+                schema = None
+                if mine_only or (is_task_table and not include_finished):
                     schema = await self.xiaot_bitable.fields(
                         table_key,
                         access_token=access_token,
                         platform=(requester or {}).get("platform", "feishu"),
                     )
+                if mine_only:
+                    owner_field = next(
+                        (
+                            str(item.get("field_name") or "")
+                            for item in schema or []
+                            if str(item.get("field_name") or "").strip().casefold()
+                            in {"owner", "负责人"}
+                            and (
+                                str(item.get("ui_type") or "").strip().casefold() == "user"
+                                or item.get("type") == 11
+                            )
+                        ),
+                        "",
+                    )
+                    if not owner_field:
+                        raise RuntimeError(
+                            f"{table_key} 表中没有可用于精确匹配当前发起人的 Owner/负责人人员字段"
+                        )
+                    if not requester or not requester.get("open_id"):
+                        raise RuntimeError("当前请求没有已验证的发起人 ID，无法查询本人任务")
+                if is_task_table and not include_finished:
                     status_field = next(
                         (
                             str(item.get("field_name") or "")
-                            for item in schema
+                            for item in schema or []
                             if str(item.get("field_name") or "").strip().casefold()
                             in {"status", "状态"}
                         ),
@@ -1470,18 +1592,32 @@ class XiaotCloudflareRelay(CloudflareRelay):
                         if filter_formula
                         else finished_filter
                     )
-                data = await self.xiaot_bitable.records(
-                    table_key,
-                    access_token=access_token,
-                    platform=(requester or {}).get("platform", "feishu"),
-                    page_size=int(args.get("page_size") or 100),
-                    page_token=str(args.get("page_token") or ""),
-                    filter_formula=filter_formula,
-                )
+                requested_page_size = max(1, min(int(args.get("page_size") or 100), 500))
+                if mine_only:
+                    data = await self._search_records_owned_by_requester(
+                        table_key=table_key,
+                        access_token=access_token,
+                        platform=(requester or {}).get("platform", "feishu"),
+                        owner_field=owner_field,
+                        requester_open_id=str((requester or {}).get("open_id") or ""),
+                        page_size=requested_page_size,
+                        page_token=str(args.get("page_token") or ""),
+                        filter_formula=filter_formula,
+                    )
+                else:
+                    data = await self.xiaot_bitable.records(
+                        table_key,
+                        access_token=access_token,
+                        platform=(requester or {}).get("platform", "feishu"),
+                        page_size=requested_page_size,
+                        page_token=str(args.get("page_token") or ""),
+                        filter_formula=filter_formula,
+                    )
                 return result(
                     {
                         "success": True,
                         "table_key": args.get("table_key"),
+                        "mine_only": mine_only,
                         "items": data.get("items") or [],
                         "has_more": bool(data.get("has_more")),
                         "page_token": data.get("page_token") or "",
