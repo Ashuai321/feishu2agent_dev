@@ -21,7 +21,7 @@ PUBLIC_BASE_URL = "https://bot.boooe.com"
 FEISHU_AUTH_BASE_URL = "https://accounts.feishu.cn"
 MCP_PATH = "/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-MCP_NAME = "workspace-agent-relay-mcp-prd"
+MCP_NAME = "workspace-agent-relay-mcp-dev"
 PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
 TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
@@ -4441,9 +4441,13 @@ class CloudflareRelay:
 
 class Default(WorkerEntrypoint):
     async def fetch(self, request: Any) -> Response:
+        # This is the DEV build: the shared MCP exposes Xiao C and Xiao T
+        # tools, while conversation keys keep their routing isolated.
+        from xiaot_worker import CombinedCloudflareRelay
+
         url = urlparse(request.url)
         state = D1State(self.env.DB)
-        relay = CloudflareRelay(self.env, self.ctx, state)
+        relay = CombinedCloudflareRelay(self.env, self.ctx, state)
         path = url.path
         if path == "/health" and request.method == "GET":
             return _response(
@@ -4463,6 +4467,7 @@ class Default(WorkerEntrypoint):
                     "endpoints": [
                         BITABLE_AUTOMATION_WEBHOOK_PATH,
                         "/feishu/events",
+                        "/xiaot/feishu/events",
                         "/feishu/oauth/authorize",
                         "/feishu/oauth/callback",
                         "/lark/events",
@@ -4491,6 +4496,8 @@ class Default(WorkerEntrypoint):
                 status=405,
                 headers={"allow": "POST"},
             )
+        if path in {"/xiaot/feishu/events", "/xiaot/feishu/event"}:
+            return await relay.xiaot.handle_xiaot_event(request)
         if path.startswith("/.well-known/") or path.startswith("/oauth/"):
             return await relay.oauth(request, path)
         if path == MCP_PATH:
@@ -4498,6 +4505,8 @@ class Default(WorkerEntrypoint):
         return _response({"error": "not_found"}, 404)
 
     async def queue(self, batch: Any, env: Any = None, ctx: Any = None) -> None:
+        from xiaot_worker import CombinedCloudflareRelay
+
         # The deployed Python Workers runtime invokes Queue handlers with
         # (self, batch, env, ctx).  Some runtime versions leave the explicit
         # env/ctx arguments as None while still exposing them on the
@@ -4507,7 +4516,7 @@ class Default(WorkerEntrypoint):
         if runtime_env is None:
             raise RuntimeError("Queue consumer did not receive a Worker environment")
         state = D1State(runtime_env.DB)
-        relay = CloudflareRelay(runtime_env, runtime_ctx, state)
+        relay = CombinedCloudflareRelay(runtime_env, runtime_ctx, state)
         for message in batch.messages:
             request_id = ""
             try:
@@ -4518,14 +4527,30 @@ class Default(WorkerEntrypoint):
                     continue
                 request_id = str(body.get("request_id") or "")
                 if body.get("kind") == "feishu_event":
-                    await relay._process_feishu_event(
-                        body.get("body") if isinstance(body.get("body"), dict) else {},
-                        str(body.get("platform") or "feishu"),
-                    )
+                    platform = str(body.get("platform") or "feishu")
+                    event_body = body.get("body") if isinstance(body.get("body"), dict) else {}
+                    if platform == "xiaot":
+                        await relay.xiaot._process_feishu_event(event_body, platform)
+                    else:
+                        await relay._process_feishu_event(event_body, platform)
                 elif body.get("kind") == "deliver_result":
-                    await relay.deliver_result(request_id)
+                    run = await state.get_run(request_id)
+                    target = (
+                        relay.xiaot
+                        if str((run or {}).get("conversation_key", "")).startswith("xiaot:")
+                        else relay
+                    )
+                    await target.deliver_result(request_id)
                 elif body.get("kind") == "deliver_question":
-                    await relay.deliver_question(request_id)
+                    run = await state.get_run(request_id)
+                    target = (
+                        relay.xiaot
+                        if str((run or {}).get("conversation_key", "")).startswith("xiaot:")
+                        else relay
+                    )
+                    await target.deliver_question(request_id)
+                elif str((await state.get_run(request_id) or {}).get("conversation_key", "")).startswith("xiaot:"):
+                    await relay.xiaot.run_agent_job(body)
                 else:
                     await relay.run_agent_job(body)
                 message.ack()

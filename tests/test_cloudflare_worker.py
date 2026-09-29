@@ -879,7 +879,7 @@ def test_agent_input_uses_text_relay_envelope():
     assert input_text.startswith(
         "request_id: req_1\n"
         "conversation_key: feishu:app:chat:1\n"
-        "relay_mcp: workspace-agent-relay-mcp-prd\n"
+        "relay_mcp: workspace-agent-relay-mcp-dev\n"
         "protocol: local-agent-shell/v1\n"
         "turn_mode: initial\n"
     )
