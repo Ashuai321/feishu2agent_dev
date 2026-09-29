@@ -795,6 +795,140 @@ def test_duplicate_queue_delivery_claims_xiaot_run_before_processing_reply():
     assert run["status"] == "dispatching"
 
 
+def test_xiaot_trigger_metadata_records_only_the_workspace_agent_run_id(monkeypatch):
+    worker = _load_xiaot_module()
+    captured = []
+
+    async def capture_sql(_db, sql, *params):
+        captured.append((sql, params))
+
+    class FakeResponse:
+        def json(self):
+            return {
+                "conversation_url": "https://chatgpt.com/c/private-conversation",
+                "agent_trigger_run_id": "apirun_123abc",
+            }
+
+    monkeypatch.setattr(worker, "_db_run", capture_sql)
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.state = SimpleNamespace(db=object())
+
+    asyncio.run(
+        relay._record_agent_trigger_metadata(
+            "xiaot_req_1",
+            "https://api.chatgpt.com/v1/workspace_agents/agtch_123abc/trigger",
+            FakeResponse(),
+        )
+    )
+
+    insert = next(
+        item for item in captured if "INSERT INTO xiaot_agent_trigger_runs" in item[0]
+    )
+    assert insert[1][:3] == ("xiaot_req_1", "agtch_123abc", "apirun_123abc")
+    assert all("private-conversation" not in str(item) for item in captured)
+
+
+def test_xiaot_run_context_polls_workspace_agent_and_redacts_token(monkeypatch):
+    worker = _load_xiaot_module()
+    db_updates = []
+    requested = []
+    record = {
+        "request_id": "xiaot_req_failed",
+        "api_trigger_id": "agtch_123abc",
+        "agent_trigger_run_id": "apirun_123abc",
+        "status": "accepted",
+        "error_code": "",
+        "error_message": "",
+        "updated_at": 100,
+    }
+
+    async def capture_sql(_db, sql, *params):
+        db_updates.append((sql, params))
+
+    async def find_record(_db, sql, *params):
+        assert "xiaot_agent_trigger_runs" in sql
+        assert params == ("xiaot_req_failed",)
+        return dict(record)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "status": "failed",
+                "error": {
+                    "code": "run_failed",
+                    "message": "agent failed while handling token-value",
+                },
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, *, headers):
+            requested.append((url, headers))
+            return FakeResponse()
+
+    class FakeState:
+        db = object()
+
+        async def recent_runs(self, conversation_key, limit):
+            assert conversation_key == "xiaot:app:group:123"
+            assert limit == 5
+            return [
+                {
+                    "request_id": "xiaot_req_failed",
+                    "status": "triggered",
+                    "created_at": 100,
+                }
+            ]
+
+    monkeypatch.setattr(worker, "_db_run", capture_sql)
+    monkeypatch.setattr(worker, "_db_first", find_record)
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: FakeClient())
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.env = worker.XiaotEnvironment(
+        SimpleNamespace(
+            XIAOT_AGENT_TRIGGER_URL=(
+                "https://api.chatgpt.com/v1/workspace_agents/agtch_123abc/trigger"
+            ),
+            XIAOT_AGENT_ACCESS_TOKEN="token-value",
+        )
+    )
+    relay.state = FakeState()
+
+    result = asyncio.run(relay._xiaot_run_context("xiaot:app:group:123", 5))
+
+    execution = result["runs"][0]["agent_execution"]
+    assert execution["status"] == "failed"
+    assert execution["error_code"] == "run_failed"
+    assert execution["error_message"] == "agent failed while handling [REDACTED]"
+    assert requested[0][0] == (
+        "https://api.chatgpt.com/v1/workspace_agents/agtch_123abc/runs/apirun_123abc"
+    )
+    assert requested[0][1]["Authorization"] == "Bearer token-value"
+    assert any("UPDATE xiaot_agent_trigger_runs" in sql for sql, _ in db_updates)
+
+
+def test_xiaot_agent_run_status_url_rejects_non_https_trigger():
+    worker = _load_xiaot_module()
+
+    try:
+        worker.XiaotCloudflareRelay._agent_run_status_url(
+            "http://api.chatgpt.com/v1/workspace_agents/agtch_123/trigger",
+            "agtch_123",
+            "apirun_123",
+        )
+    except ValueError as exc:
+        assert "HTTPS" in str(exc)
+    else:
+        raise AssertionError("non-HTTPS status URL was accepted")
+
+
 def test_audit_note_records_operation_target_and_status():
     worker = _load_xiaot_module()
     note = worker.XiaotCloudflareRelay._audit_note(

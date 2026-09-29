@@ -4181,6 +4181,18 @@ class CloudflareRelay:
             await self.state.update_run(
                 request_id, status="triggered", trigger_status=response.status_code
             )
+            # XiaoT needs provider run IDs for diagnosis. Do not invoke its
+            # optional hook for the existing XiaoC route.
+            if str(run.get("conversation_key") or "").startswith("xiaot:"):
+                try:
+                    await self._record_agent_trigger_metadata(
+                        request_id, trigger_url, response
+                    )
+                except Exception as exc:
+                    print(
+                        "agent trigger metadata was not recorded: "
+                        + _safe_error(exc, access_token)
+                    )
         except Exception as exc:
             message = _safe_error(exc, _env(self.env, "WORKSPACE_AGENT_RELAY_AGENT_TOKEN"))
             await self.state.update_run(
@@ -4193,6 +4205,12 @@ class CloudflareRelay:
                 completed_at=_now(),
             )
             await self.deliver_result(request_id)
+
+    async def _record_agent_trigger_metadata(
+        self, request_id: str, trigger_url: str, response: Any
+    ) -> None:
+        """Optional provider-specific hook; default relays remain unchanged."""
+        return None
 
     async def deliver_result(self, request_id: str) -> None:
         run = await self.state.get_run(request_id)

@@ -525,6 +525,214 @@ class XiaotCloudflareRelay(CloudflareRelay):
         # the Agent, preventing duplicate placeholders on concurrent retries.
         await super().run_agent_job(body)
 
+    async def _ensure_xiaot_agent_run_schema(self) -> None:
+        await _db_run(
+            self.state.db,
+            """CREATE TABLE IF NOT EXISTS xiaot_agent_trigger_runs (
+                request_id TEXT PRIMARY KEY,
+                api_trigger_id TEXT NOT NULL DEFAULT '',
+                agent_trigger_run_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'accepted',
+                error_code TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )""",
+        )
+
+    async def _record_agent_trigger_metadata(
+        self, request_id: str, trigger_url: str, response: Any
+    ) -> None:
+        """Store only the XiaoT API run identifier needed for status polling."""
+        await self._ensure_xiaot_agent_run_schema()
+        payload: dict[str, Any] = {}
+        try:
+            decoded = response.json()
+            if isinstance(decoded, dict):
+                payload = decoded
+        except Exception:
+            pass
+        agent_run_id = str(payload.get("agent_trigger_run_id") or "").strip()
+        if not re.fullmatch(r"apirun_[A-Za-z0-9_-]{1,200}", agent_run_id):
+            agent_run_id = ""
+        parsed = urlparse(trigger_url)
+        trigger_match = re.search(
+            r"/v1/workspace_agents/([^/]+)/trigger/?$", parsed.path
+        )
+        api_trigger_id = trigger_match.group(1) if trigger_match else ""
+        if not re.fullmatch(r"agtch_[A-Za-z0-9_-]{1,200}", api_trigger_id):
+            api_trigger_id = ""
+        await _db_run(
+            self.state.db,
+            """INSERT INTO xiaot_agent_trigger_runs
+               (request_id, api_trigger_id, agent_trigger_run_id, status,
+                error_code, error_message, updated_at)
+               VALUES (?, ?, ?, 'accepted', '', '', ?)
+               ON CONFLICT(request_id) DO UPDATE SET
+                 api_trigger_id=excluded.api_trigger_id,
+                 agent_trigger_run_id=excluded.agent_trigger_run_id,
+                 status='accepted', error_code='', error_message='',
+                 updated_at=excluded.updated_at""",
+            request_id,
+            api_trigger_id,
+            agent_run_id,
+            int(time.time()),
+        )
+
+    @staticmethod
+    def _agent_run_status_url(trigger_url: str, api_trigger_id: str, run_id: str) -> str:
+        parsed = urlparse(trigger_url)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("小 T Agent trigger URL must use HTTPS")
+        if not re.fullmatch(r"agtch_[A-Za-z0-9_-]{1,200}", api_trigger_id):
+            raise ValueError("小 T Agent trigger ID is missing or invalid")
+        if not re.fullmatch(r"apirun_[A-Za-z0-9_-]{1,200}", run_id):
+            raise ValueError("小 T Agent run ID is missing or invalid")
+        return parsed._replace(
+            path=f"/v1/workspace_agents/{api_trigger_id}/runs/{run_id}",
+            params="",
+            query="",
+            fragment="",
+        ).geturl()
+
+    async def _poll_xiaot_agent_run(self, record: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(record.get("request_id") or "")
+        run_id = str(record.get("agent_trigger_run_id") or "")
+        api_trigger_id = str(record.get("api_trigger_id") or "")
+        result: dict[str, Any] = {
+            "agent_trigger_run_id": run_id or None,
+            "status": str(record.get("status") or "accepted"),
+            "error_code": str(record.get("error_code") or "") or None,
+            "error_message": str(record.get("error_message") or "") or None,
+            "updated_at": record.get("updated_at"),
+        }
+        if not run_id:
+            result["error_code"] = result["error_code"] or "run_id_not_returned"
+            return result
+        if result["status"] in {"completed", "failed"}:
+            return result
+        trigger_url = _env(self.env, "WORKSPACE_AGENT_RELAY_TRIGGER_URL")
+        access_token = _env(self.env, "WORKSPACE_AGENT_RELAY_AGENT_TOKEN")
+        if not access_token:
+            result["error_code"] = "agent_access_token_missing"
+            return result
+        try:
+            status_url = self._agent_run_status_url(
+                trigger_url, api_trigger_id, run_id
+            )
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.get(
+                    status_url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "User-Agent": f"{self.mcp_name()}/3.0",
+                    },
+                )
+            payload: dict[str, Any] = {}
+            try:
+                decoded = response.json()
+                if isinstance(decoded, dict):
+                    payload = decoded
+            except Exception:
+                pass
+            if response.status_code < 200 or response.status_code >= 300:
+                error = payload.get("error")
+                error_code = (
+                    str(error.get("code") or "")
+                    if isinstance(error, dict)
+                    else ""
+                ) or f"status_api_http_{response.status_code}"
+                error_message = (
+                    str(error.get("message") or "")
+                    if isinstance(error, dict)
+                    else ""
+                )
+                result["error_code"] = error_code
+                result["error_message"] = _safe_error(
+                    error_message, access_token
+                )[:500] or None
+                return result
+            status = str(payload.get("status") or "").strip()
+            if status not in {
+                "queued",
+                "in_progress",
+                "suspended",
+                "completed",
+                "failed",
+            }:
+                result["error_code"] = "unexpected_status_response"
+                return result
+            error = payload.get("error")
+            error_code = (
+                str(error.get("code") or "") if isinstance(error, dict) else ""
+            )
+            error_message = (
+                str(error.get("message") or "") if isinstance(error, dict) else ""
+            )
+            error_message = _safe_error(error_message, access_token)[:500]
+            updated_at = int(time.time())
+            await _db_run(
+                self.state.db,
+                """UPDATE xiaot_agent_trigger_runs
+                   SET status = ?, error_code = ?, error_message = ?, updated_at = ?
+                   WHERE request_id = ?""",
+                status,
+                error_code,
+                error_message,
+                updated_at,
+                request_id,
+            )
+            result.update(
+                {
+                    "status": status,
+                    "error_code": error_code or None,
+                    "error_message": error_message or None,
+                    "updated_at": updated_at,
+                }
+            )
+            return result
+        except Exception as exc:
+            result["error_code"] = "status_api_request_failed"
+            result["error_message"] = _safe_error(exc, access_token)[:500]
+            return result
+
+    async def _xiaot_run_context(self, conversation_key: str, limit: int) -> dict[str, Any]:
+        rows = await self.state.recent_runs(conversation_key, limit)
+        await self._ensure_xiaot_agent_run_schema()
+        for index, row in enumerate(rows):
+            metadata = await _db_first(
+                self.state.db,
+                "SELECT request_id, api_trigger_id, agent_trigger_run_id, status, "
+                "error_code, error_message, updated_at "
+                "FROM xiaot_agent_trigger_runs WHERE request_id = ?",
+                str(row.get("request_id") or ""),
+            )
+            if not metadata:
+                row["agent_execution"] = {"status": "not_recorded"}
+                continue
+            created_at = int(row.get("created_at") or 0)
+            is_settled = time.time() - created_at >= 15
+            should_poll = (
+                index == 0
+                and is_settled
+                and str(metadata.get("status") or "")
+                not in {"completed", "failed"}
+            )
+            if should_poll:
+                row["agent_execution"] = await self._poll_xiaot_agent_run(metadata)
+            else:
+                row["agent_execution"] = {
+                    "agent_trigger_run_id": metadata.get("agent_trigger_run_id") or None,
+                    "status": metadata.get("status") or "accepted",
+                    "error_code": metadata.get("error_code") or None,
+                    "error_message": metadata.get("error_message") or None,
+                    "updated_at": metadata.get("updated_at"),
+                }
+        return {
+            "success": True,
+            "conversation_key": conversation_key,
+            "runs": rows,
+        }
+
     async def _ensure_xiaot_oauth_schema(self) -> None:
         await self.state.ensure_feishu_oauth_schema()
         await _db_run(
@@ -1149,6 +1357,26 @@ class XiaotCloudflareRelay(CloudflareRelay):
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name in _RELAY_TOOLS:
+            if name == "get_run_context":
+                conversation_key = str(args.get("conversation_key") or "")
+                if not conversation_key.startswith("xiaot:"):
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "wrong_agent_context",
+                                "message": "小 T run context requires a 小 T Feishu conversation.",
+                            },
+                        },
+                        True,
+                    )
+                try:
+                    limit = max(1, min(int(args.get("limit", 5)), 20))
+                except (TypeError, ValueError):
+                    limit = 5
+                return self._tool_result(
+                    await self._xiaot_run_context(conversation_key, limit)
+                )
             if name in {
                 "record_plan",
                 "record_progress",
