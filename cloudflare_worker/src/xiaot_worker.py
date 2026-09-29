@@ -440,8 +440,11 @@ class XiaotAgentRelayWorkflow:
                     "error, report the search failure; never describe it as zero matching tasks."
                 ),
                 (
-                    "When a user replies with a clear confirmation to a pending proposal, call "
-                    "confirm_mutation first using the pending proposal_id. Do not start a new "
+                    "When a user replies affirmatively to a pending proposal, call "
+                    "confirm_mutation first using the pending proposal_id. Common clear "
+                    "affirmations include 行, 好/好的, ok/okay, 可以, 执行, 开始/开始执行, "
+                    "没问题, 同意, and similar short positive replies. A refusal, uncertainty, "
+                    "or request to change the proposal is not confirmation. Do not start a new "
                     "proposal or re-read fields first; the service rechecks the target record and "
                     "sender before writing. If proposal_id is unavailable, omit it and the service "
                     "will resolve only one unambiguous pending proposal for that same sender."
@@ -1433,8 +1436,8 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 {
                     "name": "confirm_mutation",
                     "description": (
-                        "仅在用户明确确认紧邻的完整提案后执行对应的单次新增/更新/删除。"
-                        "拒绝或模糊回复会被服务端拦截。"
+                        "仅在同一发起人对待确认提案作出明确肯定回复后执行单次新增/更新/删除。"
+                        "行、好、ok、可以、执行、开始、没问题等肯定回复均可；否定、含糊或改动提案的回复会被拦截。"
                     ),
                     "inputSchema": {
                         "type": "object",
@@ -1838,8 +1841,11 @@ class XiaotCloudflareRelay(CloudflareRelay):
 
     @staticmethod
     def _is_explicit_confirmation(value: str, operation: str) -> bool:
-        text = re.sub(r"[\s，。！？,.!?；;：:]+", "", str(value or "")).casefold()
+        raw_text = str(value or "").strip().casefold()
+        text = re.sub(r"[\s，。！,.!；;：:、]+", "", raw_text)
         if not text or len(text) > 100:
+            return False
+        if operation not in {"create", "update", "delete"}:
             return False
         refusals = (
             "不执行",
@@ -1855,34 +1861,105 @@ class XiaotCloudflareRelay(CloudflareRelay):
             "不更新",
             "不修改",
             "不删除",
+            "不需要",
+            "不必",
+            "不想",
+            "不能",
+            "不确定",
+            "不同意",
+            "不批准",
+            "不认可",
+            "未确认",
+            "暂不",
+            "先不",
+            "先别",
             "拒绝",
             "取消",
+            "撤销",
             "不要",
-            "no",
-            "nope",
+            "别执行",
+            "别开始",
+            "别做",
+            "算了",
+            "停止",
+            "先等等",
+            "再想想",
         )
-        if any(token in text for token in refusals):
+        english_reply = re.sub(r"\bno\s+problem\b", "", raw_text)
+        if any(token in text for token in refusals) or re.search(
+            r"(?<![a-z])(?:no|nope|nah|not|don't|dont|do not|can't|cannot|cancel|reject|stop)(?![a-z])",
+            english_reply,
+        ):
             return False
         operation_words = {
-            "create": ("确认新增", "确认创建", "确认添加"),
-            "update": ("确认更新", "确认修改"),
-            "delete": ("确认删除",),
+            "create": ("确认新增", "确认创建", "确认添加", "新增", "创建", "添加"),
+            "update": ("确认更新", "确认修改", "更新", "修改"),
+            "delete": ("确认删除", "删除"),
         }[operation]
+        other_operation_words = {
+            "create": ("删除", "更新", "修改"),
+            "update": ("新增", "创建", "添加", "删除"),
+            "delete": ("新增", "创建", "添加", "更新", "修改"),
+        }
+        if any(word in text for word in other_operation_words[operation]):
+            return False
         positive = (
+            "没有问题",
+            "没问题",
+            "noproblem",
+            "没事",
+            "没意见",
+            "没有意见",
+            "无异议",
+            "确认执行",
+            "开始执行",
+            "可以执行",
+            "同意执行",
+            "立即执行",
+            "马上执行",
             "确认",
             "执行",
             "开始",
+            "可以",
+            "好的",
             "接受",
             "行",
-            "行的",
             "好",
-            "好的",
-            "可以",
-            "yes",
-            "ok",
+            "嗯",
+            "恩",
+            "是",
             "同意",
+            "赞成",
+            "支持",
+            "批准",
+            "通过",
+            "确定",
+            "照办",
+            "照做",
+            "继续",
+            "成",
+            "妥",
+            "ok",
+            "okay",
+            "yes",
+            "yep",
+            "sure",
+            "surething",
+            "allgood",
+            "yesplease",
+            "goahead",
+            "proceed",
+            "soundsgood",
+            *operation_words,
         )
-        return text in positive or any(text == item for item in operation_words)
+        alternatives = "|".join(
+            re.escape(word) for word in sorted(set(positive), key=len, reverse=True)
+        )
+        fillers = "嗯|恩|那就|那|就|我觉得|我认为|我同意|我确认|我|这就|当然|马上|立即|麻烦|请"
+        particles = "的|啊|呀|吧|呢|哈|啦|嘞|哒|了|！|。"
+        return re.fullmatch(
+            rf"(?:(?:{fillers})*(?:{alternatives})(?:{particles})?)+", text
+        ) is not None
 
     async def _confirm_mutation(self, args: dict[str, Any]) -> dict[str, Any]:
         request_id = str(args.get("request_id") or "")

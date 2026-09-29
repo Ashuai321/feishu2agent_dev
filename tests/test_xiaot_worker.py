@@ -222,16 +222,59 @@ def test_writes_reject_unknown_or_computed_fields():
     asyncio.run(check())
 
 
-def test_confirmation_requires_an_exact_positive_reply_for_the_operation():
+def test_confirmation_accepts_common_affirmations_and_rejects_negations():
     worker = _load_xiaot_module()
     check = worker.XiaotCloudflareRelay._is_explicit_confirmation
 
+    for operation in ("create", "update", "delete"):
+        for reply in (
+            "行",
+            "好",
+            "ok",
+            "可以",
+            "执行",
+            "开始执行",
+            "开始",
+            "好的",
+            "行的",
+            "ok的",
+            "没问题",
+            "确认执行",
+            "嗯，行",
+            "我觉得可以",
+            "我同意",
+            "确定",
+            "没事",
+            "照办",
+            "继续",
+            "no problem",
+            "sure thing",
+        ):
+            assert check(reply, operation), (operation, reply)
+
     assert check("确认创建", "create")
-    assert check("好的", "update")
+    assert check("确认更新", "update")
     assert check("确认删除", "delete")
-    assert not check("不确认创建", "create")
-    assert not check("不要删除", "delete")
-    assert not check("可以，然后删除另一个", "delete")
+    for operation, reply in (
+        ("create", "不确认创建"),
+        ("delete", "不要删除"),
+        ("update", "不行"),
+        ("update", "不好"),
+        ("update", "不可以"),
+        ("update", "取消"),
+        ("update", "我不同意"),
+        ("update", "no"),
+        ("update", "nope"),
+        ("update", "not now"),
+        ("update", "可以吗？"),
+        ("update", "我再想想"),
+        ("update", "可以，但不要执行"),
+        ("update", "行，不过先取消"),
+        ("update", "确认删除"),
+        ("create", "确认执行 T681 状态改为 Finished"),
+    ):
+        assert not check(reply, operation), (operation, reply)
+    assert not check("可以，然后删除另一个", "update")
     assert not check("好吧，修改成别的内容", "update")
 
 
@@ -666,7 +709,7 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
             request_id="xiaot_req_confirm",
             conversation_key=conversation_key,
             source_message_id="om_confirm",
-            input_markdown="User task:\n确认创建",
+            input_markdown="User task:\n行",
         )
         await bind_requester("xiaot_req_confirm", "ou_original")
         confirmed = await relay.call_tool(
@@ -702,6 +745,30 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
             }
         )
         await state.claim_event(
+            message_id="xiaot:om_refuse_update",
+            request_id="xiaot_req_refuse_update",
+            conversation_key=conversation_key,
+            chat_id="oc_group",
+            open_id="ou_original",
+        )
+        await state.create_run(
+            request_id="xiaot_req_refuse_update",
+            conversation_key=conversation_key,
+            source_message_id="om_refuse_update",
+            input_markdown="User task:\n可以，但不要执行",
+        )
+        await bind_requester("xiaot_req_refuse_update", "ou_original")
+        refused_update = await relay.call_tool(
+            "confirm_mutation",
+            {
+                "request_id": "xiaot_req_refuse_update",
+                "conversation_key": conversation_key,
+                "proposal_id": update_proposal["proposal_id"],
+            },
+        )
+        assert refused_update["isError"] is True
+
+        await state.claim_event(
             message_id="xiaot:om_confirm_update",
             request_id="xiaot_req_confirm_update",
             conversation_key=conversation_key,
@@ -712,7 +779,7 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
             request_id="xiaot_req_confirm_update",
             conversation_key=conversation_key,
             source_message_id="om_confirm_update",
-            input_markdown="User task:\n确认",
+            input_markdown="User task:\n确认执行",
         )
         await bind_requester("xiaot_req_confirm_update", "ou_original")
         update_confirmed = await relay.call_tool(
@@ -722,11 +789,26 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
                 "conversation_key": conversation_key,
             },
         )
-        return bitable, wrong_user, confirmed, update_proposal, update_confirmed
+        return (
+            bitable,
+            wrong_user,
+            confirmed,
+            update_proposal,
+            refused_update,
+            update_confirmed,
+        )
 
-    bitable, wrong_user, confirmed, update_proposal, update_confirmed = asyncio.run(scenario())
+    (
+        bitable,
+        wrong_user,
+        confirmed,
+        update_proposal,
+        refused_update,
+        update_confirmed,
+    ) = asyncio.run(scenario())
 
     assert wrong_user["isError"] is True
+    assert refused_update["isError"] is True
     assert confirmed["structuredContent"]["success"] is True
     assert bitable.creates[0][0] == "changelog"
     assert bitable.creates[1] == ("task", {"Task Name": "Xiaot test"})
