@@ -534,6 +534,9 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 platform TEXT NOT NULL DEFAULT 'feishu',
                 account_open_id TEXT NOT NULL DEFAULT '',
                 source_union_id TEXT NOT NULL DEFAULT '',
+                source_open_id TEXT NOT NULL DEFAULT '',
+                source_user_id TEXT NOT NULL DEFAULT '',
+                source_platform TEXT NOT NULL DEFAULT 'feishu',
                 request_id TEXT NOT NULL DEFAULT '',
                 conversation_key TEXT NOT NULL,
                 source_message_id TEXT NOT NULL,
@@ -550,6 +553,9 @@ class XiaotCloudflareRelay(CloudflareRelay):
             ("platform", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("account_open_id", "TEXT NOT NULL DEFAULT ''"),
             ("source_union_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_open_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_user_id", "TEXT NOT NULL DEFAULT ''"),
+            ("source_platform", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("request_id", "TEXT NOT NULL DEFAULT ''"),
             ("event_json", "TEXT NOT NULL DEFAULT '{}'"),
         ):
@@ -566,6 +572,16 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 account_open_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (platform, source_union_id)
+            )""",
+        )
+        await _db_run(
+            self.state.db,
+            """CREATE TABLE IF NOT EXISTS xiaot_bitable_source_identity_links (
+                platform TEXT NOT NULL,
+                source_open_id TEXT NOT NULL,
+                account_open_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (platform, source_open_id)
             )""",
         )
         await _db_run(
@@ -601,15 +617,81 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 "ALTER TABLE xiaot_bitable_proposals ADD COLUMN requester_platform TEXT NOT NULL DEFAULT 'feishu'",
             )
 
+    async def _detect_requester_platform(self, event: dict[str, Any]) -> str:
+        """Classify the sender before starting OAuth; never guess Feishu on failure."""
+        explicit = str(
+            event.get("tenant_brand") or event.get("platform") or event.get("brand") or ""
+        ).strip().lower()
+        if explicit in {"feishu", "lark"}:
+            return explicit
+
+        sender_tenant = str(event.get("sender_tenant_key") or "").strip()
+        event_tenant = str(event.get("tenant_key") or "").strip()
+        configured_lark_tenants = {
+            item.strip()
+            for item in _env(self.identity_relay.env, "LARK_EXTERNAL_TENANT_KEYS", "").split(",")
+            if item.strip()
+        }
+        if sender_tenant and sender_tenant in configured_lark_tenants:
+            return "lark"
+        if sender_tenant and event_tenant and sender_tenant != event_tenant:
+            return "lark"
+
+        # Tenant fields can be normalized for external groups, so use the
+        # platform contact APIs as a second signal. Only a unique match is
+        # enough to choose which bot's OAuth flow to start.
+        identifiers = (
+            (str(event.get("open_id") or "").strip(), "open_id"),
+            (str(event.get("union_id") or "").strip(), "union_id"),
+            (str(event.get("user_id") or "").strip(), "user_id"),
+        )
+        resolved: list[str] = []
+        for candidate in ("feishu", "lark"):
+            api = getattr(self.identity_relay, candidate, None)
+            if api is None:
+                continue
+            for identifier, identifier_type in identifiers:
+                if not identifier:
+                    continue
+                try:
+                    user = await api.resolve_user_id(
+                        identifier, user_id_type=identifier_type
+                    )
+                except Exception:
+                    continue
+                if user:
+                    resolved.append(candidate)
+                    break
+        if len(resolved) == 1:
+            return resolved[0]
+        if len(resolved) > 1:
+            reason = "Feishu 和 Lark 都能解析该发起人，结果不唯一"
+        else:
+            reason = "事件租户信息不足，Feishu/Lark 用户目录也无法解析该发起人"
+        raise RuntimeError(
+            f"无法判断当前发起人的账号类型：{reason}；未发起授权，也未访问或修改多维表格。"
+        )
+
     async def _resolve_account_identity(self, event: dict[str, Any]) -> dict[str, str]:
         source_open_id = str(event.get("open_id") or "").strip()
         if not source_open_id:
             raise ValueError("小T event does not contain a requester open_id")
-        platform = await self.identity_relay.detect_user_platform(event, "feishu")
+        platform = await self._detect_requester_platform(event)
         api = self.identity_relay.lark if platform == "lark" else self.identity_relay.feishu
         if api is None:
             raise RuntimeError(f"{platform.title()} authorization is not configured")
         source_union_id = str(event.get("union_id") or "").strip()
+        if source_open_id:
+            linked_by_source = await _db_first(
+                self.state.db,
+                "SELECT account_open_id FROM xiaot_bitable_source_identity_links "
+                "WHERE platform = ? AND source_open_id = ?",
+                platform,
+                source_open_id,
+            )
+            linked_open_id = str((linked_by_source or {}).get("account_open_id") or "").strip()
+            if linked_open_id:
+                return {"platform": platform, "open_id": linked_open_id}
         if platform == "lark" and source_union_id:
             linked = await _db_first(
                 self.state.db,
@@ -643,15 +725,21 @@ class XiaotCloudflareRelay(CloudflareRelay):
             open_id = str(resolved.get("open_id") or "").strip()
             if open_id:
                 return {"platform": platform, "open_id": open_id}
-        if platform == "lark" and source_union_id:
+        if platform == "lark":
             # Some Lark users arrive through a Feishu external-group event and
-            # are not resolvable through the Lark app's tenant contact API.
-            # Let the requester authorize directly, then bind the OAuth user
-            # only when its developer-scoped union_id matches this event.
+            # cannot be resolved through the Lark app's tenant contact API.
+            # The platform has already been selected by detect_user_platform;
+            # require Lark OAuth next, then bind the returned account to this
+            # exact source open_id through the one-time OAuth state.  Do not
+            # require a cross-app union_id to exist in the webhook event.
             return {
                 "platform": platform,
-                "open_id": f"pending_union:{source_union_id}",
+                "open_id": f"pending_source:{source_open_id}",
+                "identity_pending": "true",
+                "source_open_id": source_open_id,
                 "source_union_id": source_union_id,
+                "source_user_id": str(event.get("user_id") or "").strip(),
+                "source_platform": "feishu",
             }
         raise RuntimeError(
             "无法安全确认当前发起人的账号；事件未提供可用于本人 OAuth 校验的稳定用户标识，"
@@ -669,7 +757,13 @@ class XiaotCloudflareRelay(CloudflareRelay):
         await self._ensure_xiaot_oauth_schema()
         platform = str(account_identity.get("platform") or "feishu")
         open_id = str(account_identity.get("open_id") or "").strip()
-        source_union_id = str(account_identity.get("source_union_id") or "").strip()
+        source_open_id = str(event.get("open_id") or "").strip()
+        source_union_id = str(event.get("union_id") or "").strip()
+        source_user_id = str(event.get("user_id") or "").strip()
+        source_platform = str(account_identity.get("source_platform") or "feishu").strip()
+        account_open_id = (
+            "" if str(account_identity.get("identity_pending") or "") == "true" else open_id
+        )
         callback_key = f"{platform.upper()}_OAUTH_REDIRECT_URI"
         redirect_uri = str(
             _env(
@@ -686,14 +780,18 @@ class XiaotCloudflareRelay(CloudflareRelay):
         await _db_run(
             self.state.db,
             "INSERT INTO xiaot_bitable_oauth_states "
-            "(state, open_id, platform, account_open_id, source_union_id, request_id, conversation_key, "
+            "(state, open_id, platform, account_open_id, source_union_id, source_open_id, "
+            "source_user_id, source_platform, request_id, conversation_key, "
             "source_message_id, redirect_uri, event_json, expires_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             state,
             open_id,
             platform,
-            open_id,
+            account_open_id,
             source_union_id,
+            source_open_id,
+            source_user_id,
+            source_platform,
             request_id,
             conversation_key,
             str(event.get("message_id") or ""),
@@ -765,7 +863,12 @@ class XiaotCloudflareRelay(CloudflareRelay):
         if (
             not pending
             or str(pending.get("platform") or "") != normalized
-            or not pending.get("account_open_id")
+            or not (
+                pending.get("account_open_id")
+                or pending.get("source_open_id")
+                or pending.get("source_union_id")
+                or pending.get("source_user_id")
+            )
             or int(pending.get("expires_at") or 0) < int(time.time())
         ):
             return _response({"success": False, "error": "invalid_or_expired_state"}, 400)
@@ -823,8 +926,12 @@ class XiaotCloudflareRelay(CloudflareRelay):
             identity = str(user_data.get("open_id") or "").strip()
             expected_open_id = str(pending.get("account_open_id") or "").strip()
             source_union_id = str(pending.get("source_union_id") or "").strip()
-            if source_union_id:
-                if str(user_data.get("union_id") or "").strip() != source_union_id:
+            source_open_id = str(pending.get("source_open_id") or "").strip()
+            source_user_id = str(pending.get("source_user_id") or "").strip()
+            source_platform = str(pending.get("source_platform") or normalized).strip().lower()
+            is_pending_identity = expected_open_id.startswith(("pending_union:", "pending_source:"))
+            if expected_open_id and not is_pending_identity:
+                if identity != expected_open_id:
                     return _response(
                         {
                             "success": False,
@@ -833,27 +940,57 @@ class XiaotCloudflareRelay(CloudflareRelay):
                         },
                         403,
                     )
-                await _db_run(
-                    self.state.db,
-                    "INSERT INTO xiaot_bitable_identity_links "
-                    "(platform, source_union_id, account_open_id, created_at) "
-                    "VALUES (?, ?, ?, ?) ON CONFLICT(platform, source_union_id) "
-                    "DO UPDATE SET account_open_id = excluded.account_open_id, "
-                    "created_at = excluded.created_at",
-                    normalized,
-                    source_union_id,
-                    identity,
-                    int(time.time()),
-                )
-            elif identity != expected_open_id:
-                return _response(
-                    {
-                        "success": False,
-                        "error": "requester_mismatch",
-                        "message": f"授权的 {normalized.title()} 账号与发起 @小T 的人员不一致，未保存授权。",
-                    },
-                    403,
-                )
+            else:
+                requester_ids = {
+                    value
+                    for value in (source_open_id, source_union_id, source_user_id)
+                    if value
+                }
+                authorized_ids = {
+                    str(user_data.get(key) or "").strip()
+                    for key in ("open_id", "union_id", "user_id")
+                    if str(user_data.get(key) or "").strip()
+                }
+                same_platform_match = bool(requester_ids.intersection(authorized_ids))
+                # Feishu webhook IDs and Lark OAuth IDs can live in different
+                # namespaces. In that detected cross-platform case, the
+                # one-time state created from the @ message is the binding;
+                # same-platform authorization must still match an event ID.
+                if not same_platform_match and source_platform == normalized:
+                    return _response(
+                        {
+                            "success": False,
+                            "error": "requester_mismatch",
+                            "message": f"授权的 {normalized.title()} 账号与发起 @小T 的人员不一致，未保存授权。",
+                        },
+                        403,
+                    )
+                if source_union_id and str(user_data.get("union_id") or "").strip() == source_union_id:
+                    await _db_run(
+                        self.state.db,
+                        "INSERT INTO xiaot_bitable_identity_links "
+                        "(platform, source_union_id, account_open_id, created_at) "
+                        "VALUES (?, ?, ?, ?) ON CONFLICT(platform, source_union_id) "
+                        "DO UPDATE SET account_open_id = excluded.account_open_id, "
+                        "created_at = excluded.created_at",
+                        normalized,
+                        source_union_id,
+                        identity,
+                        int(time.time()),
+                    )
+                if source_open_id:
+                    await _db_run(
+                        self.state.db,
+                        "INSERT INTO xiaot_bitable_source_identity_links "
+                        "(platform, source_open_id, account_open_id, created_at) "
+                        "VALUES (?, ?, ?, ?) ON CONFLICT(platform, source_open_id) "
+                        "DO UPDATE SET account_open_id = excluded.account_open_id, "
+                        "created_at = excluded.created_at",
+                        normalized,
+                        source_open_id,
+                        identity,
+                        int(time.time()),
+                    )
             await self.state.save_user_token(
                 platform=normalized,
                 open_id=identity,

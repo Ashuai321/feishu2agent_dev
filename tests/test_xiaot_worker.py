@@ -841,12 +841,16 @@ def test_lark_requester_is_resolved_in_lark_user_namespace():
     class FakeIdentityRelay:
         lark = FakeAPI()
         feishu = object()
+        env = SimpleNamespace(LARK_EXTERNAL_TENANT_KEYS="")
 
-        async def detect_user_platform(self, _event, source_platform):
-            assert source_platform == "feishu"
-            return "lark"
+    class FakeState:
+        db = object()
 
     relay.identity_relay = FakeIdentityRelay()
+    relay.state = FakeState()
+    async def no_link(_db, _sql, *_params):
+        return None
+    worker._db_first = no_link
     result = asyncio.run(
         relay._resolve_account_identity({"open_id": "ou_external"})
     )
@@ -866,12 +870,16 @@ def test_feishu_requester_is_resolved_in_oauth_app_namespace():
     class FakeIdentityRelay:
         lark = None
         feishu = FakeAPI()
+        env = SimpleNamespace(LARK_EXTERNAL_TENANT_KEYS="")
 
-        async def detect_user_platform(self, _event, source_platform):
-            assert source_platform == "feishu"
-            return "feishu"
+    class FakeState:
+        db = object()
 
     relay.identity_relay = FakeIdentityRelay()
+    relay.state = FakeState()
+    async def no_link(_db, _sql, *_params):
+        return None
+    worker._db_first = no_link
     result = asyncio.run(
         relay._resolve_account_identity(
             {"open_id": "ou_xiaot_event_app_user", "union_id": "on_tenant_stable"}
@@ -881,7 +889,44 @@ def test_feishu_requester_is_resolved_in_oauth_app_namespace():
     assert result == {"platform": "feishu", "open_id": "ou_feishu_oauth_app_user"}
 
 
-def test_unresolvable_lark_requester_gets_union_bound_oauth_identity(monkeypatch):
+def test_xiaot_platform_detection_prefers_explicit_lark_brand_without_lookup():
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class FakeIdentityRelay:
+        env = SimpleNamespace(LARK_EXTERNAL_TENANT_KEYS="")
+        feishu = None
+        lark = None
+
+    relay.identity_relay = FakeIdentityRelay()
+    assert asyncio.run(
+        relay._detect_requester_platform({"open_id": "ou_lark", "platform": "lark"})
+    ) == "lark"
+
+
+def test_xiaot_platform_detection_does_not_guess_feishu_when_unresolved():
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class UnresolvableAPI:
+        async def resolve_user_id(self, *_args, **_kwargs):
+            raise RuntimeError("user is outside this app's directory")
+
+    class FakeIdentityRelay:
+        env = SimpleNamespace(LARK_EXTERNAL_TENANT_KEYS="")
+        feishu = UnresolvableAPI()
+        lark = UnresolvableAPI()
+
+    relay.identity_relay = FakeIdentityRelay()
+    try:
+        asyncio.run(relay._detect_requester_platform({"open_id": "ou_external"}))
+    except RuntimeError as exc:
+        assert "无法判断当前发起人的账号类型" in str(exc)
+    else:
+        raise AssertionError("unknown platform must not silently fall back to Feishu")
+
+
+def test_unresolvable_lark_requester_gets_oauth_identity_without_union_id(monkeypatch):
     worker = _load_xiaot_module()
     relay = object.__new__(worker.XiaotCloudflareRelay)
 
@@ -892,9 +937,7 @@ def test_unresolvable_lark_requester_gets_union_bound_oauth_identity(monkeypatch
     class FakeIdentityRelay:
         lark = FakeAPI()
         feishu = None
-
-        async def detect_user_platform(self, _event, _source_platform):
-            return "lark"
+        env = SimpleNamespace(LARK_EXTERNAL_TENANT_KEYS="")
 
     class FakeState:
         db = object()
@@ -907,14 +950,22 @@ def test_unresolvable_lark_requester_gets_union_bound_oauth_identity(monkeypatch
     relay.state = FakeState()
     result = asyncio.run(
         relay._resolve_account_identity(
-            {"open_id": "ou_external_event", "union_id": "on_requester_stable"}
+            {
+                "open_id": "ou_external_event",
+                "tenant_key": "tenant_feishu",
+                "sender_tenant_key": "tenant_lark",
+            }
         )
     )
 
     assert result == {
         "platform": "lark",
-        "open_id": "pending_union:on_requester_stable",
-        "source_union_id": "on_requester_stable",
+        "open_id": "pending_source:ou_external_event",
+        "identity_pending": "true",
+        "source_open_id": "ou_external_event",
+        "source_union_id": "",
+        "source_user_id": "",
+        "source_platform": "feishu",
     }
 
 
@@ -929,24 +980,28 @@ def test_lark_requester_reuses_oauth_identity_link(monkeypatch):
     class FakeIdentityRelay:
         lark = FakeAPI()
         feishu = None
-
-        async def detect_user_platform(self, _event, _source_platform):
-            return "lark"
+        env = SimpleNamespace(LARK_EXTERNAL_TENANT_KEYS="")
 
     class FakeState:
         db = object()
 
     async def linked_identity(_db, sql, *params):
-        assert "xiaot_bitable_identity_links" in sql
-        assert params == ("lark", "on_requester_stable")
-        return {"account_open_id": "ou_lark_oauth_app"}
+        if "xiaot_bitable_source_identity_links" in sql:
+            assert params == ("lark", "ou_external_event")
+            return {"account_open_id": "ou_lark_oauth_app"}
+        raise AssertionError("the linked source identity should be used before union_id")
 
     monkeypatch.setattr(worker, "_db_first", linked_identity)
     relay.identity_relay = FakeIdentityRelay()
     relay.state = FakeState()
     result = asyncio.run(
         relay._resolve_account_identity(
-            {"open_id": "ou_external_event", "union_id": "on_requester_stable"}
+            {
+                "open_id": "ou_external_event",
+                "union_id": "on_requester_stable",
+                "tenant_key": "tenant_feishu",
+                "sender_tenant_key": "tenant_lark",
+            }
         )
     )
 
@@ -1000,7 +1055,12 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
         return None
 
     monkeypatch.setattr(worker, "_db_run", capture_sql)
-    event = {"message_id": "om_original", "text": "查询我的 task"}
+    event = {
+        "message_id": "om_original",
+        "open_id": "ou_external_event",
+        "union_id": "on_requester_stable",
+        "text": "查询我的 task",
+    }
     asyncio.run(
         relay._send_user_authorization(
             event=event,
@@ -1009,7 +1069,7 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
             account_identity={
                 "platform": "lark",
                 "open_id": "ou_lark_canonical",
-                "source_union_id": "on_requester_stable",
+                "identity_pending": "true",
             },
         )
     )
@@ -1018,14 +1078,19 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
     sql, params = next(item for item in statements if "INSERT INTO xiaot_bitable_oauth_states" in item[0])
     assert params[2:8] == (
         "lark",
-        "ou_lark_canonical",
+        "",
         "on_requester_stable",
+        "ou_external_event",
+        "",
+        "feishu",
+    )
+    assert params[8:11] == (
         "xiaot_req_1",
         "xiaot:cli_xiaot:oc_group:abc",
         "om_original",
     )
-    assert params[8] == "https://bot.boooe.com/lark/oauth/callback"
-    assert '"text":"查询我的 task"' in params[9]
+    assert params[11] == "https://bot.boooe.com/lark/oauth/callback"
+    assert '"text":"查询我的 task"' in params[12]
     card = replies[0][1]
     auth_url = card["elements"][1]["actions"][0]["url"]
     assert auth_url.startswith("https://accounts.larksuite.com/")
@@ -1074,8 +1139,11 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     relay = object.__new__(worker.XiaotCloudflareRelay)
     pending = {
         "platform": "lark",
-        "account_open_id": "pending_union:on_requester_stable",
-        "source_union_id": "on_requester_stable",
+        "account_open_id": "",
+        "source_union_id": "",
+        "source_open_id": "ou_external_event",
+        "source_user_id": "",
+        "source_platform": "feishu",
         "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
         "expires_at": int(worker.time.time()) + 600,
         "event_json": '{"message_id":"om_original","text":"查询 task"}',
@@ -1106,10 +1174,7 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     class FakeAPI:
         async def user_info(self, access_token):
             assert access_token == "lark-user-token"
-            return {
-                "open_id": "ou_lark_verified",
-                "union_id": "on_requester_stable",
-            }
+            return {"open_id": "ou_lark_verified"}
 
     class FakeIdentityRelay:
         env = worker.XiaotLarkOAuthEnvironment(
@@ -1188,9 +1253,10 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     assert saved_tokens[0]["platform"] == "lark"
     assert saved_tokens[0]["open_id"] == "ou_lark_verified"
     identity_link = next(
-        item for item in statements if "INSERT INTO xiaot_bitable_identity_links" in item[0]
+        item for item in statements
+        if "INSERT INTO xiaot_bitable_source_identity_links" in item[0]
     )
-    assert identity_link[1][:3] == ("lark", "on_requester_stable", "ou_lark_verified")
+    assert identity_link[1][:3] == ("lark", "ou_external_event", "ou_lark_verified")
     assert resumed == [
         {
             "platform": "lark",
@@ -1206,8 +1272,11 @@ def test_lark_oauth_callback_rejects_different_union_id(monkeypatch):
     relay = object.__new__(worker.XiaotCloudflareRelay)
     pending = {
         "platform": "lark",
-        "account_open_id": "pending_union:on_requester_stable",
+        "account_open_id": "",
         "source_union_id": "on_requester_stable",
+        "source_open_id": "ou_external_event",
+        "source_user_id": "",
+        "source_platform": "lark",
         "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
         "expires_at": int(worker.time.time()) + 600,
         "event_json": '{"message_id":"om_original","text":"查询我的 task"}',
