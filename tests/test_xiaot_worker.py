@@ -1129,6 +1129,15 @@ def test_xiaot_lark_oauth_environment_only_overrides_lark_credentials():
     assert env.LARK_APP_SECRET == "xiaot-secret"
     assert env.FEISHU_APP_ID == "cli_feishu_shared"
 
+    unconfigured = worker.XiaotLarkOAuthEnvironment(
+        SimpleNamespace(
+            LARK_APP_ID="cli_lark_shared",
+            LARK_APP_SECRET="shared-secret",
+        )
+    )
+    assert unconfigured.LARK_APP_ID is None
+    assert unconfigured.LARK_APP_SECRET is None
+
 
 def test_lark_bitable_api_calls_use_lark_api_host(monkeypatch):
     worker = _load_xiaot_module()

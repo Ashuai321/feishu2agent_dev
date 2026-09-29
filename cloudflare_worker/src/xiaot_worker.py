@@ -131,9 +131,9 @@ class XiaotLarkOAuthEnvironment:
     def __getattr__(self, name: str) -> Any:
         alias = self._aliases.get(name)
         if alias:
-            value = getattr(self.raw, alias, None)
-            if value not in (None, ""):
-                return value
+            # Never fall back to a different agent's Lark app if XiaoT's
+            # dedicated credentials are missing.
+            return getattr(self.raw, alias, None)
         return getattr(self.raw, name, None)
 
 
