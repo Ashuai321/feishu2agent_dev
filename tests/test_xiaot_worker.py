@@ -888,9 +888,14 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
     replies = []
 
     class FakeIdentityRelay:
-        env = SimpleNamespace(
-            LARK_APP_ID="cli_lark_dev",
-            LARK_OAUTH_REDIRECT_URI="https://bot.boooe.com/lark/oauth/callback",
+        env = worker.XiaotLarkOAuthEnvironment(
+            SimpleNamespace(
+                LARK_APP_ID="cli_shared_lark",
+                LARK_APP_SECRET="shared-lark-secret",
+                XIAOT_LARK_APP_ID="cli_lark_dev",
+                XIAOT_LARK_APP_SECRET="xiaot-lark-secret",
+                LARK_OAUTH_REDIRECT_URI="https://bot.boooe.com/lark/oauth/callback",
+            )
         )
 
         def platform_oauth_scope(self, platform):
@@ -1026,7 +1031,14 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
             return {"open_id": "ou_lark_verified"}
 
     class FakeIdentityRelay:
-        env = SimpleNamespace(LARK_APP_ID="cli_lark_app", LARK_APP_SECRET="lark-secret")
+        env = worker.XiaotLarkOAuthEnvironment(
+            SimpleNamespace(
+                LARK_APP_ID="cli_shared_lark",
+                LARK_APP_SECRET="shared-lark-secret",
+                XIAOT_LARK_APP_ID="cli_lark_app",
+                XIAOT_LARK_APP_SECRET="xiaot-lark-secret",
+            )
+        )
 
         def api_for_conversation(self, conversation_key):
             assert conversation_key == "lark:oauth"
@@ -1087,6 +1099,7 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     assert result["payload"]["success"] is True
     assert exchange_calls[0][0] == "https://accounts.larksuite.com/oauth/v3/token"
     assert exchange_calls[0][1]["data"]["client_id"] == "cli_lark_app"
+    assert exchange_calls[0][1]["data"]["client_secret"] == "xiaot-lark-secret"
     assert exchange_calls[0][1]["data"]["redirect_uri"] == pending["redirect_uri"]
     assert saved_tokens[0]["platform"] == "lark"
     assert saved_tokens[0]["open_id"] == "ou_lark_verified"
@@ -1098,6 +1111,23 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
             "request_id": pending["request_id"],
         }
     ]
+
+
+def test_xiaot_lark_oauth_environment_only_overrides_lark_credentials():
+    worker = _load_xiaot_module()
+    env = worker.XiaotLarkOAuthEnvironment(
+        SimpleNamespace(
+            FEISHU_APP_ID="cli_feishu_shared",
+            LARK_APP_ID="cli_lark_shared",
+            LARK_APP_SECRET="shared-secret",
+            XIAOT_LARK_APP_ID="cli_lark_xiaot",
+            XIAOT_LARK_APP_SECRET="xiaot-secret",
+        )
+    )
+
+    assert env.LARK_APP_ID == "cli_lark_xiaot"
+    assert env.LARK_APP_SECRET == "xiaot-secret"
+    assert env.FEISHU_APP_ID == "cli_feishu_shared"
 
 
 def test_lark_bitable_api_calls_use_lark_api_host(monkeypatch):

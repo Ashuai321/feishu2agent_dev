@@ -117,6 +117,26 @@ class XiaotEnvironment:
         return getattr(self.raw, name, None)
 
 
+class XiaotLarkOAuthEnvironment:
+    """Use 小T's Lark app for XiaoT identity resolution and OAuth only."""
+
+    _aliases = {
+        "LARK_APP_ID": "XIAOT_LARK_APP_ID",
+        "LARK_APP_SECRET": "XIAOT_LARK_APP_SECRET",
+    }
+
+    def __init__(self, raw: Any) -> None:
+        self.raw = raw
+
+    def __getattr__(self, name: str) -> Any:
+        alias = self._aliases.get(name)
+        if alias:
+            value = getattr(self.raw, alias, None)
+            if value not in (None, ""):
+                return value
+        return getattr(self.raw, name, None)
+
+
 class XiaotBitableClient:
     """Bitable API client constrained to the user-approved base and tables."""
 
@@ -455,10 +475,12 @@ class XiaotCloudflareRelay(CloudflareRelay):
     def __init__(self, env: Any, ctx: Any, db_state: D1State) -> None:
         super().__init__(env, ctx, db_state)
         raw_env = env.raw if isinstance(env, XiaotEnvironment) else env
-        # The XiaoT bot receives/replies to the group message, while this
-        # second relay reuses the existing Feishu/Lark apps to identify and
-        # authorize the human requester on the correct platform.
-        self.identity_relay = CloudflareRelay(raw_env, ctx, db_state)
+        # The XiaoT bot receives/replies to the Feishu group message. Lark
+        # identity resolution and OAuth use XiaoT's own Lark app, while the
+        # existing Feishu user-OAuth app stays unchanged.
+        self.identity_relay = CloudflareRelay(
+            XiaotLarkOAuthEnvironment(raw_env), ctx, db_state
+        )
         self.xiaot_bitable = XiaotBitableClient(
             raw_env
         )

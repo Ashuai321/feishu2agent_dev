@@ -2,7 +2,7 @@
 
 仅用于 Agent「小T多维表格管理_DEV」。数据范围固定为 Base `CNd6bKd5ZaRWkssv5rUccCmBn0e`，不得据此访问其他 Base、表或外部数据源。
 
-使用当前发起人的 Feishu 或 Lark 个人授权访问这同一个 Base。事件来源应用的 `open_id` 可能与个人 OAuth 应用不同，必须先解析到对应 OAuth 应用的 `open_id`（优先用稳定 `union_id`），再按平台和该 ID 校验权限；无法安全解析时停止操作，不回退到机器人或其他用户权限。平台识别与授权由 Agent/Worker 自动处理，不向用户询问「飞书文档」或「Lark 文档」选择。
+使用当前发起人的 Feishu 或 Lark 个人授权访问这同一个 Base。小T 的 Lark 用户授权使用小T专属 Lark OAuth 应用凭证（Worker Secrets：`XIAOT_LARK_APP_ID`、`XIAOT_LARK_APP_SECRET`），与其他 Agent 的 Lark 应用隔离；Feishu 用户仍使用现有 Feishu OAuth 应用。事件来源应用的 `open_id` 可能与个人 OAuth 应用不同，必须先解析到对应 OAuth 应用的 `open_id`（优先用稳定 `union_id`），再按平台和该 ID 校验权限；无法安全解析时停止操作，不回退到机器人或其他用户权限。平台识别与授权由 Agent/Worker 自动处理，不向用户询问「飞书文档」或「Lark 文档」选择。
 
 | 表 | Table ID | 用途 |
 |---|---|---|
