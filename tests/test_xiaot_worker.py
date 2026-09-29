@@ -62,6 +62,109 @@ def test_table_allowlist_contains_only_the_seven_user_supplied_tables():
     assert worker.XiaotBitableClient.resolve_table("sub-task")["table_id"] == "tblRSAd7V63Zp2ya"
 
 
+def test_xiaot_dedicated_mcp_has_only_xiaot_tools_and_correct_identity(monkeypatch):
+    worker = _load_xiaot_module()
+    app = sys.modules["worker_app"]
+    relay = worker.XiaotOnlyCloudflareRelay(
+        SimpleNamespace(WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL="https://bot.boooe.com"),
+        None,
+        SimpleNamespace(),
+    )
+
+    tools = relay.tool_definitions()
+    names = {tool["name"] for tool in tools}
+    assert names == worker.XIAOT_TOOL_NAMES | worker._RELAY_TOOLS
+    assert not names.intersection(
+        {"create_group", "update_group", "search_contacts", "send_image", "get_user_images"}
+    )
+    search = next(tool for tool in tools if tool["name"] == "search_records")
+    assert search["inputSchema"]["properties"]["include_finished"] == {
+        "type": "boolean",
+        "default": False,
+    }
+
+    async def no_auth(self, _request, **_kwargs):
+        return None
+
+    monkeypatch.setattr(app.CloudflareRelay, "authorize_request", no_auth)
+
+    class Request:
+        method = "POST"
+        headers = {}
+
+        async def json(self):
+            return {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+
+    app.Response.json = staticmethod(
+        lambda payload, status=200, headers=None: SimpleNamespace(
+            payload=payload, status=status, headers=headers or {}
+        )
+    )
+    response = asyncio.run(
+        relay.mcp(
+            Request(),
+            resource_path=app.XIAOT_MCP_PATH,
+            resource_name=app.XIAOT_MCP_NAME,
+            initialize_instructions="isolated Xiao T server",
+        )
+    )
+    assert response.payload["result"]["serverInfo"]["name"] == app.XIAOT_MCP_NAME
+    assert response.payload["result"]["instructions"] == "isolated Xiao T server"
+
+    info = asyncio.run(relay.call_tool("server_info", {}))["structuredContent"]
+    assert info["app_name"] == app.XIAOT_MCP_NAME
+    assert info["mcp_path"] == app.XIAOT_MCP_PATH
+
+
+def test_xiaot_mcp_oauth_metadata_binds_its_own_resource(monkeypatch):
+    worker = _load_xiaot_module()
+    app = sys.modules["worker_app"]
+    relay = worker.XiaotOnlyCloudflareRelay(
+        SimpleNamespace(WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL="https://bot.boooe.com"),
+        None,
+        SimpleNamespace(),
+    )
+
+    app.Response.json = staticmethod(
+        lambda payload, status=200, headers=None: SimpleNamespace(
+            payload=payload, status=status, headers=headers or {}
+        )
+    )
+
+    class Request:
+        method = "GET"
+        headers = {}
+
+    resource = asyncio.run(
+        relay.oauth(
+            Request(),
+            "/.well-known/oauth-protected-resource/xiaot/mcp",
+            resource_path=app.XIAOT_MCP_PATH,
+            resource_name=app.XIAOT_MCP_NAME,
+            oauth_prefix="/xiaot",
+            issuer_path="/xiaot",
+        )
+    )
+    assert resource.payload["resource"] == "https://bot.boooe.com/xiaot/mcp"
+    assert resource.payload["authorization_servers"] == ["https://bot.boooe.com/xiaot"]
+    assert resource.payload["resource_name"] == app.XIAOT_MCP_NAME
+
+    authorization = asyncio.run(
+        relay.oauth(
+            Request(),
+            "/.well-known/oauth-authorization-server/xiaot",
+            resource_path=app.XIAOT_MCP_PATH,
+            resource_name=app.XIAOT_MCP_NAME,
+            oauth_prefix="/xiaot",
+            issuer_path="/xiaot",
+        )
+    )
+    assert authorization.payload["issuer"] == "https://bot.boooe.com/xiaot"
+    assert authorization.payload["authorization_endpoint"] == (
+        "https://bot.boooe.com/xiaot/oauth/authorize"
+    )
+
+
 def test_unknown_tables_and_malformed_record_ids_are_rejected():
     worker = _load_xiaot_module()
 
@@ -535,7 +638,7 @@ def test_feishu_event_callback_requires_verification_token():
     assert scheduled == []
 
 
-def test_xiaot_mcp_routes_are_not_separately_mounted():
+def test_xiaot_mcp_route_is_mounted_with_dedicated_identity(monkeypatch):
     worker = _load_xiaot_module()
     app = sys.modules["worker_app"]
     worker._response = lambda body, status=200, headers=None: {
@@ -550,6 +653,7 @@ def test_xiaot_mcp_routes_are_not_separately_mounted():
 
     app.D1State = FakeState
     app._response = worker._response
+    app.CloudflareRelay.authorize_request = lambda *_args, **_kwargs: asyncio.sleep(0, result=None)
     entrypoint = object.__new__(app.Default)
     entrypoint.env = SimpleNamespace(DB=object())
     entrypoint.ctx = None
@@ -564,13 +668,17 @@ def test_xiaot_mcp_routes_are_not_separately_mounted():
 
         headers = Headers()
 
+        async def json(self):
+            return {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+
     response = asyncio.run(entrypoint.fetch(FakeRequest()))
 
-    assert response["status"] == 404
-    assert response["body"] == {"error": "not_found"}
+    assert response["status"] == 200
+    assert response["body"]["result"]["serverInfo"]["name"] == app.XIAOT_MCP_NAME
+    assert "workspace-agent-relay-mcp-xiaot-dev" in response["body"]["result"]["instructions"]
 
 
-def test_xiaot_uses_the_shared_mcp_name_and_root_resource():
+def test_xiaot_uses_a_dedicated_mcp_name_and_resource():
     worker = _load_xiaot_module()
     env = worker.XiaotEnvironment(
         SimpleNamespace(
@@ -582,9 +690,9 @@ def test_xiaot_uses_the_shared_mcp_name_and_root_resource():
     relay = worker.XiaotCloudflareRelay(env, None, SimpleNamespace(db=object()))
 
     assert relay.base_url() == "https://bot.boooe.com"
-    assert relay.mcp_name() == "workspace-agent-relay-mcp-dev"
+    assert relay.mcp_name() == "workspace-agent-relay-mcp-xiaot-dev"
     assert relay.scopes() == ["workspace-agent-relay"]
-    assert relay.base_url() + "/mcp" == "https://bot.boooe.com/mcp"
+    assert relay.base_url() + "/xiaot/mcp" == "https://bot.boooe.com/xiaot/mcp"
 
 
 def test_shared_mcp_exposes_union_and_routes_actions_by_feishu_conversation():

@@ -13,13 +13,15 @@ import secrets
 import time
 from contextlib import suppress
 from typing import Any
-from urllib.parse import quote, urlencode, urlparse, parse_qs
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import httpx
 from worker_app import (
+    FEISHU_AUTH_BASE_URL,
+    XIAOT_MCP_NAME,
+    XIAOT_MCP_PATH,
     CloudflareRelay,
     D1State,
-    FEISHU_AUTH_BASE_URL,
     _db_all,
     _db_first,
     _db_run,
@@ -448,7 +450,8 @@ class XiaotAgentRelayWorkflow:
                 ),
                 (
                     f"The relay MCP is {self.relay.mcp_name()} at "
-                    f"{self.relay.base_url()}/mcp. Use record_result to reply to Feishu."
+                    f"{self.relay.base_url()}{XIAOT_MCP_PATH}. "
+                    "Use record_result to reply to Feishu/Lark."
                 ),
                 "",
                 "User task:",
@@ -491,10 +494,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
         return super().base_url()
 
     def mcp_name(self) -> str:
-        return str(
-            _env(self.env, "WORKSPACE_AGENT_RELAY_MCP_NAME", "workspace-agent-relay-mcp-dev")
-            or "workspace-agent-relay-mcp-dev"
-        )
+        return XIAOT_MCP_NAME
 
     def memory_scope(self) -> str:
         return XIAOT_AGENT_SCOPE
@@ -2112,6 +2112,42 @@ class XiaotCloudflareRelay(CloudflareRelay):
             event=event,
             request_id=request_id,
         )
+
+
+class XiaotOnlyCloudflareRelay(XiaotCloudflareRelay):
+    """Isolated DEV MCP surface for 小 T; the shared /mcp remains untouched."""
+
+    _allowed_tools = XIAOT_TOOL_NAMES | _RELAY_TOOLS
+
+    def mcp_name(self) -> str:
+        return XIAOT_MCP_NAME
+
+    async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name not in self._allowed_tools:
+            return self._tool_result(
+                {
+                    "success": False,
+                    "error": {
+                        "code": "action_not_enabled_for_agent",
+                        "message": "This action is not enabled for the isolated 小 T MCP.",
+                    },
+                },
+                True,
+            )
+        if name == "server_info":
+            return self._tool_result(
+                {
+                    "success": True,
+                    "app_name": XIAOT_MCP_NAME,
+                    "version": "3.0.0",
+                    "public_base_url": self.base_url(),
+                    "mcp_path": XIAOT_MCP_PATH,
+                    "storage": "D1",
+                    "queue": "AGENT_QUEUE",
+                    "table_count": len(XIAOT_TABLES),
+                }
+            )
+        return await super().call_tool(name, args)
 
 
 class CombinedCloudflareRelay(CloudflareRelay):

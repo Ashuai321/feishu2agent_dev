@@ -22,6 +22,8 @@ FEISHU_AUTH_BASE_URL = "https://accounts.feishu.cn"
 MCP_PATH = "/mcp"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 MCP_NAME = "workspace-agent-relay-mcp-dev"
+XIAOT_MCP_PATH = "/xiaot/mcp"
+XIAOT_MCP_NAME = "workspace-agent-relay-mcp-xiaot-dev"
 PLACEHOLDER = "正在处理，Agent 完成后会回复到这条消息。"
 MAX_CLIENTS = 50
 TRIGGER_RUNS_BETA = "workspace_agent_runs=v1"
@@ -2733,7 +2735,13 @@ class CloudflareRelay:
 
         return _response({"error": "not_found"}, 404)
 
-    async def authorize_request(self, request: Any) -> Response | None:
+    async def authorize_request(
+        self,
+        request: Any,
+        *,
+        resource_path: str = MCP_PATH,
+        resource_name: str = MCP_NAME,
+    ) -> Response | None:
         if self.auth_mode() == "none":
             return None
         auth = str(request.headers.get("authorization") or "")
@@ -2750,29 +2758,46 @@ class CloudflareRelay:
             valid = bool(
                 row
                 and int(row.get("expires_at", 0)) >= _now()
-                and row.get("resource") == self.base_url() + MCP_PATH
+                and row.get("resource") == self.base_url() + resource_path
             )
         if valid:
             return None
-        metadata = f"{self.base_url()}/.well-known/oauth-protected-resource/mcp"
+        metadata = f"{self.base_url()}/.well-known/oauth-protected-resource{resource_path}"
         return _response(
             {"error": "unauthorized", "error_description": "MCP authorization required"},
             401,
-            {"WWW-Authenticate": f'Bearer realm="mcp", resource_metadata="{metadata}"'},
+            {
+                "WWW-Authenticate": (
+                    f'Bearer realm="{resource_name}", resource_metadata="{metadata}"'
+                )
+            },
         )
 
-    async def oauth(self, request: Any, path: str) -> Response:
+    async def oauth(
+        self,
+        request: Any,
+        path: str,
+        *,
+        resource_path: str = MCP_PATH,
+        resource_name: str = MCP_NAME,
+        oauth_prefix: str = "",
+        issuer_path: str = "",
+    ) -> Response:
         base = self.base_url()
+        authorization_server_path = f"/.well-known/oauth-authorization-server{issuer_path}"
+        protected_resource_path = f"/.well-known/oauth-protected-resource{resource_path}"
         if path in {
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-authorization-server/mcp",
-        }:
+            authorization_server_path,
+        } and path != protected_resource_path:
+            issuer = base + issuer_path
             return _response(
                 {
-                    "issuer": base,
-                    "authorization_endpoint": f"{base}/oauth/authorize",
-                    "token_endpoint": f"{base}/oauth/token",
-                    "registration_endpoint": f"{base}/oauth/register",
+                    "issuer": issuer,
+                    "authorization_endpoint": f"{base}{oauth_prefix}/oauth/authorize",
+                    "token_endpoint": f"{base}{oauth_prefix}/oauth/token",
+                    "registration_endpoint": f"{base}{oauth_prefix}/oauth/register",
                     "response_types_supported": ["code"],
                     "grant_types_supported": ["authorization_code"],
                     "token_endpoint_auth_methods_supported": ["none"],
@@ -2783,17 +2808,21 @@ class CloudflareRelay:
         if path in {
             "/.well-known/oauth-protected-resource",
             "/.well-known/oauth-protected-resource/mcp",
-        }:
+            protected_resource_path,
+        } and path != authorization_server_path:
             return _response(
                 {
-                    "resource": base + MCP_PATH,
-                    "authorization_servers": [base],
+                    "resource": base + resource_path,
+                    "authorization_servers": [base + issuer_path],
                     "scopes_supported": self.scopes(),
                     "bearer_methods_supported": ["header"],
-                    "resource_name": MCP_NAME,
+                    "resource_name": resource_name,
                 }
             )
-        if path == "/oauth/register" and request.method == "POST":
+        route_path = path
+        if oauth_prefix and path.startswith(f"{oauth_prefix}/oauth/"):
+            route_path = path[len(oauth_prefix) :]
+        if route_path == "/oauth/register" and request.method == "POST":
             payload = await self._body_json(request)
             redirect_uris = payload.get("redirect_uris")
             if (
@@ -2827,7 +2856,7 @@ class CloudflareRelay:
                 },
                 201,
             )
-        if path == "/oauth/authorize":
+        if route_path == "/oauth/authorize":
             params = (
                 await self._body_params(request)
                 if request.method == "POST"
@@ -2841,7 +2870,8 @@ class CloudflareRelay:
                 html = (
                     "<!doctype html><meta charset=utf-8><title>Authorize</title>"
                     "<main style='font-family:system-ui;max-width:480px;margin:48px auto'>"
-                    "<h1>Authorize MCP</h1><form method='post' action='/oauth/authorize'>"
+                    "<h1>Authorize MCP</h1>"
+                    f"<form method='post' action='{oauth_prefix}/oauth/authorize'>"
                     f"{hidden}<label>Token <input name='login_token' type='password' autofocus></label> "
                     "<button>Authorize</button></form></main>"
                 )
@@ -2866,6 +2896,9 @@ class CloudflareRelay:
             scope = str(params.get("scope") or " ".join(self.scopes()))
             if not _scope_set(scope).issubset(set(self.scopes())):
                 return _text_response("Unsupported scope", 400)
+            requested_resource = str(params.get("resource") or base + resource_path)
+            if requested_resource != base + resource_path:
+                return _text_response("Invalid resource", 400)
             code = "mcp_code_" + secrets.token_urlsafe(32)
             await _db_run(
                 self.state.db,
@@ -2875,7 +2908,7 @@ class CloudflareRelay:
                 redirect_uri,
                 str(params["code_challenge"]),
                 scope,
-                base + MCP_PATH,
+                requested_resource,
                 _now() + 300,
             )
             query = {"code": code}
@@ -2884,7 +2917,7 @@ class CloudflareRelay:
             separator = "&" if "?" in redirect_uri else "?"
             location = redirect_uri + separator + urlencode(query)
             return _text_response("", 302, {"Location": location})
-        if path == "/oauth/token" and request.method == "POST":
+        if route_path == "/oauth/token" and request.method == "POST":
             params = await self._body_params(request)
             code = str(params.get("code") or "")
             row = await _db_first(self.state.db, "SELECT * FROM oauth_codes WHERE code = ?", code)
@@ -2924,8 +2957,17 @@ class CloudflareRelay:
             )
         return _response({"error": "not_found"}, 404)
 
-    async def mcp(self, request: Any) -> Response:
-        unauthorized = await self.authorize_request(request)
+    async def mcp(
+        self,
+        request: Any,
+        *,
+        resource_path: str = MCP_PATH,
+        resource_name: str = MCP_NAME,
+        initialize_instructions: str | None = None,
+    ) -> Response:
+        unauthorized = await self.authorize_request(
+            request, resource_path=resource_path, resource_name=resource_name
+        )
         if unauthorized is not None:
             return unauthorized
         if request.method != "POST":
@@ -2943,8 +2985,8 @@ class CloudflareRelay:
                 result = {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": MCP_NAME, "version": "3.0.0"},
-                    "instructions": (
+                    "serverInfo": {"name": resource_name, "version": "3.0.0"},
+                    "instructions": initialize_instructions or (
                         "Use record_plan, record_progress and record_result for every relay turn. "
                         "If input is required, use ask_user; it delivers the question to the "
                         "current Feishu/Lark reply and keeps the run resumable. "
@@ -4460,13 +4502,52 @@ class CloudflareRelay:
 class Default(WorkerEntrypoint):
     async def fetch(self, request: Any) -> Response:
         # This is the DEV build: the shared MCP exposes Xiao C and Xiao T
-        # tools, while conversation keys keep their routing isolated.
-        from xiaot_worker import CombinedCloudflareRelay
+        # tools, while conversation keys keep their routing isolated. Xiao T
+        # also has a dedicated MCP path so its Agent never receives Xiao C tools.
+        from xiaot_worker import (
+            CombinedCloudflareRelay,
+            XiaotEnvironment,
+            XiaotOnlyCloudflareRelay,
+        )
 
         url = urlparse(request.url)
         state = D1State(self.env.DB)
-        relay = CombinedCloudflareRelay(self.env, self.ctx, state)
         path = url.path
+        xiaot_resource_metadata_path = (
+            f"/.well-known/oauth-protected-resource{XIAOT_MCP_PATH}"
+        )
+        xiaot_authorization_server_path = "/.well-known/oauth-authorization-server/xiaot"
+        if (
+            path == XIAOT_MCP_PATH
+            or path.startswith("/xiaot/oauth/")
+            or path in {xiaot_resource_metadata_path, xiaot_authorization_server_path}
+        ):
+            xiaot_relay = XiaotOnlyCloudflareRelay(
+                XiaotEnvironment(self.env), self.ctx, state
+            )
+            if path == XIAOT_MCP_PATH:
+                return await xiaot_relay.mcp(
+                    request,
+                    resource_path=XIAOT_MCP_PATH,
+                    resource_name=XIAOT_MCP_NAME,
+                    initialize_instructions=(
+                        "This is the isolated DEV MCP server workspace-agent-relay-mcp-xiaot-dev. "
+                        "It exposes only Xiao T's seven allowlisted Bitable tables and the "
+                        "relay tools required by the Xiao T Agent. It is not the shared Xiao C "
+                        "MCP. Use request_id and conversation_key from the current Xiao T run; "
+                        "never access any table outside the allowlist."
+                    ),
+                )
+            return await xiaot_relay.oauth(
+                request,
+                path,
+                resource_path=XIAOT_MCP_PATH,
+                resource_name=XIAOT_MCP_NAME,
+                oauth_prefix="/xiaot",
+                issuer_path="/xiaot",
+            )
+
+        relay = CombinedCloudflareRelay(self.env, self.ctx, state)
         if path == "/health" and request.method == "GET":
             return _response(
                 {
@@ -4492,6 +4573,7 @@ class Default(WorkerEntrypoint):
                         "/lark/oauth/authorize",
                         "/lark/oauth/callback",
                         "/mcp",
+                        XIAOT_MCP_PATH,
                         "/oauth/token",
                     ],
                 }
