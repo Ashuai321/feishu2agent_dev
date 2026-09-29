@@ -579,7 +579,11 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
         def __init__(self):
             self.creates = []
             self.updates = []
+            self.deletes = []
             self.row_fields = {"rec_target": {"Status": "Waiting/Blocked"}}
+            self.deleted_records = set()
+            self.stale_reads_remaining = {}
+            self.stale_fields = {}
 
         @staticmethod
         def resolve_table(table_key):
@@ -610,10 +614,35 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
                 self.row_fields[record_id] = {**self.row_fields[record_id], **fields}
             return {"record_id": record_id, "fields": fields}
 
+        async def delete_record(self, table_key, record_id, *, access_token, platform="feishu"):
+            self.deletes.append((table_key, record_id))
+            assert table_key == "task"
+            assert access_token == "xiaot-user-token"
+            assert platform == "feishu"
+            self.stale_fields[record_id] = self.row_fields.pop(record_id)
+            self.deleted_records.add(record_id)
+            self.stale_reads_remaining[record_id] = 2
+            # Simulate Feishu applying the delete but returning a late 400 error.
+            raise worker.XiaotBitableAPIError(
+                status_code=400,
+                api_code=None,
+                message="Data not ready",
+            )
+
         async def record(self, table_key, record_id, *, access_token, platform="feishu"):
             assert access_token == "xiaot-user-token"
             assert platform == "feishu"
             assert table_key == "task"
+            if record_id in self.deleted_records:
+                remaining = self.stale_reads_remaining[record_id]
+                if remaining:
+                    self.stale_reads_remaining[record_id] = remaining - 1
+                    return {"record_id": record_id, "fields": self.stale_fields[record_id]}
+                raise worker.XiaotBitableAPIError(
+                    status_code=200,
+                    api_code=1254043,
+                    message="RecordIdNotFound",
+                )
             return {
                 "record_id": record_id,
                 "fields": self.row_fields[record_id],
@@ -789,6 +818,52 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
                 "conversation_key": conversation_key,
             },
         )
+
+        await state.claim_event(
+            message_id="xiaot:om_prepare_delete",
+            request_id="xiaot_req_prepare_delete",
+            conversation_key=conversation_key,
+            chat_id="oc_group",
+            open_id="ou_original",
+        )
+        await state.create_run(
+            request_id="xiaot_req_prepare_delete",
+            conversation_key=conversation_key,
+            source_message_id="om_prepare_delete",
+            input_markdown="User task:\n删除这个任务",
+        )
+        await bind_requester("xiaot_req_prepare_delete", "ou_original")
+        delete_proposal = await relay._prepare_mutation(
+            {
+                "request_id": "xiaot_req_prepare_delete",
+                "conversation_key": conversation_key,
+                "operation": "delete",
+                "table_key": "task",
+                "record_id": "rec_target",
+            }
+        )
+        await state.claim_event(
+            message_id="xiaot:om_confirm_delete",
+            request_id="xiaot_req_confirm_delete",
+            conversation_key=conversation_key,
+            chat_id="oc_group",
+            open_id="ou_original",
+        )
+        await state.create_run(
+            request_id="xiaot_req_confirm_delete",
+            conversation_key=conversation_key,
+            source_message_id="om_confirm_delete",
+            input_markdown="User task:\n确认",
+        )
+        await bind_requester("xiaot_req_confirm_delete", "ou_original")
+        delete_confirmed = await relay.call_tool(
+            "confirm_mutation",
+            {
+                "request_id": "xiaot_req_confirm_delete",
+                "conversation_key": conversation_key,
+                "proposal_id": delete_proposal["proposal_id"],
+            },
+        )
         return (
             bitable,
             wrong_user,
@@ -796,6 +871,7 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
             update_proposal,
             refused_update,
             update_confirmed,
+            delete_confirmed,
         )
 
     (
@@ -805,6 +881,7 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
         update_proposal,
         refused_update,
         update_confirmed,
+        delete_confirmed,
     ) = asyncio.run(scenario())
 
     assert wrong_user["isError"] is True
@@ -817,6 +894,53 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
     assert update_confirmed["structuredContent"]["success"] is True
     assert update_confirmed["structuredContent"]["record_id"] == "rec_target"
     assert ("task", "rec_target", {"Status": "In Progress"}) in bitable.updates
+    assert delete_confirmed["structuredContent"]["success"] is True
+    assert delete_confirmed["structuredContent"]["deleted"] is True
+    assert bitable.deletes == [("task", "rec_target")]
+    assert "rec_target" not in bitable.row_fields
+
+
+def test_delete_that_returns_error_but_still_exists_is_not_success_or_retried(monkeypatch):
+    worker = _load_xiaot_module()
+    monkeypatch.setattr(worker, "XIAOT_DELETE_VERIFY_DELAYS", (0.0, 0.0, 0.0))
+
+    class FakeBitable:
+        def __init__(self):
+            self.delete_calls = 0
+
+        async def delete_record(self, *_args, **_kwargs):
+            self.delete_calls += 1
+            raise worker.XiaotBitableAPIError(
+                status_code=400,
+                api_code=None,
+                message="Data not ready",
+            )
+
+        async def record(self, *_args, **_kwargs):
+            return {"record_id": "rec_target", "fields": {"Status": "In Progress"}}
+
+    bitable = FakeBitable()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.xiaot_bitable = bitable
+
+    async def scenario():
+        try:
+            await relay._delete_record_and_verify(
+                "task",
+                "rec_target",
+                expected_fields={"Status": "In Progress"},
+                access_token="xiaot-user-token",
+                platform="feishu",
+            )
+        except RuntimeError as exc:
+            return str(exc)
+        raise AssertionError("a still-present record must not be reported as deleted")
+
+    message = asyncio.run(scenario())
+
+    assert "record still exists" in message
+    assert "Data not ready" in message
+    assert bitable.delete_calls == 1
 
 
 def test_feishu_event_callback_requires_verification_token():

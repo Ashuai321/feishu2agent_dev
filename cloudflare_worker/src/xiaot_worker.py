@@ -7,6 +7,7 @@ Queue, D1 binding, OAuth app, and MCP connector with 小 C.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import secrets
@@ -44,6 +45,7 @@ XIAOT_TOOL_NAMES = {
     "confirm_mutation",
 }
 XIAOT_READ_TOOL_NAMES = {"list_tables", "get_table_fields", "search_records", "get_record"}
+XIAOT_DELETE_VERIFY_DELAYS = (0.0, 0.25, 0.5, 1.0, 2.0)
 XIAOT_TABLES: dict[str, dict[str, str]] = {
     "goal": {
         "table_id": "tblHq7aqhe195HnD",
@@ -92,6 +94,21 @@ _RELAY_TOOLS = {
     "get_run_context",
     "get_requester_info",
 }
+
+
+class XiaotBitableAPIError(RuntimeError):
+    """Keep Bitable error details available for safe post-write verification."""
+
+    def __init__(self, *, status_code: int, api_code: Any, message: str) -> None:
+        self.status_code = int(status_code)
+        try:
+            self.api_code = int(api_code) if api_code is not None else None
+        except (TypeError, ValueError):
+            self.api_code = None
+        self.message = str(message or "unknown Bitable API error")
+        super().__init__(
+            f"Feishu Bitable API failed ({self.status_code}): {self.message}"
+        )
 
 
 class XiaotEnvironment:
@@ -206,7 +223,11 @@ class XiaotBitableClient:
             payload = {"raw": response.text}
         if response.status_code >= 400 or payload.get("code", 0) != 0:
             message = payload.get("msg") or payload.get("message") or response.text
-            raise RuntimeError(f"Feishu Bitable API failed ({response.status_code}): {message}")
+            raise XiaotBitableAPIError(
+                status_code=response.status_code,
+                api_code=payload.get("code"),
+                message=str(message),
+            )
         return payload
 
     @staticmethod
@@ -1811,6 +1832,81 @@ class XiaotCloudflareRelay(CloudflareRelay):
         actual = record.get("fields") if isinstance(record.get("fields"), dict) else {}
         return all(actual.get(key) == value for key, value in expected.items())
 
+    @staticmethod
+    def _is_missing_bitable_record(exc: Exception) -> bool:
+        if isinstance(exc, XiaotBitableAPIError) and exc.api_code == 1254043:
+            return True
+        return re.search(
+            r"\bRecordIdNotFound\b|\b1254043\b|record[_ ]id does not exist|record not found|记录不存在",
+            str(exc),
+            re.IGNORECASE,
+        ) is not None
+
+    async def _delete_record_and_verify(
+        self,
+        table_key: str,
+        record_id: str,
+        *,
+        expected_fields: dict[str, Any],
+        access_token: str,
+        platform: str,
+    ) -> dict[str, Any]:
+        """Issue one delete, then poll read-back to resolve delayed/ambiguous results."""
+        write_error: Exception | None = None
+        try:
+            await self.xiaot_bitable.delete_record(
+                table_key,
+                record_id,
+                access_token=access_token,
+                platform=platform,
+            )
+        except Exception as exc:
+            # A write error does not prove that the remote mutation was not applied.
+            write_error = exc
+
+        last_record: dict[str, Any] | None = None
+        last_read_error: Exception | None = None
+        for delay in XIAOT_DELETE_VERIFY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                current = await self.xiaot_bitable.record(
+                    table_key,
+                    record_id,
+                    access_token=access_token,
+                    platform=platform,
+                )
+            except Exception as exc:
+                if self._is_missing_bitable_record(exc):
+                    return {"record_id": record_id, "deleted": True}
+                last_record = None
+                last_read_error = exc
+                continue
+            if not isinstance(current, dict) or str(current.get("record_id") or "") != record_id:
+                last_record = None
+                last_read_error = RuntimeError(
+                    "Bitable read-back did not identify the requested record"
+                )
+                continue
+            last_record = current
+            last_read_error = None
+
+        if last_record is not None:
+            if last_record.get("fields") != expected_fields:
+                detail = "record still exists but changed after confirmation; deletion was not retried"
+            else:
+                detail = "record still exists after delete and repeated read-back verification"
+            if write_error:
+                detail += f"; delete API error: {_safe_error(write_error)}"
+            raise RuntimeError(detail) from write_error
+
+        detail = "delete was sent, but its outcome could not be verified from Bitable read-back"
+        if write_error:
+            detail += f"; delete API error: {_safe_error(write_error)}"
+        if last_read_error:
+            detail += f"; read-back error: {_safe_error(last_read_error)}"
+        raise RuntimeError(detail) from (write_error or last_read_error)
+
     async def _requester_for_run(
         self, request_id: str, conversation_key: str
     ) -> dict[str, str]:
@@ -2112,9 +2208,12 @@ class XiaotCloudflareRelay(CloudflareRelay):
                         f"update was not verified after {attempt + 1} attempt(s): {detail}"
                     ) from write_error
             else:
-                record = await self.xiaot_bitable.delete_record(
+                record = await self._delete_record_and_verify(
                     table_key,
                     record_id,
+                    expected_fields=before.get("fields")
+                    if isinstance(before.get("fields"), dict)
+                    else {},
                     access_token=access_token,
                     platform=identity["platform"],
                 )
