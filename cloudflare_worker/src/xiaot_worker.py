@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 import httpx
 from worker_app import (
     FEISHU_AUTH_BASE_URL,
+    PLACEHOLDER,
     XIAOT_MCP_NAME,
     XIAOT_MCP_PATH,
     CloudflareRelay,
@@ -832,7 +833,11 @@ class XiaotAgentRelayWorkflow:
                 ),
                 (
                     "Ask about ambiguity. Claim success only after tool verification, then call "
-                    "record_result once to reply to the original Feishu message."
+                    "record_result once to reply to the original Feishu message. The relay "
+                    "mentions the user who invoked this XiaoT request in its replies and final card. "
+                    "If the user cancels the request, do not perform any pending write; call "
+                    "record_result with status=cancelled. If cancellation itself cannot be "
+                    "completed, use status=cancel_failed and state the reason."
                 ),
                 (
                     f"The relay MCP is {self.relay.mcp_name()} at "
@@ -884,6 +889,103 @@ class XiaotCloudflareRelay(CloudflareRelay):
 
     def memory_scope(self) -> str:
         return XIAOT_AGENT_SCOPE
+
+    async def _source_requester_open_id(self, run: dict[str, Any]) -> str:
+        row = await _db_first(
+            self.state.db,
+            "SELECT sender_open_id FROM feishu_events "
+            "WHERE request_id = ? AND conversation_key = ?",
+            str(run.get("request_id") or ""),
+            str(run.get("conversation_key") or ""),
+        )
+        open_id = str((row or {}).get("sender_open_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", open_id):
+            raise RuntimeError("当前小T请求缺少有效的原始发起人 ID，无法安全 @ 发起人")
+        return open_id
+
+    @staticmethod
+    def _mention_requester_text(open_id: str, text: str) -> str:
+        return f'<at user_id="{open_id}">发起人</at> {str(text or "").strip()}'
+
+    @staticmethod
+    def _result_card(run: dict[str, Any], open_id: str) -> dict[str, Any]:
+        status = str(run.get("status") or "done").strip().lower()
+        card_heading, template = {
+            "done": ("任务成功", "turquoise"),
+            "failed": ("任务失败", "red"),
+            "blocked": ("任务被阻塞", "turquoise"),
+            "cancelled": ("取消任务成功", "turquoise"),
+            "cancel_failed": ("取消任务失败", "red"),
+        }.get(status, ("任务失败", "red"))
+        title = str(run.get("title") or "").strip()
+        markdown = str(run.get("markdown") or "").strip()
+        details = "\n\n".join(part for part in (title, markdown) if part)
+        if not details:
+            details = {
+                "done": "任务已完成。",
+                "cancelled": "任务已取消，没有执行后续操作。",
+                "cancel_failed": "取消任务未能完成。",
+            }.get(status, "任务未能完成。")
+        return {
+            "header": {
+                "template": template,
+                "title": {"tag": "plain_text", "content": card_heading},
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"<at id={open_id}></at>\n\n{details}",
+                    },
+                }
+            ],
+        }
+
+    async def deliver_result(self, request_id: str) -> None:
+        """Deliver XiaoT terminal results as a requester-mentioning card."""
+        run = await self.state.get_run(request_id)
+        if not run or int(run.get("delivered") or 0):
+            return
+        requester_open_id = await self._source_requester_open_id(run)
+        api = self.api_for_conversation(str(run.get("conversation_key") or ""))
+        outbound = await api.reply_card(
+            str(run.get("source_message_id") or ""),
+            self._result_card(run, requester_open_id),
+        )
+        placeholder = str(run.get("placeholder_message_id") or "").strip()
+        if placeholder:
+            try:
+                await api.update(placeholder, "本次小T请求已结束，请查看下方结果卡片。")
+            except Exception as exc:
+                print(f"小T placeholder update failed: {_safe_error(exc)}")
+        await _db_run(
+            self.state.db,
+            "UPDATE relay_runs SET delivered = 1, updated_at = ? WHERE request_id = ?",
+            int(time.time()),
+            request_id,
+        )
+        await self.state.save_reply(outbound, str(run.get("conversation_key") or ""))
+
+    async def deliver_question(self, request_id: str) -> None:
+        """Keep XiaoT clarification replies in place and mention their requester."""
+        run = await self.state.get_run(request_id)
+        if not run or str(run.get("status") or "") != "needs_user":
+            return
+        open_id = await self._source_requester_open_id(run)
+        text = str(run.get("progress_message") or "请补充必要信息。")
+        text = self._mention_requester_text(open_id, text)
+        api = self.api_for_conversation(str(run.get("conversation_key") or ""))
+        placeholder = str(run.get("placeholder_message_id") or "").strip()
+        if placeholder:
+            try:
+                await api.update(placeholder, text)
+                return
+            except Exception as exc:
+                print(f"小T question update failed; sending a reply: {_safe_error(exc)}")
+        outbound = await api.reply(str(run.get("source_message_id") or ""), text)
+        await self.state.update_run(request_id, placeholder_message_id=str(outbound))
+        await self.state.save_reply(outbound, str(run.get("conversation_key") or ""))
 
     @staticmethod
     def _record_owned_by(
@@ -989,6 +1091,34 @@ class XiaotCloudflareRelay(CloudflareRelay):
         )
         if not claimed:
             return
+        if not run.get("placeholder_message_id"):
+            try:
+                requester_open_id = await self._source_requester_open_id(run)
+                placeholder_id = await self.api_for_conversation(
+                    str(run.get("conversation_key") or "")
+                ).reply(
+                    str(run.get("source_message_id") or ""),
+                    self._mention_requester_text(requester_open_id, PLACEHOLDER),
+                )
+                await self.state.update_run(
+                    request_id, placeholder_message_id=str(placeholder_id)
+                )
+                await self.state.save_reply(
+                    str(placeholder_id), str(run.get("conversation_key") or "")
+                )
+            except Exception as exc:
+                message = _safe_error(exc)
+                await self.state.update_run(
+                    request_id,
+                    status="failed",
+                    trigger_status=0,
+                    trigger_error=message,
+                    title="Agent 任务失败",
+                    markdown=message,
+                    completed_at=int(time.time()),
+                )
+                await self.deliver_result(request_id)
+                return
         # Queue delivery is at-least-once. Only the worker that atomically
         # moved this run from queued may send the processing reply or trigger
         # the Agent, preventing duplicate placeholders on concurrent retries.
@@ -1814,6 +1944,12 @@ class XiaotCloudflareRelay(CloudflareRelay):
                     "Feishu/Lark OAuth app. Use this exact open_id in person fields as "
                     "[{\"id\": \"open_id\"}]; do not use the bot-event open_id."
                 )
+            elif item.get("name") == "record_result":
+                item["description"] = (
+                    "结束当前小T请求并回复 Feishu。status 使用 done/failed/blocked；"
+                    "用户取消请求且未执行后续操作时使用 cancelled；取消未能完成时使用 "
+                    "cancel_failed。DEV relay 会返回带有本次发起人 @提及的状态消息卡片。"
+                )
         string = {"type": "string"}
         definitions.extend(
             [
@@ -1946,6 +2082,62 @@ class XiaotCloudflareRelay(CloudflareRelay):
         return definitions
 
     async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        status = str(args.get("status") or "").strip().lower()
+        if name == "record_result" and status in {
+            "cancelled",
+            "canceled",
+            "cancel_failed",
+        }:
+            run = await self._require_xiaot_run(args)
+            request_id = str(run["request_id"])
+            conversation_key = str(args.get("conversation_key") or "")
+            if run.get("completed_at"):
+                return self._tool_result(
+                    {
+                        "success": True,
+                        "request_id": request_id,
+                        "status": run.get("status"),
+                        "already_recorded": True,
+                    }
+                )
+            image_results: list[dict[str, Any]] = []
+            try:
+                for image_args in self._result_image_args(args):
+                    image_results.append(
+                        await self._send_agent_image(
+                            request_id, conversation_key, image_args
+                        )
+                    )
+            except Exception as exc:
+                return self._tool_result(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "image_send_failed",
+                            "message": _safe_error(exc),
+                        },
+                        "result_not_recorded": True,
+                        "images_sent": image_results,
+                    },
+                    True,
+                )
+            normalized_status = "cancelled" if status == "canceled" else status
+            await self.state.update_run(
+                request_id,
+                status=normalized_status,
+                title=str(args.get("title") or ""),
+                markdown=str(args.get("markdown") or ""),
+                completed_at=int(time.time()),
+            )
+            await self._enqueue({"kind": "deliver_result", "request_id": request_id})
+            return self._tool_result(
+                {
+                    "success": True,
+                    "request_id": request_id,
+                    "status": normalized_status,
+                    "images_sent": image_results,
+                }
+            )
         if name in _RELAY_TOOLS:
             if name == "get_run_context":
                 conversation_key = str(args.get("conversation_key") or "")

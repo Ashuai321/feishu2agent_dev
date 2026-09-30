@@ -1645,6 +1645,13 @@ def test_duplicate_queue_delivery_claims_xiaot_run_before_processing_reply():
     async def scenario():
         state = worker.D1State(FakeD1())
         await state.ensure_schema()
+        await state.claim_event(
+            message_id="xiaot:om_source",
+            request_id="xiaot_run_duplicate",
+            conversation_key="xiaot:cli_xiaot:oc_group:dedupe",
+            chat_id="oc_group",
+            open_id="ou_requester",
+        )
         await state.create_run(
             request_id="xiaot_run_duplicate",
             conversation_key="xiaot:cli_xiaot:oc_group:dedupe",
@@ -1657,10 +1664,17 @@ def test_duplicate_queue_delivery_claims_xiaot_run_before_processing_reply():
             calls.append(body["request_id"])
             await asyncio.sleep(0)
 
+        class FakeFeishuAPI:
+            async def reply(self, message_id, text):
+                assert message_id == "om_source"
+                assert '<at user_id="ou_requester">发起人</at>' in text
+                return "om_placeholder"
+
         original = worker.CloudflareRelay.run_agent_job
         worker.CloudflareRelay.run_agent_job = process_once
         try:
             relay = worker.XiaotCloudflareRelay(SimpleNamespace(), None, state)
+            relay.api_for_conversation = lambda _key: FakeFeishuAPI()
             await asyncio.gather(
                 relay.run_agent_job({"request_id": "xiaot_run_duplicate"}),
                 relay.run_agent_job({"request_id": "xiaot_run_duplicate"}),
@@ -1830,6 +1844,120 @@ def test_xiaot_instructions_have_bitable_workflow_and_no_calendar_routes():
     assert "search_person_candidates" in content
     assert "毫秒时间戳" in content
     assert "William" in content and "元博 王" in content
+
+
+def test_xiaot_result_cards_mention_source_user_for_every_terminal_status():
+    worker = _load_xiaot_module()
+    expected = {
+        "done": "任务成功",
+        "failed": "任务失败",
+        "blocked": "任务被阻塞",
+        "cancelled": "取消任务成功",
+        "cancel_failed": "取消任务失败",
+    }
+    for status, heading in expected.items():
+        card = worker.XiaotCloudflareRelay._result_card(
+            {"status": status, "title": "测试结果", "markdown": "已核实"},
+            "ou_requester",
+        )
+        assert card["header"]["title"]["content"] == heading
+        assert "<at id=ou_requester></at>" in card["elements"][0]["text"]["content"]
+
+
+def test_xiaot_deliver_result_sends_mention_card_and_marks_run_delivered(monkeypatch):
+    worker = _load_xiaot_module()
+    run = {
+        "request_id": "xiaot_result_1",
+        "conversation_key": "xiaot:app:chat:thread",
+        "source_message_id": "om_source",
+        "placeholder_message_id": "om_placeholder",
+        "status": "cancelled",
+        "title": "用户取消",
+        "markdown": "未执行写入。",
+        "delivered": 0,
+    }
+
+    class State:
+        db = object()
+
+        def __init__(self):
+            self.saved = None
+
+        async def get_run(self, _request_id):
+            return run
+
+        async def save_reply(self, outbound, conversation_key):
+            self.saved = (outbound, conversation_key)
+
+    class API:
+        def __init__(self):
+            self.card = None
+            self.updated = []
+
+        async def reply_card(self, message_id, card):
+            self.card = (message_id, card)
+            return "om_result_card"
+
+        async def update(self, message_id, text):
+            self.updated.append((message_id, text))
+
+    state = State()
+    api = API()
+    relay = worker.XiaotOnlyCloudflareRelay(SimpleNamespace(), None, state)
+
+    async def requester(_run):
+        return "ou_requester"
+
+    async def db_run(_db, sql, *_args):
+        assert "SET delivered = 1" in sql
+
+    relay._source_requester_open_id = requester
+    relay.api_for_conversation = lambda _key: api
+    monkeypatch.setattr(worker, "_db_run", db_run)
+    asyncio.run(relay.deliver_result("xiaot_result_1"))
+
+    assert api.card[0] == "om_source"
+    assert "<at id=ou_requester></at>" in api.card[1]["elements"][0]["text"]["content"]
+    assert api.updated == [("om_placeholder", "本次小T请求已结束，请查看下方结果卡片。")]
+    assert state.saved == ("om_result_card", "xiaot:app:chat:thread")
+
+
+def test_xiaot_cancel_result_records_cancelled_and_queues_terminal_card(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = worker.XiaotOnlyCloudflareRelay(SimpleNamespace(), None, SimpleNamespace())
+    updates = []
+    queued = []
+
+    async def require_run(_args):
+        return {"request_id": "xiaot_cancel_1", "completed_at": None}
+
+    async def update_run(request_id, **fields):
+        updates.append((request_id, fields))
+
+    async def enqueue(body):
+        queued.append(body)
+
+    relay._require_xiaot_run = require_run
+    relay.state.update_run = update_run
+    relay._enqueue = enqueue
+    monkeypatch.setattr(relay, "_result_image_args", lambda _args: [])
+
+    result = asyncio.run(
+        relay.call_tool(
+            "record_result",
+            {
+                "request_id": "xiaot_cancel_1",
+                "conversation_key": "xiaot:app:chat:thread",
+                "status": "canceled",
+                "title": "用户取消",
+                "markdown": "未执行写入。",
+            },
+        )
+    )
+
+    assert result["structuredContent"]["status"] == "cancelled"
+    assert updates[0][1]["status"] == "cancelled"
+    assert queued == [{"kind": "deliver_result", "request_id": "xiaot_cancel_1"}]
 
 
 def test_lark_requester_is_resolved_in_lark_user_namespace():
