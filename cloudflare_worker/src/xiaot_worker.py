@@ -351,7 +351,14 @@ class XiaotBitableClient:
             access_token=access_token,
             platform=platform,
         )
-        return payload.get("data") or {"record_id": record_id, "deleted": True}
+        # Bitable documents successful deletion as code=0 with data.deleted=true
+        # and the exact record_id. Do not infer success from an empty response.
+        data = payload.get("data")
+        if not isinstance(data, dict) or data.get("deleted") is not True:
+            raise RuntimeError("Bitable delete response did not confirm deletion")
+        if str(data.get("record_id") or "") != record_id:
+            raise RuntimeError("Bitable delete response record_id did not match the target")
+        return data
 
     @staticmethod
     def _validate_record_id(record_id: str) -> None:
@@ -1851,14 +1858,25 @@ class XiaotCloudflareRelay(CloudflareRelay):
         access_token: str,
         platform: str,
     ) -> dict[str, Any]:
-        """Issue one delete, then poll read-back to resolve delayed/ambiguous results."""
+        """Trust an exact success response; poll the target ID only if ambiguous."""
         write_error: Exception | None = None
         try:
-            await self.xiaot_bitable.delete_record(
+            result = await self.xiaot_bitable.delete_record(
                 table_key,
                 record_id,
                 access_token=access_token,
                 platform=platform,
+            )
+            if (
+                isinstance(result, dict)
+                and result.get("deleted") is True
+                and str(result.get("record_id") or "") == record_id
+            ):
+                # The DELETE response itself confirms the exact target row;
+                # avoid a second read that can be slow or temporarily stale.
+                return result
+            write_error = RuntimeError(
+                "Bitable delete response did not confirm deletion of the target record"
             )
         except Exception as exc:
             # A write error does not prove that the remote mutation was not applied.

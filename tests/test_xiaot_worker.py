@@ -943,6 +943,59 @@ def test_delete_that_returns_error_but_still_exists_is_not_success_or_retried(mo
     assert bitable.delete_calls == 1
 
 
+def test_delete_success_response_confirms_exact_row_without_readback():
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class FakeBitable:
+        async def delete_record(self, *_args, **_kwargs):
+            return {"deleted": True, "record_id": "rec_target"}
+
+        async def record(self, *_args, **_kwargs):
+            raise AssertionError("a successful DELETE response must not trigger a read-back")
+
+    relay.xiaot_bitable = FakeBitable()
+    result = asyncio.run(
+        relay._delete_record_and_verify(
+            "task",
+            "rec_target",
+            expected_fields={"Status": "In Progress"},
+            access_token="xiaot-user-token",
+            platform="feishu",
+        )
+    )
+
+    assert result == {"deleted": True, "record_id": "rec_target"}
+
+
+def test_bitable_delete_requires_documented_success_response_fields():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(SimpleNamespace())
+    calls = []
+
+    async def successful_response(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {
+            "code": 0,
+            "msg": "success",
+            "data": {"deleted": True, "record_id": "rec_target"},
+        }
+
+    client.request = successful_response
+    result = asyncio.run(
+        client.delete_record(
+            "task",
+            "rec_target",
+            access_token="xiaot-user-token",
+            platform="feishu",
+        )
+    )
+
+    assert result == {"deleted": True, "record_id": "rec_target"}
+    assert calls[0][0] == "DELETE"
+    assert calls[0][1].endswith("/records/rec_target")
+
+
 def test_feishu_event_callback_requires_verification_token():
     worker = _load_xiaot_module()
     relay = object.__new__(worker.XiaotCloudflareRelay)
