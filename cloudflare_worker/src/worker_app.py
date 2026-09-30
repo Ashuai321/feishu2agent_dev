@@ -4520,6 +4520,7 @@ class Default(WorkerEntrypoint):
         if (
             path == XIAOT_MCP_PATH
             or path.startswith("/xiaot/oauth/")
+            or path == "/xiaot/user-oauth/start"
             or path in {xiaot_resource_metadata_path, xiaot_authorization_server_path}
         ):
             xiaot_relay = XiaotOnlyCloudflareRelay(
@@ -4538,6 +4539,8 @@ class Default(WorkerEntrypoint):
                         "never access any table outside the allowlist."
                     ),
                 )
+            if path == "/xiaot/user-oauth/start":
+                return await xiaot_relay.handle_user_oauth_start(request)
             return await xiaot_relay.oauth(
                 request,
                 path,
@@ -4572,6 +4575,7 @@ class Default(WorkerEntrypoint):
                         "/lark/events",
                         "/lark/oauth/authorize",
                         "/lark/oauth/callback",
+                        "/xiaot/user-oauth/start",
                         "/mcp",
                         XIAOT_MCP_PATH,
                         "/oauth/token",

@@ -1695,8 +1695,8 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
             return None
 
     class FakeAPI:
-        async def reply_card(self, message_id, card):
-            replies.append((message_id, card))
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            replies.append((chat_id, open_id, card))
             return "om_auth_reply"
 
     relay.identity_relay = FakeIdentityRelay()
@@ -1713,6 +1713,7 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
     monkeypatch.setattr(worker, "_db_run", capture_sql)
     event = {
         "message_id": "om_original",
+        "chat_id": "oc_requester_group",
         "open_id": "ou_external_event",
         "union_id": "on_requester_stable",
         "text": "查询我的 task",
@@ -1747,11 +1748,98 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
     )
     assert params[11] == "https://bot.boooe.com/lark/oauth/callback"
     assert '"text":"查询我的 task"' in params[12]
-    card = replies[0][1]
-    auth_url = card["elements"][1]["actions"][0]["url"]
-    assert auth_url.startswith("https://accounts.larksuite.com/")
-    assert "app_id=cli_lark_dev" in auth_url
+    assert replies[0][0:2] == ("oc_requester_group", "ou_external_event")
+    card = replies[0][2]
+    launch_url = card["elements"][1]["actions"][0]["url"]
+    assert launch_url.startswith("https://bot.boooe.com/xiaot/user-oauth/start?")
+    assert "platform=lark" in launch_url
+    assert "accounts.larksuite.com" not in launch_url
     assert "飞书文档" not in str(card) and "Lark 文档" not in str(card)
+
+
+def test_xiaot_oauth_start_page_opens_popup_and_validates_pending_state(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    pending = {
+        "platform": "lark",
+        "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
+        "expires_at": int(worker.time.time()) + 600,
+        "consumed_at": None,
+    }
+
+    class CapturedResponse:
+        def __init__(self, body, *, status=200, headers=None):
+            self.body = body
+            self.status = status
+            self.headers = headers or {}
+
+    class FakeIdentityRelay:
+        env = worker.XiaotLarkOAuthEnvironment(
+            SimpleNamespace(XIAOT_LARK_APP_ID="cli_xiaot_lark")
+        )
+
+        def base_url(self):
+            return "https://bot.boooe.com"
+
+        def platform_oauth_scope(self, platform):
+            assert platform == "lark"
+            return "bitable:app"
+
+    class FakeState:
+        db = object()
+
+    async def lookup(_db, sql, *params):
+        assert "consumed_at IS NULL" in sql
+        assert params == ("xiaot_lark_nonce", "lark")
+        return pending
+
+    monkeypatch.setattr(worker, "_db_first", lookup)
+    monkeypatch.setattr(worker, "Response", CapturedResponse)
+    relay.identity_relay = FakeIdentityRelay()
+    relay.state = FakeState()
+    relay._ensure_xiaot_oauth_schema = lambda: asyncio.sleep(0)
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/xiaot/user-oauth/start?platform=lark&state=xiaot_lark_nonce",
+    )
+
+    response = asyncio.run(relay.handle_user_oauth_start(request))
+
+    assert response.status == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert "window.open(config.auth_url" in response.body
+    assert "window.opener.postMessage" not in response.body
+    assert "xiaot_oauth_popup" in response.body
+    assert "accounts.larksuite.com/open-apis/authen/v1/authorize" in response.body
+    assert "cli_xiaot_lark" in response.body
+    assert "new BroadcastChannel(config.channel_name)" in response.body
+    assert "window.close()" in response.body
+
+
+def test_xiaot_user_oauth_start_route_uses_xiaot_relay(monkeypatch):
+    worker = _load_xiaot_module()
+    app = sys.modules["worker_app"]
+    entry = object.__new__(app.Default)
+    entry.env = SimpleNamespace(DB=object())
+    entry.ctx = None
+    calls = []
+
+    class FakeRelay:
+        async def handle_user_oauth_start(self, request):
+            calls.append(request.url)
+            return "xiaot-start-page"
+
+    monkeypatch.setattr(app, "D1State", lambda _db: object())
+    monkeypatch.setattr(worker, "XiaotOnlyCloudflareRelay", lambda *_args: FakeRelay())
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/xiaot/user-oauth/start?platform=feishu&state=xiaot_feishu_nonce",
+    )
+
+    result = asyncio.run(entry.fetch(request))
+
+    assert result == "xiaot-start-page"
+    assert calls == [request.url]
 
 
 def test_combined_oauth_routes_only_matching_xiaot_state_to_xiaot(monkeypatch):
@@ -1793,6 +1881,13 @@ def test_combined_oauth_routes_only_matching_xiaot_state_to_xiaot(monkeypatch):
 def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monkeypatch):
     worker = _load_xiaot_module()
     relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class CapturedResponse:
+        def __init__(self, body, *, status=200, headers=None):
+            self.body = body
+            self.status = status
+            self.headers = headers or {}
+
     pending = {
         "platform": "lark",
         "account_open_id": "",
@@ -1880,6 +1975,7 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     monkeypatch.setattr(worker, "_db_all", consume)
     monkeypatch.setattr(worker, "_db_run", capture_sql)
     monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: FakeClient())
+    monkeypatch.setattr(worker, "Response", CapturedResponse)
     monkeypatch.setattr(
         worker,
         "_response",
@@ -1900,8 +1996,13 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
 
     result = asyncio.run(relay.handle_user_oauth_callback(request, "lark"))
 
-    assert result["status"] == 200
-    assert result["payload"]["success"] is True
+    assert result.status == 200
+    assert result.headers["content-type"] == "text/html; charset=utf-8"
+    assert "window.opener.postMessage(result,window.location.origin)" in result.body
+    assert '"state":"xiaot_lark_nonce"' in result.body
+    assert 'new BroadcastChannel("xiaot-oauth-xiaot_lark_nonce")' in result.body
+    assert "window.close()" in result.body
+    assert '"success":true' in result.body
     assert exchange_calls[0][0] == "https://accounts.larksuite.com/oauth/v3/token"
     assert exchange_calls[0][1]["data"]["client_id"] == "cli_lark_app"
     assert exchange_calls[0][1]["data"]["client_secret"] == "xiaot-lark-secret"

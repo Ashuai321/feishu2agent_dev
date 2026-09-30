@@ -96,6 +96,124 @@ _RELAY_TOOLS = {
 }
 
 
+def _html_response(body: str, status: int = 200, *, nonce: str = "") -> Response:
+    headers = {
+        "cache-control": "no-store",
+        "content-type": "text/html; charset=utf-8",
+        "referrer-policy": "no-referrer",
+        "x-content-type-options": "nosniff",
+    }
+    if nonce:
+        headers["content-security-policy"] = (
+            f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        )
+    return Response(
+        body,
+        status=status,
+        headers=headers,
+    )
+
+
+def _oauth_launcher_page(auth_url: str, origin: str, state: str) -> Response:
+    nonce = secrets.token_urlsafe(18)
+    channel_name = f"xiaot-oauth-{state}"
+    config = _json(
+        {
+            "auth_url": auth_url,
+            "origin": origin,
+            "state": state,
+            "channel_name": channel_name,
+        }
+    )
+    config = config.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    body = f"""<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小T账号授权</title>
+<style>
+body{{
+  font:16px system-ui,sans-serif;
+  max-width:36rem;
+  margin:12vh auto;
+  padding:0 1.25rem;
+  color:#1f2937;
+}}
+button{{
+  font:inherit;
+  padding:.7rem 1.1rem;
+  border:0;
+  border-radius:.5rem;
+  background:#2563eb;
+  color:white;
+  cursor:pointer;
+}}
+#status{{line-height:1.6;color:#475569}}
+</style>
+<h1>小T账号授权</h1>
+<p>点击下方按钮打开安全授权窗口。授权成功后，授权窗口会自动关闭，原请求会继续处理。</p>
+<button id="open-auth" type="button">打开授权窗口</button>
+<p id="status" role="status">请确认浏览器允许弹出授权窗口。</p>
+<script nonce="{nonce}">
+const config={config};
+let authPopup=null;
+const status=document.getElementById("status");
+document.getElementById("open-auth").addEventListener("click",()=>{{
+  authPopup=window.open(config.auth_url,"xiaot_oauth_popup","popup=yes,width=600,height=760,resizable=yes,scrollbars=yes");
+  if(!authPopup){{status.textContent="授权窗口被浏览器拦截了，请允许此网站弹出窗口后重试。";return;}}
+  status.textContent="请在弹出的窗口中完成授权；完成后本页会自动更新。";
+  authPopup.focus();
+}});
+window.addEventListener("message",event=>{{
+  if(event.origin!==config.origin || event.source!==authPopup)return;
+  handleResult(event.data);
+}});
+function handleResult(result){{
+  if (!result || result.type!=="xiaot-user-oauth-result" || result.state!==config.state) return;
+  status.textContent = result.success
+    ? "授权成功，刚才的请求正在继续处理。可以返回飞书。"
+    : "授权未完成，请返回飞书查看提示并重试。";
+  if(result.success)window.close();
+}}
+if("BroadcastChannel" in window){{
+  const resultChannel=new BroadcastChannel(config.channel_name);
+  resultChannel.addEventListener("message",event=>handleResult(event.data));
+}}
+</script></html>"""
+    return _html_response(body, nonce=nonce)
+
+
+def _oauth_callback_page(platform: str, state: str) -> Response:
+    nonce = secrets.token_urlsafe(18)
+    result = _json(
+        {
+            "type": "xiaot-user-oauth-result",
+            "success": True,
+            "platform": platform,
+            "state": state,
+        }
+    )
+    result = result.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    body = f"""<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>授权完成</title>
+<h1>授权完成</h1>
+<p>正在通知原页面并关闭授权窗口。若窗口未自动关闭，请返回飞书继续使用。</p>
+<script nonce="{nonce}">
+const result={result};
+if(window.opener&&!window.opener.closed)window.opener.postMessage(result,window.location.origin);
+if("BroadcastChannel" in window){{
+  const resultChannel=new BroadcastChannel("xiaot-oauth-{state}");
+  resultChannel.postMessage(result);
+  setTimeout(()=>{{resultChannel.close();window.close();}},150);
+}}else{{window.close();}}
+</script></html>"""
+    return _html_response(body, nonce=nonce)
+
+
 class XiaotBitableAPIError(RuntimeError):
     """Keep Bitable error details available for safe post-write verification."""
 
@@ -1090,6 +1208,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
         platform = str(account_identity.get("platform") or "feishu")
         open_id = str(account_identity.get("open_id") or "").strip()
         source_open_id = str(event.get("open_id") or "").strip()
+        source_chat_id = str(event.get("chat_id") or "").strip()
         source_union_id = str(event.get("union_id") or "").strip()
         source_user_id = str(event.get("user_id") or "").strip()
         source_platform = str(account_identity.get("source_platform") or "feishu").strip()
@@ -1132,17 +1251,8 @@ class XiaotCloudflareRelay(CloudflareRelay):
             expires_at,
             int(time.time()),
         )
-        scope = self.identity_relay.platform_oauth_scope(platform)
-        auth_base = (
-            "https://accounts.larksuite.com" if platform == "lark" else FEISHU_AUTH_BASE_URL
-        )
-        auth_url = f"{auth_base}/open-apis/authen/v1/authorize?" + urlencode(
-            {
-                "app_id": _env(self.identity_relay.env, f"{platform.upper()}_APP_ID"),
-                "redirect_uri": redirect_uri,
-                "scope": scope,
-                "state": state,
-            }
+        launch_url = self.identity_relay.base_url() + "/xiaot/user-oauth/start?" + urlencode(
+            {"platform": platform, "state": state}
         )
         card = {
             "config": {"wide_screen_mode": True},
@@ -1153,7 +1263,8 @@ class XiaotCloudflareRelay(CloudflareRelay):
                         "tag": "lark_md",
                         "content": (
                             "小 T 需要使用当前发起人的账号权限访问多维表格。"
-                            f"请使用你的 {platform.title()} 账号授权；授权后会自动继续刚才的请求。"
+                            f"请使用你的 {platform.title()} 账号授权；点击后在页面中打开授权窗口，"
+                            "授权成功后窗口会自动关闭并继续刚才的请求。"
                         ),
                     },
                 },
@@ -1164,16 +1275,59 @@ class XiaotCloudflareRelay(CloudflareRelay):
                             "tag": "button",
                             "text": {"tag": "plain_text", "content": "授权并继续"},
                             "type": "primary",
-                            "url": auth_url,
+                            "url": launch_url,
                         }
                     ],
                 },
             ],
         }
-        outbound = await self.api_for_conversation(conversation_key).reply_card(
-            str(event["message_id"]), card
+        if not source_chat_id or not source_open_id:
+            raise RuntimeError("无法安全发送仅本人可见的授权卡片：缺少群组或发起人标识")
+        outbound = await self.api_for_conversation(conversation_key).send_ephemeral_card(
+            chat_id=source_chat_id,
+            open_id=source_open_id,
+            card=card,
         )
         await self.state.save_reply(str(outbound), conversation_key)
+
+    async def handle_user_oauth_start(self, request: Any) -> Response:
+        if str(request.method or "").upper() != "GET":
+            return _response({"error": "method_not_allowed"}, 405, {"allow": "GET"})
+        params = parse_qs(urlparse(request.url).query)
+        platform = str((params.get("platform") or [""])[0]).strip().lower()
+        state = str((params.get("state") or [""])[0]).strip()
+        if platform not in {"feishu", "lark"} or not state.startswith(f"xiaot_{platform}_"):
+            return _response({"success": False, "error": "invalid_authorization_request"}, 400)
+        await self._ensure_xiaot_oauth_schema()
+        pending = await _db_first(
+            self.state.db,
+            "SELECT * FROM xiaot_bitable_oauth_states "
+            "WHERE state = ? AND platform = ? AND consumed_at IS NULL",
+            state,
+            platform,
+        )
+        if (
+            not pending
+            or int(pending.get("expires_at") or 0) < int(time.time())
+            or not str(pending.get("redirect_uri") or "").strip()
+        ):
+            return _response(
+                {"success": False, "error": "invalid_or_expired_state"}, 400
+            )
+        auth_base = (
+            "https://accounts.larksuite.com" if platform == "lark" else FEISHU_AUTH_BASE_URL
+        )
+        auth_url = f"{auth_base}/open-apis/authen/v1/authorize?" + urlencode(
+            {
+                "app_id": _env(self.identity_relay.env, f"{platform.upper()}_APP_ID"),
+                "redirect_uri": str(pending["redirect_uri"]),
+                "scope": self.identity_relay.platform_oauth_scope(platform),
+                "state": state,
+            }
+        )
+        parsed_base = urlparse(self.identity_relay.base_url())
+        origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+        return _oauth_launcher_page(auth_url, origin, state)
 
     async def handle_user_oauth_callback(self, request: Any, platform: str) -> Response:
         if str(request.method or "").upper() != "GET":
@@ -1356,12 +1510,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
                     event=event,
                     request_id=request_id,
                 )
-            return _response(
-                {
-                    "success": True,
-                    "message": "授权完成，刚才的请求已自动继续处理。",
-                }
-            )
+            return _oauth_callback_page(normalized, state)
         except Exception as exc:
             return _response(
                 {
