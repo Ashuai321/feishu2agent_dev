@@ -992,6 +992,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 source_message_id TEXT NOT NULL,
                 redirect_uri TEXT NOT NULL,
                 event_json TEXT NOT NULL DEFAULT '{}',
+                authorization_message_id TEXT NOT NULL DEFAULT '',
                 expires_at INTEGER NOT NULL,
                 consumed_at INTEGER,
                 created_at INTEGER NOT NULL
@@ -1008,6 +1009,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
             ("source_platform", "TEXT NOT NULL DEFAULT 'feishu'"),
             ("request_id", "TEXT NOT NULL DEFAULT ''"),
             ("event_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("authorization_message_id", "TEXT NOT NULL DEFAULT ''"),
         ):
             with suppress(Exception):
                 await _db_run(
@@ -1288,7 +1290,58 @@ class XiaotCloudflareRelay(CloudflareRelay):
             open_id=source_open_id,
             card=card,
         )
+        await _db_run(
+            self.state.db,
+            "UPDATE xiaot_bitable_oauth_states SET authorization_message_id = ? "
+            "WHERE state = ? AND consumed_at IS NULL",
+            str(outbound),
+            state,
+        )
         await self.state.save_reply(str(outbound), conversation_key)
+
+    async def _replace_authorization_card_with_success(
+        self, pending: dict[str, Any]
+    ) -> None:
+        """Replace XiaoT's private authorization card with a private success card."""
+        try:
+            event = json.loads(str(pending.get("event_json") or "{}"))
+            if not isinstance(event, dict):
+                raise RuntimeError("授权状态缺少原始事件")
+            chat_id = str(event.get("chat_id") or "").strip()
+            open_id = str(event.get("open_id") or "").strip()
+            conversation_key = str(pending.get("conversation_key") or "").strip()
+            if not chat_id or not open_id or not conversation_key:
+                raise RuntimeError("授权状态缺少私有卡片接收人信息")
+
+            api = self.api_for_conversation(conversation_key)
+            success_card = {
+                "config": {"wide_screen_mode": True},
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {"tag": "plain_text", "content": "授权成功！"},
+                    }
+                ],
+            }
+            # Ephemeral cards do not use the shared-card PATCH flow. Send the
+            # replacement first, then remove the old card to avoid losing the
+            # success confirmation if sending the replacement fails.
+            await api.send_ephemeral_card(
+                chat_id=chat_id,
+                open_id=open_id,
+                card=success_card,
+            )
+            old_message_id = str(pending.get("authorization_message_id") or "").strip()
+            if old_message_id:
+                await api._request(
+                    "POST",
+                    "/open-apis/ephemeral/v1/delete",
+                    json={"message_id": old_message_id},
+                )
+        except Exception as exc:
+            # OAuth and the user's request have already succeeded. A transient
+            # card-rendering error must not undo their authorization.
+            print(f"小T授权成功卡片更新失败: {_safe_error(exc)}")
 
     async def handle_user_oauth_start(self, request: Any) -> Response:
         if str(request.method or "").upper() != "GET":
@@ -1484,6 +1537,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 refresh_token=str(token_data.get("refresh_token") or ""),
                 expires_at=int(time.time()) + int(token_data.get("expires_in") or 7200),
             )
+            await self._replace_authorization_card_with_success(pending)
             event = json.loads(str(pending.get("event_json") or "{}"))
             request_id = str(pending.get("request_id") or "")
             conversation_key = str(pending.get("conversation_key") or "")

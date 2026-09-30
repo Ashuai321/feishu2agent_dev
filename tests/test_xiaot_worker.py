@@ -1748,6 +1748,11 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
     )
     assert params[11] == "https://bot.boooe.com/lark/oauth/callback"
     assert '"text":"查询我的 task"' in params[12]
+    _, card_id_params = next(
+        item for item in statements if "SET authorization_message_id = ?" in item[0]
+    )
+    assert card_id_params[0] == "om_auth_reply"
+    assert card_id_params[1].startswith("xiaot_lark_")
     assert replies[0][0:2] == ("oc_requester_group", "ou_external_event")
     card = replies[0][2]
     launch_url = card["elements"][1]["actions"][0]["url"]
@@ -1896,14 +1901,19 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
         "source_user_id": "",
         "source_platform": "feishu",
         "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
+        "authorization_message_id": "om_private_auth_card",
         "expires_at": int(worker.time.time()) + 600,
-        "event_json": '{"message_id":"om_original","text":"查询 task"}',
+        "event_json": (
+            '{"message_id":"om_original","chat_id":"oc_requester_group",'
+            '"open_id":"ou_external_event","text":"查询 task"}'
+        ),
         "request_id": "xiaot_original_request",
         "conversation_key": "xiaot:cli_xiaot:oc_group:thread",
     }
     exchange_calls = []
     saved_tokens = []
     resumed = []
+    private_card_calls = []
 
     class FakeResponse:
         status_code = 200
@@ -1940,6 +1950,15 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
         def api_for_conversation(self, conversation_key):
             assert conversation_key == "lark:oauth"
             return FakeAPI()
+
+    class FakeFeishuMessageAPI:
+        async def send_ephemeral_card(self, *, chat_id, open_id, card):
+            private_card_calls.append(("send", chat_id, open_id, card))
+            return "om_private_success_card"
+
+        async def _request(self, method, path, **kwargs):
+            private_card_calls.append(("delete", method, path, kwargs))
+            return {"code": 0}
 
     class FakeState:
         db = object()
@@ -1987,6 +2006,7 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     )
     relay.state = FakeState()
     relay.identity_relay = FakeIdentityRelay()
+    relay.api_for_conversation = lambda conversation_key: FakeFeishuMessageAPI()
     relay.agent_workflow = FakeWorkflow()
     relay._ensure_xiaot_oauth_schema = lambda: asyncio.sleep(0)
     request = SimpleNamespace(
@@ -2009,6 +2029,26 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     assert exchange_calls[0][1]["data"]["redirect_uri"] == pending["redirect_uri"]
     assert saved_tokens[0]["platform"] == "lark"
     assert saved_tokens[0]["open_id"] == "ou_lark_verified"
+    assert private_card_calls[0] == (
+        "send",
+        "oc_requester_group",
+        "ou_external_event",
+        {
+            "config": {"wide_screen_mode": True},
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "plain_text", "content": "授权成功！"},
+                }
+            ],
+        },
+    )
+    assert private_card_calls[1] == (
+        "delete",
+        "POST",
+        "/open-apis/ephemeral/v1/delete",
+        {"json": {"message_id": "om_private_auth_card"}},
+    )
     identity_link = next(
         item for item in statements
         if "INSERT INTO xiaot_bitable_source_identity_links" in item[0]
@@ -2018,7 +2058,12 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
         {
             "platform": "lark",
             "conversation_key": pending["conversation_key"],
-            "event": {"message_id": "om_original", "text": "查询 task"},
+            "event": {
+                "message_id": "om_original",
+                "chat_id": "oc_requester_group",
+                "open_id": "ou_external_event",
+                "text": "查询 task",
+            },
             "request_id": pending["request_id"],
         }
     ]
