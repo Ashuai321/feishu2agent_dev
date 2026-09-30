@@ -269,6 +269,63 @@ def test_date_fields_are_normalized_to_millisecond_timestamps():
         raise AssertionError("natural-language date was accepted as a Bitable date value")
 
 
+def test_relation_fields_use_string_record_id_arrays_and_verify_readback():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(object())
+
+    async def fields(_table_key, *, access_token, platform="feishu"):
+        assert access_token == "user-token"
+        assert platform == "feishu"
+        return [
+            {"field_name": "Parent Goal", "type": 18, "ui_type": "SingleLink"},
+            {"field_name": "Parent Project", "type": 18, "ui_type": "SingleLink"},
+            {"field_name": "Task Name", "type": 1},
+        ]
+
+    client.fields = fields
+    normalized = asyncio.run(
+        client.validate_writable_fields(
+            "project",
+            {
+                "Parent Goal": [{"record_id": "recGoal123"}],
+                "Parent Project": ["recProject456"],
+                "Task Name": "Child project",
+            },
+            access_token="user-token",
+        )
+    )
+
+    assert normalized == {
+        "Parent Goal": ["recGoal123"],
+        "Parent Project": ["recProject456"],
+        "Task Name": "Child project",
+    }
+    assert worker.XiaotCloudflareRelay._fields_match(
+        {
+            "fields": {
+                "Parent Goal": [{"record_id": "recGoal123", "text": "Goal"}],
+                "Parent Project": [{"record_id": "recProject456", "text": "Project"}],
+                "Task Name": "Child project",
+            }
+        },
+        normalized,
+    )
+
+    for invalid in (
+        {"Parent Goal": {"record_id": "recGoal123"}},
+        {"Parent Goal": [{"record_id": "not-a-record-id"}]},
+    ):
+        try:
+            asyncio.run(
+                client.validate_writable_fields(
+                    "project", invalid, access_token="user-token"
+                )
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"invalid relation value was accepted: {invalid}")
+
+
 def test_person_candidate_search_uses_visible_bitable_people_and_aliases():
     worker = _load_xiaot_module()
     client = worker.XiaotBitableClient(object())

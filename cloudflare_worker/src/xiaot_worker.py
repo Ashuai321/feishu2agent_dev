@@ -709,6 +709,23 @@ class XiaotBitableClient:
                 field_type = 0
             if field_type == 5:
                 normalized[field_name] = _normalize_bitable_date_value(value)
+            elif field_type == 18:
+                if not isinstance(value, list):
+                    raise ValueError(
+                        f"relation field {field_name} must be an array of record IDs"
+                    )
+                record_ids: list[str] = []
+                for item in value:
+                    record_id = (
+                        str(item.get("record_id") or "").strip()
+                        if isinstance(item, dict)
+                        else str(item or "").strip()
+                    )
+                    self._validate_record_id(record_id)
+                    record_ids.append(record_id)
+                # Bitable relation fields accept a string array, not objects
+                # such as [{"record_id": "rec..."}].
+                normalized[field_name] = record_ids
         return normalized
 
 
@@ -779,6 +796,12 @@ class XiaotAgentRelayWorkflow:
                     "date/datetime values to milliseconds (date-only values use Asia/Shanghai); "
                     "never send a natural-language date to Bitable. Show dates to the user in "
                     "readable date/time form, not as raw millisecond numbers."
+                ),
+                (
+                    "For writable single-link relation fields (Bitable field type 18), pass the "
+                    "linked record IDs as a string array, e.g. [\"rec...\"]. Never pass objects "
+                    "such as [{\"record_id\": \"rec...\"}]. Read the relevant table and records "
+                    "first, and use only verified record IDs."
                 ),
                 (
                     "Feishu Bitable creates its own operation audit entries. 小T must never write "
@@ -2568,7 +2591,28 @@ class XiaotCloudflareRelay(CloudflareRelay):
     @staticmethod
     def _fields_match(record: dict[str, Any], expected: dict[str, Any]) -> bool:
         actual = record.get("fields") if isinstance(record.get("fields"), dict) else {}
-        return all(actual.get(key) == value for key, value in expected.items())
+        for key, expected_value in expected.items():
+            actual_value = actual.get(key)
+            if actual_value == expected_value:
+                continue
+            if isinstance(expected_value, list) and all(
+                isinstance(item, str) and re.fullmatch(r"rec[A-Za-z0-9_-]{1,80}", item)
+                for item in expected_value
+            ):
+                actual_ids: list[str] = []
+                if not isinstance(actual_value, list):
+                    return False
+                for item in actual_value:
+                    if isinstance(item, str):
+                        actual_ids.append(item)
+                    elif isinstance(item, dict) and item.get("record_id"):
+                        actual_ids.append(str(item["record_id"]))
+                    else:
+                        return False
+                if actual_ids == expected_value:
+                    continue
+            return False
+        return True
 
     @staticmethod
     def _is_missing_bitable_record(exc: Exception) -> bool:
