@@ -1474,8 +1474,10 @@ def test_xiaot_environment_uses_dedicated_dev_resources_and_urls():
             FEISHU_OAUTH_REDIRECT_URI="https://mcp.0abt.com/feishu/oauth/callback",
             LARK_OAUTH_REDIRECT_URI="https://mcp.0abt.com/lark/oauth/callback",
             WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL="https://mcp.0abt.com",
+            WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN="shared-token-must-not-be-used-by-xiaot",
             XIAOT_DB="xiaot-dev-db",
             XIAOT_AGENT_QUEUE="xiaot-dev-queue",
+            XIAOT_MCP_OAUTH_LOGIN_TOKEN="xiaot-dev-token",
             XIAOT_FEISHU_OAUTH_REDIRECT_URI=(
                 "https://bot.boooe.com/feishu/oauth/callback"
             ),
@@ -1491,6 +1493,10 @@ def test_xiaot_environment_uses_dedicated_dev_resources_and_urls():
     )
     assert env.LARK_OAUTH_REDIRECT_URI == "https://bot.boooe.com/lark/oauth/callback"
     assert env.WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL == "https://bot.boooe.com"
+    assert env.WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN == "xiaot-dev-token"
+    assert env.raw.WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN == (
+        "shared-token-must-not-be-used-by-xiaot"
+    )
 
     oauth_env = worker.XiaotLarkOAuthEnvironment(env.raw)
     assert oauth_env.FEISHU_OAUTH_REDIRECT_URI == "https://bot.boooe.com/feishu/oauth/callback"
