@@ -422,6 +422,31 @@ def _allowed_redirect(uri: str) -> bool:
     )
 
 
+def _is_chatgpt_cimd_client_id(client_id: str) -> bool:
+    parsed = urlparse(client_id)
+    return bool(
+        parsed.scheme == "https"
+        and parsed.netloc.lower() == "chatgpt.com"
+        and not parsed.query
+        and not parsed.fragment
+        and re.fullmatch(r"/oauth/(?:[A-Za-z0-9_-]+/)?client\.json", parsed.path)
+    )
+
+
+def _is_chatgpt_oauth_redirect(uri: str) -> bool:
+    parsed = urlparse(uri)
+    return bool(
+        parsed.scheme == "https"
+        and parsed.netloc.lower() == "chatgpt.com"
+        and not parsed.query
+        and not parsed.fragment
+        and re.fullmatch(
+            r"/(?:connector_platform_oauth_redirect|connector/oauth/[A-Za-z0-9_-]+)",
+            parsed.path,
+        )
+    )
+
+
 def _safe_error(value: Any, secret: str = "") -> str:
     text = str(value or "").strip()
     return text.replace(secret, "[REDACTED]") if secret else text
@@ -2782,6 +2807,7 @@ class CloudflareRelay:
         resource_name: str = MCP_NAME,
         oauth_prefix: str = "",
         issuer_path: str = "",
+        allow_cimd: bool = False,
     ) -> Response:
         base = self.base_url()
         authorization_server_path = f"/.well-known/oauth-authorization-server{issuer_path}"
@@ -2792,19 +2818,20 @@ class CloudflareRelay:
             authorization_server_path,
         } and path != protected_resource_path:
             issuer = base + issuer_path
-            return _response(
-                {
-                    "issuer": issuer,
-                    "authorization_endpoint": f"{base}{oauth_prefix}/oauth/authorize",
-                    "token_endpoint": f"{base}{oauth_prefix}/oauth/token",
-                    "registration_endpoint": f"{base}{oauth_prefix}/oauth/register",
-                    "response_types_supported": ["code"],
-                    "grant_types_supported": ["authorization_code"],
-                    "token_endpoint_auth_methods_supported": ["none"],
-                    "code_challenge_methods_supported": ["S256"],
-                    "scopes_supported": self.scopes(),
-                }
-            )
+            metadata = {
+                "issuer": issuer,
+                "authorization_endpoint": f"{base}{oauth_prefix}/oauth/authorize",
+                "token_endpoint": f"{base}{oauth_prefix}/oauth/token",
+                "registration_endpoint": f"{base}{oauth_prefix}/oauth/register",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code"],
+                "token_endpoint_auth_methods_supported": ["none"],
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": self.scopes(),
+            }
+            if allow_cimd:
+                metadata["client_id_metadata_document_supported"] = True
+            return _response(metadata)
         if path in {
             "/.well-known/oauth-protected-resource",
             "/.well-known/oauth-protected-resource/mcp",
@@ -2881,14 +2908,20 @@ class CloudflareRelay:
                 _env(self.env, "WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN"),
             ):
                 return _text_response("Invalid login token", 401)
-            client = await self.state.oauth_client(str(params.get("client_id") or ""))
+            client_id = str(params.get("client_id") or "")
+            client = await self.state.oauth_client(client_id)
             redirect_uri = str(params.get("redirect_uri") or "")
-            if not client:
+            if client:
+                try:
+                    redirects = json.loads(str(client.get("redirect_uris_json") or "[]"))
+                except json.JSONDecodeError:
+                    redirects = []
+            elif allow_cimd:
+                redirects = await self._chatgpt_cimd_redirect_uris(client_id)
+                if redirects is None:
+                    return _text_response("Unknown client", 400)
+            else:
                 return _text_response("Unknown client", 400)
-            try:
-                redirects = json.loads(str(client.get("redirect_uris_json") or "[]"))
-            except json.JSONDecodeError:
-                redirects = []
             if redirect_uri not in redirects or params.get("response_type") != "code":
                 return _text_response("Invalid authorization request", 400)
             if params.get("code_challenge_method") != "S256" or not params.get("code_challenge"):
@@ -2956,6 +2989,51 @@ class CloudflareRelay:
                 }
             )
         return _response({"error": "not_found"}, 404)
+
+    async def _chatgpt_cimd_redirect_uris(self, client_id: str) -> list[str] | None:
+        """Resolve ChatGPT's CIMD client without trusting arbitrary client URLs."""
+        if not _is_chatgpt_cimd_client_id(client_id):
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(
+                    client_id,
+                    headers={"Accept": "application/json"},
+                )
+            if response.status_code != 200:
+                return None
+            document = response.json()
+        except Exception:
+            return None
+        if not isinstance(document, dict) or document.get("client_id") != client_id:
+            return None
+        redirects = document.get("redirect_uris")
+        if (
+            not isinstance(redirects, list)
+            or not redirects
+            or not all(
+                isinstance(uri, str) and _is_chatgpt_oauth_redirect(uri)
+                for uri in redirects
+            )
+        ):
+            return None
+        auth_methods = document.get("token_endpoint_auth_methods_supported")
+        if auth_methods is not None:
+            if not isinstance(auth_methods, list) or "none" not in auth_methods:
+                return None
+        elif document.get("token_endpoint_auth_method") not in (None, "none"):
+            return None
+        grant_types = document.get("grant_types")
+        if grant_types is not None and (
+            not isinstance(grant_types, list) or "authorization_code" not in grant_types
+        ):
+            return None
+        response_types = document.get("response_types")
+        if response_types is not None and (
+            not isinstance(response_types, list) or "code" not in response_types
+        ):
+            return None
+        return redirects
 
     async def mcp(
         self,
@@ -4552,6 +4630,7 @@ class Default(WorkerEntrypoint):
                 resource_name=XIAOT_MCP_NAME,
                 oauth_prefix="/xiaot",
                 issuer_path="/xiaot",
+                allow_cimd=True,
             )
 
         state = D1State(self.env.DB)

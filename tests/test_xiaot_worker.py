@@ -165,12 +165,218 @@ def test_xiaot_mcp_oauth_metadata_binds_its_own_resource(monkeypatch):
             resource_name=app.XIAOT_MCP_NAME,
             oauth_prefix="/xiaot",
             issuer_path="/xiaot",
+            allow_cimd=True,
         )
     )
     assert authorization.payload["issuer"] == "https://bot.boooe.com/xiaot"
     assert authorization.payload["authorization_endpoint"] == (
         "https://bot.boooe.com/xiaot/oauth/authorize"
     )
+    assert authorization.payload["client_id_metadata_document_supported"] is True
+
+    shared_relay = app.CloudflareRelay(
+        SimpleNamespace(WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL="https://bot.boooe.com"),
+        None,
+        SimpleNamespace(),
+    )
+    shared_authorization = asyncio.run(
+        shared_relay.oauth(Request(), "/.well-known/oauth-authorization-server")
+    )
+    assert "client_id_metadata_document_supported" not in shared_authorization.payload
+
+
+def test_xiaot_mcp_oauth_accepts_chatgpt_cimd_client(monkeypatch):
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    worker = _load_xiaot_module()
+    app = sys.modules["worker_app"]
+    client_id = "https://chatgpt.com/oauth/callback_123/client.json"
+    redirect_uri = "https://chatgpt.com/connector/oauth/callback_123"
+    verifier = "test-pkce-verifier"
+    challenge = app._pkce_s256(verifier)
+
+    class FakeStatement:
+        def __init__(self, db, sql):
+            self.db = db
+            self.sql = sql
+            self.params = ()
+
+        def bind(self, *params):
+            self.params = params
+            return self
+
+        async def first(self):
+            cursor = self.db.connection.execute(self.sql, self.params)
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            columns = [column[0] for column in cursor.description]
+            return dict(zip(columns, row, strict=True))
+
+        async def run(self):
+            cursor = self.db.connection.execute(self.sql, self.params)
+            self.db.connection.commit()
+            return SimpleNamespace(meta={"changes": max(cursor.rowcount, 0)})
+
+    class FakeD1:
+        def __init__(self):
+            import sqlite3
+
+            self.connection = sqlite3.connect(":memory:")
+            self.connection.executescript(
+                """
+                CREATE TABLE oauth_clients (
+                    client_id TEXT PRIMARY KEY,
+                    client_name TEXT NOT NULL,
+                    redirect_uris_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE oauth_codes (
+                    code TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    code_challenge TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                CREATE TABLE oauth_tokens (
+                    access_token TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL
+                );
+                """
+            )
+
+        def prepare(self, sql):
+            return FakeStatement(self, sql)
+
+    class FakeResponse:
+        def __init__(self, body, status=200, headers=None):
+            self.body = body
+            self.status = status
+            self.headers = headers or {}
+
+        @classmethod
+        def json(cls, payload, status=200, headers=None):
+            return cls(payload, status, headers)
+
+    class FakeMetadataResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "client_id": client_id,
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "private_key_jwt",
+                "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+            }
+
+    class FakeHttpClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, *, headers):
+            assert url == client_id
+            assert headers == {"Accept": "application/json"}
+            return FakeMetadataResponse()
+
+    class Request:
+        method = "POST"
+        url = "https://bot.boooe.com/xiaot/oauth/authorize"
+        headers = {"content-type": "application/x-www-form-urlencoded"}
+
+        async def text(self):
+            return urlencode(
+                {
+                    "login_token": "dev-login-token",
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "response_type": "code",
+                    "code_challenge_method": "S256",
+                    "code_challenge": challenge,
+                    "scope": "workspace-agent-relay",
+                    "resource": "https://bot.boooe.com/xiaot/mcp",
+                    "state": "state_1",
+                }
+            )
+
+    monkeypatch.setattr(app, "Response", FakeResponse)
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: FakeHttpClient())
+    relay = worker.XiaotOnlyCloudflareRelay(
+        SimpleNamespace(
+            WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL="https://bot.boooe.com",
+            WORKSPACE_AGENT_RELAY_OAUTH_LOGIN_TOKEN="dev-login-token",
+        ),
+        None,
+        app.D1State(FakeD1()),
+    )
+    response = asyncio.run(
+        relay.oauth(
+            Request(),
+            "/xiaot/oauth/authorize",
+            resource_path=app.XIAOT_MCP_PATH,
+            resource_name=app.XIAOT_MCP_NAME,
+            oauth_prefix="/xiaot",
+            issuer_path="/xiaot",
+            allow_cimd=True,
+        )
+    )
+
+    assert response.status == 302
+    callback = urlparse(response.headers["Location"])
+    assert callback.scheme == "https"
+    assert callback.netloc == "chatgpt.com"
+    assert callback.path == "/connector/oauth/callback_123"
+    assert parse_qs(callback.query)["state"] == ["state_1"]
+    code = parse_qs(callback.query)["code"][0]
+    row = asyncio.run(
+        app._db_first(relay.state.db, "SELECT * FROM oauth_codes WHERE code = ?", code)
+    )
+    assert row["client_id"] == client_id
+    assert row["redirect_uri"] == redirect_uri
+
+    class TokenRequest:
+        method = "POST"
+        url = "https://bot.boooe.com/xiaot/oauth/token"
+        headers = {"content-type": "application/x-www-form-urlencoded"}
+
+        async def text(self):
+            return urlencode(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "code_verifier": verifier,
+                    "resource": "https://bot.boooe.com/xiaot/mcp",
+                }
+            )
+
+    token_response = asyncio.run(
+        relay.oauth(
+            TokenRequest(),
+            "/xiaot/oauth/token",
+            resource_path=app.XIAOT_MCP_PATH,
+            resource_name=app.XIAOT_MCP_NAME,
+            oauth_prefix="/xiaot",
+            issuer_path="/xiaot",
+            allow_cimd=True,
+        )
+    )
+    assert token_response.status == 200
+    assert token_response.body["token_type"] == "Bearer"
+    assert token_response.body["scope"] == "workspace-agent-relay"
+    assert not app._is_chatgpt_cimd_client_id("https://attacker.example/oauth/client.json")
+    assert not app._is_chatgpt_oauth_redirect("https://attacker.example/callback")
 
 
 def test_unknown_tables_and_malformed_record_ids_are_rejected():
