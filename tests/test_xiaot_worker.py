@@ -88,6 +88,8 @@ def test_xiaot_dedicated_mcp_has_only_xiaot_tools_and_correct_identity(monkeypat
     }
     requester_info = next(tool for tool in tools if tool["name"] == "get_requester_info")
     assert "matching Feishu/Lark OAuth app" in requester_info["description"]
+    people_search = next(tool for tool in tools if tool["name"] == "search_person_candidates")
+    assert people_search["annotations"]["readOnlyHint"] is True
 
     async def no_auth(self, _request, **_kwargs):
         return None
@@ -222,6 +224,185 @@ def test_writes_reject_unknown_or_computed_fields():
             raise AssertionError(f"unsafe or unknown fields were accepted: {invalid}")
 
     asyncio.run(check())
+
+
+def test_date_fields_are_normalized_to_millisecond_timestamps():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(object())
+
+    async def fields(_table_key, *, access_token, platform="feishu"):
+        return [
+            {"field_name": "Task Name", "type": 1},
+            {"field_name": "Dead Line", "type": 5},
+            {"field_name": "Owner", "type": 11, "ui_type": "User"},
+        ]
+
+    client.fields = fields
+
+    async def scenario():
+        return await client.validate_writable_fields(
+            "task",
+            {"Task Name": "test", "Dead Line": "2026-10-01"},
+            access_token="user-token",
+            platform="feishu",
+        )
+
+    normalized = asyncio.run(scenario())
+    assert normalized == {
+        "Task Name": "test",
+        "Dead Line": 1790784000000,
+    }
+    assert worker._normalize_bitable_date_value(1790784000) == 1790784000000
+    assert worker._normalize_bitable_date_value("2026-10-01T00:00:00Z") == 1790812800000
+
+    try:
+        asyncio.run(
+            client.validate_writable_fields(
+                "task",
+                {"Dead Line": "明天"},
+                access_token="user-token",
+            )
+        )
+    except ValueError as exc:
+        assert "ISO 日期/时间" in str(exc)
+    else:
+        raise AssertionError("natural-language date was accepted as a Bitable date value")
+
+
+def test_person_candidate_search_uses_visible_bitable_people_and_aliases():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(object())
+    calls = []
+
+    async def fields(_table_key, *, access_token, platform="feishu"):
+        return [
+            {"field_name": "Task Name", "type": 1},
+            {"field_name": "Owner", "type": 11, "ui_type": "User"},
+            {"field_name": "关注人", "type": 11, "ui_type": "User"},
+        ]
+
+    async def records(_table_key, **kwargs):
+        calls.append(kwargs)
+        assert kwargs["field_names"] == ["Owner", "关注人"]
+        assert kwargs["page_size"] == 500
+        if len(calls) == 1:
+            return {
+                "items": [
+                    {
+                        "fields": {
+                            "Owner": [{"id": "ou_liqian", "name": "李谦"}],
+                            "关注人": [{"id": "ou_other", "name": "其他人"}],
+                        }
+                    }
+                ],
+                "has_more": True,
+                "page_token": "next",
+            }
+        return {
+            "items": [
+                {"fields": {"Owner": [{"id": "ou_liqian", "name": "李谦（William）"}]}}
+            ],
+            "has_more": False,
+        }
+
+    client.fields = fields
+    client.records = records
+    result = asyncio.run(
+        client.search_person_candidates(
+            "task",
+            "William",
+            access_token="user-token",
+            platform="feishu",
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["page_token"] == "next"
+    assert result["scan_truncated"] is False
+    assert result["candidates"] == [
+        {"id": "ou_liqian", "name": "李谦", "fields": ["Owner"], "exact_match": True}
+    ]
+
+
+def test_person_candidate_search_marks_name_fragments_as_suggestions_only():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(object())
+
+    async def fields(_table_key, *, access_token, platform="feishu"):
+        return [{"field_name": "Owner", "type": 11}]
+
+    async def records(_table_key, **_kwargs):
+        return {
+            "items": [{"fields": {"Owner": [{"id": "ou_liqianwen", "name": "李谦文"}]}}],
+            "has_more": False,
+        }
+
+    client.fields = fields
+    client.records = records
+    result = asyncio.run(
+        client.search_person_candidates(
+            "task", "李谦", access_token="user-token", platform="feishu"
+        )
+    )
+    assert result["candidates"] == [
+        {"id": "ou_liqianwen", "name": "李谦文", "fields": ["Owner"], "exact_match": False}
+    ]
+
+
+def test_person_candidate_search_stops_once_it_proves_identity_is_ambiguous():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(object())
+
+    async def fields(_table_key, *, access_token, platform="feishu"):
+        return [{"field_name": "Owner", "type": 11}]
+
+    async def records(_table_key, **_kwargs):
+        return {
+            "items": [
+                {"fields": {"Owner": [{"id": "ou_one", "name": "张伟"}]}},
+                {"fields": {"Owner": [{"id": "ou_two", "name": "张伟"}]}},
+            ],
+            "has_more": True,
+            "page_token": "unused",
+        }
+
+    client.fields = fields
+    client.records = records
+    result = asyncio.run(
+        client.search_person_candidates(
+            "task", "张伟", access_token="user-token", platform="feishu"
+        )
+    )
+    assert {candidate["id"] for candidate in result["candidates"]} == {"ou_one", "ou_two"}
+    assert result["scan_truncated"] is False
+    assert result["scanned_records"] == 2
+
+
+def test_bitable_person_candidate_reads_project_only_person_fields():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(SimpleNamespace())
+    calls = []
+
+    async def response(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"code": 0, "data": {"items": [], "has_more": False}}
+
+    client.request = response
+    asyncio.run(
+        client.records(
+            "task",
+            access_token="user-token",
+            page_size=500,
+            field_names=["Owner", "关注人"],
+            platform="feishu",
+        )
+    )
+
+    assert calls[0][2]["params"] == {
+        "page_size": 500,
+        "field_names": '["Owner", "关注人"]',
+        "user_id_type": "open_id",
+    }
 
 
 def test_bitable_create_and_update_explicitly_use_open_id_for_person_fields():
@@ -730,6 +911,7 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
             )
             assert access_token == "xiaot-user-token"
             assert platform == "feishu"
+            return fields
 
         async def create_record(self, table_key, fields, *, access_token, platform="feishu"):
             self.creates.append((table_key, fields))
@@ -1645,6 +1827,9 @@ def test_xiaot_instructions_have_bitable_workflow_and_no_calendar_routes():
     assert "Perfect710" not in content
     assert "仅可读取" in content
     assert "get_requester_info" in content
+    assert "search_person_candidates" in content
+    assert "毫秒时间戳" in content
+    assert "William" in content and "元博 王" in content
 
 
 def test_lark_requester_is_resolved_in_lark_user_namespace():

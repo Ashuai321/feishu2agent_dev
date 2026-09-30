@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import secrets
 import time
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
@@ -40,12 +42,25 @@ XIAOT_TOOL_NAMES = {
     "list_tables",
     "get_table_fields",
     "search_records",
+    "search_person_candidates",
     "get_record",
     "prepare_mutation",
     "confirm_mutation",
 }
-XIAOT_READ_TOOL_NAMES = {"list_tables", "get_table_fields", "search_records", "get_record"}
+XIAOT_READ_TOOL_NAMES = {
+    "list_tables",
+    "get_table_fields",
+    "search_records",
+    "search_person_candidates",
+    "get_record",
+}
 XIAOT_DELETE_VERIFY_DELAYS = (0.0, 0.25, 0.5, 1.0, 2.0)
+XIAOT_PERSON_NAME_ALIAS_GROUPS = (
+    ("William", "李谦", "李威廉", "威廉"),
+    ("元博 王", "yuanbo", "王元博", "元博"),
+)
+XIAOT_DATE_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+XIAOT_PERSON_SEARCH_MAX_RECORDS = 5000
 XIAOT_TABLES: dict[str, dict[str, str]] = {
     "goal": {
         "table_id": "tblHq7aqhe195HnD",
@@ -94,6 +109,78 @@ _RELAY_TOOLS = {
     "get_run_context",
     "get_requester_info",
 }
+
+
+def _normalize_bitable_date_value(value: Any) -> Any:
+    """Convert date field input to a Unix millisecond timestamp."""
+    def milliseconds(timestamp: float) -> int:
+        if not math.isfinite(timestamp):
+            raise ValueError("日期字段必须使用有效的毫秒时间戳")
+        if abs(timestamp) < 100_000_000_000:
+            timestamp *= 1000
+        try:
+            datetime.fromtimestamp(timestamp / 1000, tz=timezone(timedelta(0)))
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError("日期字段时间戳超出支持范围") from exc
+        return int(timestamp)
+
+    if value is None or value == "":
+        return value
+    if isinstance(value, bool):
+        raise ValueError("日期字段必须使用毫秒时间戳或 ISO 日期/时间")
+    if isinstance(value, (int, float)):
+        return milliseconds(float(value))
+    if not isinstance(value, str):
+        raise ValueError("日期字段必须使用毫秒时间戳或 ISO 日期/时间")
+
+    raw = value.strip()
+    if not raw:
+        return value
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", raw):
+        return milliseconds(float(raw))
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            parsed = datetime.fromisoformat(raw).replace(tzinfo=XIAOT_DATE_TIMEZONE)
+        else:
+            iso_value = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+            parsed = datetime.fromisoformat(iso_value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=XIAOT_DATE_TIMEZONE)
+        return int(parsed.timestamp() * 1000)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(
+            "日期字段必须是有效的毫秒时间戳或 ISO 日期/时间，例如 2026-10-01"
+        ) from exc
+
+
+def _normalize_person_name(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _person_name_search_terms(query: str) -> list[str]:
+    normalized = _normalize_person_name(query)
+    if not normalized:
+        raise ValueError("search query must contain a person name")
+    terms = {normalized}
+    for group in XIAOT_PERSON_NAME_ALIAS_GROUPS:
+        aliases = {_normalize_person_name(item) for item in group}
+        if any(alias in normalized or normalized in alias for alias in aliases):
+            terms.update(aliases)
+    return sorted((term for term in terms if term), key=len, reverse=True)
+
+
+def _person_name_has_exact_term(name: str, terms: list[str]) -> bool:
+    """Match a full name or a standalone alias token, never a name fragment."""
+    for term in terms:
+        start = 0
+        while (index := name.find(term, start)) >= 0:
+            end = index + len(term)
+            left_is_name_char = index > 0 and (name[index - 1].isalnum() or name[index - 1] == "_")
+            right_is_name_char = end < len(name) and (name[end].isalnum() or name[end] == "_")
+            if not left_is_name_char and not right_is_name_char:
+                return True
+            start = index + 1
+    return False
 
 
 def _html_response(body: str, status: int = 200, *, nonce: str = "") -> Response:
@@ -388,6 +475,7 @@ class XiaotBitableClient:
         page_size: int = 100,
         page_token: str = "",
         filter_formula: str = "",
+        field_names: list[str] | None = None,
         platform: str = "feishu",
     ) -> dict[str, Any]:
         query: dict[str, Any] = {"page_size": max(1, min(int(page_size), 500))}
@@ -397,6 +485,8 @@ class XiaotBitableClient:
             if len(filter_formula) > 2000:
                 raise ValueError("filter_formula is too long")
             query["filter"] = filter_formula
+        if field_names:
+            query["field_names"] = json.dumps(field_names, ensure_ascii=False)
         query["user_id_type"] = "open_id"
         payload = await self.request(
             "GET",
@@ -406,6 +496,107 @@ class XiaotBitableClient:
             params=query,
         )
         return payload.get("data") or {}
+
+    async def search_person_candidates(
+        self,
+        table_key: str,
+        query: str,
+        *,
+        access_token: str,
+        platform: str = "feishu",
+        filter_formula: str = "",
+    ) -> dict[str, Any]:
+        """Find matching people already present in permission-visible Bitable rows."""
+        table = self.resolve_table(table_key)
+        terms = _person_name_search_terms(query)
+        schema = await self.fields(table_key, access_token=access_token, platform=platform)
+        person_fields = [
+            str(item.get("field_name") or "")
+            for item in schema
+            if str(item.get("field_name") or "").strip()
+            and (
+                str(item.get("ui_type") or "").strip().casefold() == "user"
+                or str(item.get("type") or "") == "11"
+            )
+        ]
+        if not person_fields:
+            return {
+                "success": True,
+                "table": table,
+                "person_fields": [],
+                "candidates": [],
+                "scan_truncated": False,
+            }
+
+        found: dict[str, dict[str, Any]] = {}
+        page_token = ""
+        scanned = 0
+        scan_truncated = False
+        while scanned < XIAOT_PERSON_SEARCH_MAX_RECORDS:
+            data = await self.records(
+                table_key,
+                access_token=access_token,
+                platform=platform,
+                page_size=500,
+                page_token=page_token,
+                filter_formula=filter_formula,
+                field_names=person_fields,
+            )
+            items = data.get("items") or []
+            for record in items:
+                scanned += 1
+                fields = record.get("fields") if isinstance(record, dict) else {}
+                if not isinstance(fields, dict):
+                    continue
+                for field_name in person_fields:
+                    raw_people = fields.get(field_name)
+                    people = raw_people if isinstance(raw_people, list) else [raw_people]
+                    for person in people:
+                        if not isinstance(person, dict):
+                            continue
+                        person_id = str(person.get("id") or "").strip()
+                        person_name = str(person.get("name") or "").strip()
+                        normalized_name = _normalize_person_name(person_name)
+                        if not person_id or not person_name or not any(term in normalized_name for term in terms):
+                            continue
+                        candidate = found.setdefault(
+                            person_id,
+                            {
+                                "id": person_id,
+                                "name": person_name,
+                                "fields": set(),
+                                "exact_match": False,
+                            },
+                        )
+                        candidate["fields"].add(field_name)
+                        candidate["exact_match"] = candidate["exact_match"] or (
+                            _person_name_has_exact_term(normalized_name, terms)
+                        )
+                if len(found) > 1:
+                    # Two distinct platform IDs are enough to prove ambiguity.
+                    break
+                if scanned >= XIAOT_PERSON_SEARCH_MAX_RECORDS:
+                    scan_truncated = bool(data.get("has_more"))
+                    break
+            if len(found) > 1 or scan_truncated or not data.get("has_more"):
+                break
+            next_token = str(data.get("page_token") or "")
+            if not next_token or next_token == page_token:
+                raise RuntimeError("多维表格人员候选查询未返回有效 page_token")
+            page_token = next_token
+
+        candidates = [
+            {**candidate, "fields": sorted(candidate["fields"])}
+            for candidate in found.values()
+        ]
+        return {
+            "success": True,
+            "table": table,
+            "person_fields": person_fields,
+            "candidates": candidates,
+            "scan_truncated": scan_truncated,
+            "scanned_records": scanned,
+        }
 
     async def record(
         self, table_key: str, record_id: str, *, access_token: str, platform: str = "feishu"
@@ -494,7 +685,7 @@ class XiaotBitableClient:
         *,
         access_token: str,
         platform: str = "feishu",
-    ) -> None:
+    ) -> dict[str, Any]:
         if not isinstance(fields, dict) or not fields:
             raise ValueError("fields must be a non-empty object")
         if len(_json(fields).encode("utf-8")) > 20_000:
@@ -509,6 +700,15 @@ class XiaotBitableClient:
         ]
         if read_only:
             raise ValueError(f"computed or system fields cannot be written: {', '.join(read_only)}")
+        normalized = dict(fields)
+        for field_name, value in fields.items():
+            try:
+                field_type = int(by_name[field_name].get("type") or 0)
+            except (TypeError, ValueError):
+                field_type = 0
+            if field_type == 5:
+                normalized[field_name] = _normalize_bitable_date_value(value)
+        return normalized
 
 
 class XiaotAgentRelayWorkflow:
@@ -557,6 +757,27 @@ class XiaotAgentRelayWorkflow:
                     "requester, call get_requester_info and use its OAuth-app-specific open_id "
                     "exactly as [{\"id\": \"open_id\"}]. Do not reuse a source bot event ID. "
                     "Bitable write calls use user_id_type=open_id."
+                ),
+                (
+                    "When a user names another person for Owner, watcher, or another person "
+                    "field, use search_person_candidates in the target table if the identity is "
+                    "not unambiguous. It searches only person-field values from rows visible to "
+                    "the current user's Bitable authorization. Only one exact full-name or "
+                    "standalone alias match can be used as the candidate; partial-name matches "
+                    "are suggestions only. If it returns multiple IDs, only partial matches, no "
+                    "candidate, or a truncated scan, ask the user to choose or clarify before "
+                    "preparing a write; if the target table has no candidate, search related "
+                    "task/sub_task/project/goal tables before asking. Never guess or write a "
+                    "display name as an ID. Known XiaoT aliases: William = 李谦 / 李威廉 / 威廉; "
+                    "元博 王 = yuanbo / 王元博 / 元博. "
+                    "Treat aliases as search variants and still resolve the actual Bitable person ID."
+                ),
+                (
+                    "For date fields (Bitable field type 5), use an integer Unix timestamp in "
+                    "milliseconds in the proposed write. The service also converts exact ISO "
+                    "date/datetime values to milliseconds (date-only values use Asia/Shanghai); "
+                    "never send a natural-language date to Bitable. Show dates to the user in "
+                    "readable date/time form, not as raw millisecond numbers."
                 ),
                 (
                     "Feishu Bitable creates its own operation audit entries. 小T must never write "
@@ -1645,6 +1866,32 @@ class XiaotCloudflareRelay(CloudflareRelay):
                     "annotations": {"readOnlyHint": True},
                 },
                 {
+                    "name": "search_person_candidates",
+                    "description": (
+                        "只读搜索目标表中当前用户有权限读取到的人员字段候选。"
+                        "仅在 Owner、关注人、负责人等人员身份不确定时调用；返回候选的 Bitable ID 和姓名，"
+                        "候选带 exact_match；只有唯一完整姓名/独立别名匹配可用于提案，片段匹配只作提示。"
+                        "若多 ID、只有片段匹配、无候选或扫描被截断，先询问用户，不得猜测或写入。"
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "required": [
+                            "request_id",
+                            "conversation_key",
+                            "table_key",
+                            "query",
+                        ],
+                        "properties": {
+                            "request_id": string,
+                            "conversation_key": string,
+                            "table_key": string,
+                            "query": string,
+                            "filter_formula": string,
+                        },
+                    },
+                    "annotations": {"readOnlyHint": True},
+                },
+                {
                     "name": "get_record",
                     "description": "按记录 ID 读取允许表中的精确记录。",
                     "inputSchema": {
@@ -1939,6 +2186,16 @@ class XiaotCloudflareRelay(CloudflareRelay):
                         "page_token": data.get("page_token") or "",
                     }
                 )
+            if name == "search_person_candidates":
+                return result(
+                    await self.xiaot_bitable.search_person_candidates(
+                        str(args.get("table_key") or ""),
+                        str(args.get("query") or ""),
+                        access_token=access_token,
+                        platform=(requester or {}).get("platform", "feishu"),
+                        filter_formula=str(args.get("filter_formula") or ""),
+                    )
+                )
             if name == "get_record":
                 record = await self.xiaot_bitable.record(
                     str(args.get("table_key") or ""),
@@ -2050,7 +2307,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
         record_id = str(args.get("record_id") or "").strip()
         before: dict[str, Any] = {}
         if operation == "create":
-            await self.xiaot_bitable.validate_writable_fields(
+            fields = await self.xiaot_bitable.validate_writable_fields(
                 table_key,
                 fields,
                 access_token=access_token,
@@ -2068,7 +2325,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
             if operation == "update" and not fields:
                 raise ValueError("update proposals require fields")
             if operation == "update":
-                await self.xiaot_bitable.validate_writable_fields(
+                fields = await self.xiaot_bitable.validate_writable_fields(
                     table_key,
                     fields,
                     access_token=access_token,
