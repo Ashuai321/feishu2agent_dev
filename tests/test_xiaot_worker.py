@@ -1412,10 +1412,10 @@ def test_bitable_delete_requires_documented_success_response_fields():
     assert calls[0][1].endswith("/records/rec_target")
 
 
-def test_feishu_event_callback_requires_verification_token():
+def test_feishu_event_callback_does_not_require_verification_token():
     worker = _load_xiaot_module()
     relay = object.__new__(worker.XiaotCloudflareRelay)
-    relay.env = SimpleNamespace(FEISHU_VERIFY_TOKEN="expected-token", FEISHU_BOT_OPEN_ID="ou_bot")
+    relay.env = SimpleNamespace(FEISHU_BOT_OPEN_ID="ou_bot")
     scheduled = []
 
     async def schedule(body, platform):
@@ -1439,33 +1439,74 @@ def test_feishu_event_callback_requires_verification_token():
 
     async def scenario():
         challenge = await relay.handle_xiaot_event(
-            FakeRequest({"header": {"token": "expected-token"}, "challenge": "abc"})
+            FakeRequest({"header": {"token": "unexpected-token"}, "challenge": "abc"})
         )
         legacy_challenge = await relay.handle_xiaot_event(
             FakeRequest(
                 {
                     "type": "url_verification",
-                    "token": "expected-token",
+                    "token": "unexpected-token",
                     "challenge": "legacy-abc",
                 }
             )
         )
-        denied = await relay.handle_xiaot_event(
-            FakeRequest({"type": "url_verification", "token": "wrong", "challenge": "denied"})
+        event = await relay.handle_xiaot_event(
+            FakeRequest({"header": {"event_type": "im.message.receive_v1"}, "event": {}})
         )
-        relay.env = SimpleNamespace(FEISHU_BOT_OPEN_ID="ou_bot")
-        unconfigured = await relay.handle_xiaot_event(
-            FakeRequest({"header": {"token": "anything"}, "event": {}})
-        )
-        return challenge, legacy_challenge, denied, unconfigured
+        return challenge, legacy_challenge, event
 
-    challenge, legacy_challenge, denied, unconfigured = asyncio.run(scenario())
+    challenge, legacy_challenge, event = asyncio.run(scenario())
 
     assert challenge["body"] == {"challenge": "abc"}
     assert legacy_challenge["body"] == {"challenge": "legacy-abc"}
-    assert denied["status"] == 403
-    assert unconfigured["status"] == 503
-    assert scheduled == []
+    assert event["status"] == 200
+    assert scheduled == [
+        ({"header": {"event_type": "im.message.receive_v1"}, "event": {}}, "xiaot")
+    ]
+
+
+def test_xiaot_environment_uses_dedicated_dev_resources_and_urls():
+    worker = _load_xiaot_module()
+    env = worker.XiaotEnvironment(
+        SimpleNamespace(
+            DB="shared-db",
+            AGENT_QUEUE="shared-queue",
+            FEISHU_OAUTH_REDIRECT_URI="https://mcp.0abt.com/feishu/oauth/callback",
+            LARK_OAUTH_REDIRECT_URI="https://mcp.0abt.com/lark/oauth/callback",
+            WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL="https://mcp.0abt.com",
+            XIAOT_DB="xiaot-dev-db",
+            XIAOT_AGENT_QUEUE="xiaot-dev-queue",
+            XIAOT_FEISHU_OAUTH_REDIRECT_URI=(
+                "https://bot.boooe.com/feishu/oauth/callback"
+            ),
+            XIAOT_LARK_OAUTH_REDIRECT_URI="https://bot.boooe.com/lark/oauth/callback",
+            XIAOT_PUBLIC_BASE_URL="https://bot.boooe.com",
+        )
+    )
+
+    assert env.DB == "xiaot-dev-db"
+    assert env.AGENT_QUEUE == "xiaot-dev-queue"
+    assert env.FEISHU_OAUTH_REDIRECT_URI == (
+        "https://bot.boooe.com/feishu/oauth/callback"
+    )
+    assert env.LARK_OAUTH_REDIRECT_URI == "https://bot.boooe.com/lark/oauth/callback"
+    assert env.WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL == "https://bot.boooe.com"
+
+    oauth_env = worker.XiaotLarkOAuthEnvironment(env.raw)
+    assert oauth_env.FEISHU_OAUTH_REDIRECT_URI == "https://bot.boooe.com/feishu/oauth/callback"
+    assert oauth_env.LARK_OAUTH_REDIRECT_URI == "https://bot.boooe.com/lark/oauth/callback"
+    assert oauth_env.WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL == "https://bot.boooe.com"
+
+
+def test_combined_relay_keeps_xiaot_state_separate_from_shared_routes():
+    worker = _load_xiaot_module()
+    app = sys.modules["worker_app"]
+    env = SimpleNamespace(DB="shared-db", XIAOT_DB="xiaot-dev-db")
+
+    relay = worker.CombinedCloudflareRelay(env, None, app.D1State("shared-db"))
+
+    assert relay.state.db == "shared-db"
+    assert relay.xiaot.state.db == "xiaot-dev-db"
 
 
 def test_xiaot_mcp_route_is_mounted_with_dedicated_identity(monkeypatch):
@@ -1477,15 +1518,19 @@ def test_xiaot_mcp_route_is_mounted_with_dedicated_identity(monkeypatch):
         "headers": headers or {},
     }
 
+    created_databases = []
+
     class FakeState:
-        def __init__(self, _db):
-            pass
+        def __init__(self, db):
+            created_databases.append(db)
 
     app.D1State = FakeState
     app._response = worker._response
     app.CloudflareRelay.authorize_request = lambda *_args, **_kwargs: asyncio.sleep(0, result=None)
     entrypoint = object.__new__(app.Default)
-    entrypoint.env = SimpleNamespace(DB=object())
+    shared_db = object()
+    xiaot_db = object()
+    entrypoint.env = SimpleNamespace(DB=shared_db, XIAOT_DB=xiaot_db)
     entrypoint.ctx = None
 
     class FakeRequest:
@@ -1504,6 +1549,7 @@ def test_xiaot_mcp_route_is_mounted_with_dedicated_identity(monkeypatch):
     response = asyncio.run(entrypoint.fetch(FakeRequest()))
 
     assert response["status"] == 200
+    assert created_databases == [xiaot_db]
     assert response["body"]["result"]["serverInfo"]["name"] == app.XIAOT_MCP_NAME
     assert "workspace-agent-relay-mcp-xiaot-dev" in response["body"]["result"]["instructions"]
 

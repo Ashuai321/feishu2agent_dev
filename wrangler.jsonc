@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "feishu2agents",
+  "account_id": "3babaa7cfa54ae9ac91af0b0dfd8e80b",
   "main": "cloudflare_worker/src/entry.py",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": [
@@ -14,17 +15,10 @@
     }
   ],
   "vars": {
-    "FEISHU_OAUTH_REDIRECT_URI": "https://bot.boooe.com/feishu/oauth/callback",
-    "FEISHU_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access",
-    "LARK_OAUTH_REDIRECT_URI": "https://bot.boooe.com/lark/oauth/callback",
-    "LARK_OAUTH_SCOPE": "bitable:app wiki:wiki:readonly offline_access",
-    "WORKSPACE_AGENT_RELAY_OAUTH_TOKEN_TTL_SECONDS": "315360000",
-    "WORKSPACE_AGENT_RELAY_OAUTH_REFRESH_TOKEN_TTL_SECONDS": "0",
-    "WORKSPACE_AGENT_RELAY_MCP_NAME": "workspace-agent-relay-mcp-dev",
-    "BITABLE_WORKFLOW_GROUP_CHAT_ID": "oc_5e9132f3638772d53d92d6fc5e953abc",
-    "LARK_DOCUMENT_WIKI_TOKEN": "UmGRwFFDQiegHckOVh0j0DIrpRc",
-    "LARK_DOCUMENT_TABLE_ID": "tblmd8DAQwM00t7B",
-    "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL": "https://bot.boooe.com"
+    "XIAOT_PUBLIC_BASE_URL": "https://bot.boooe.com",
+    "XIAOT_FEISHU_OAUTH_REDIRECT_URI": "https://bot.boooe.com/feishu/oauth/callback",
+    "XIAOT_LARK_OAUTH_REDIRECT_URI": "https://bot.boooe.com/lark/oauth/callback",
+    "XIAOT_AGENT_QUEUE_NAME": "feishu2agents-dev-agent-jobs"
   },
   "observability": {
     "enabled": true
@@ -32,8 +26,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "feishu2agents-state",
-      "database_id": "45b634df-226e-42cb-9c1e-cc5311329ade",
+      "database_name": "feishu2agents-prd-state",
+      "database_id": "de158ca8-3236-4cc8-be02-29974a951a48",
+      "migrations_dir": "cloudflare_worker/migrations"
+    },
+    {
+      "binding": "XIAOT_DB",
+      "database_name": "feishu2agents-dev-state",
+      "database_id": "f56585bf-45cc-42fb-917e-3b537a33f353",
       "migrations_dir": "cloudflare_worker/migrations"
     }
   ],
@@ -41,10 +41,20 @@
     "producers": [
       {
         "binding": "AGENT_QUEUE",
-        "queue": "feishu2agents-agent-jobs"
+        "queue": "feishu2agents-prd-agent-jobs"
+      },
+      {
+        "binding": "XIAOT_AGENT_QUEUE",
+        "queue": "feishu2agents-dev-agent-jobs"
       }
     ],
     "consumers": [
+      {
+        "queue": "feishu2agents-dev-agent-jobs",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 3
+      },
       {
         "queue": "feishu2agents-agent-jobs",
         "max_batch_size": 10,

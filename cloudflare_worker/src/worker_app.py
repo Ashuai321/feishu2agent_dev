@@ -4511,7 +4511,6 @@ class Default(WorkerEntrypoint):
         )
 
         url = urlparse(request.url)
-        state = D1State(self.env.DB)
         path = url.path
         xiaot_resource_metadata_path = (
             f"/.well-known/oauth-protected-resource{XIAOT_MCP_PATH}"
@@ -4521,11 +4520,16 @@ class Default(WorkerEntrypoint):
             path == XIAOT_MCP_PATH
             or path.startswith("/xiaot/oauth/")
             or path == "/xiaot/user-oauth/start"
+            or path in {"/xiaot/feishu/events", "/xiaot/feishu/event"}
             or path in {xiaot_resource_metadata_path, xiaot_authorization_server_path}
         ):
+            xiaot_db = getattr(self.env, "XIAOT_DB", None) or self.env.DB
+            state = D1State(xiaot_db)
             xiaot_relay = XiaotOnlyCloudflareRelay(
                 XiaotEnvironment(self.env), self.ctx, state
             )
+            if path in {"/xiaot/feishu/events", "/xiaot/feishu/event"}:
+                return await xiaot_relay.handle_xiaot_event(request)
             if path == XIAOT_MCP_PATH:
                 return await xiaot_relay.mcp(
                     request,
@@ -4550,6 +4554,7 @@ class Default(WorkerEntrypoint):
                 issuer_path="/xiaot",
             )
 
+        state = D1State(self.env.DB)
         relay = CombinedCloudflareRelay(self.env, self.ctx, state)
         if path == "/health" and request.method == "GET":
             return _response(
@@ -4600,8 +4605,6 @@ class Default(WorkerEntrypoint):
                 status=405,
                 headers={"allow": "POST"},
             )
-        if path in {"/xiaot/feishu/events", "/xiaot/feishu/event"}:
-            return await relay.xiaot.handle_xiaot_event(request)
         if path.startswith("/.well-known/") or path.startswith("/oauth/"):
             return await relay.oauth(request, path)
         if path == MCP_PATH:
@@ -4619,7 +4622,14 @@ class Default(WorkerEntrypoint):
         runtime_ctx = ctx if ctx is not None else self.ctx
         if runtime_env is None:
             raise RuntimeError("Queue consumer did not receive a Worker environment")
-        state = D1State(runtime_env.DB)
+        xiaot_queue_name = str(getattr(runtime_env, "XIAOT_AGENT_QUEUE_NAME", "") or "")
+        is_xiaot_queue = bool(xiaot_queue_name) and str(
+            getattr(batch, "queue", "") or ""
+        ) == xiaot_queue_name
+        xiaot_db = getattr(runtime_env, "XIAOT_DB", None)
+        if is_xiaot_queue and xiaot_db is None:
+            raise RuntimeError("XiaoT queue consumer is missing its dedicated D1 binding")
+        state = D1State(xiaot_db if is_xiaot_queue else runtime_env.DB)
         relay = CombinedCloudflareRelay(runtime_env, runtime_ctx, state)
         for message in batch.messages:
             request_id = ""

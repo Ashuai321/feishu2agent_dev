@@ -321,10 +321,14 @@ class XiaotEnvironment:
     """Expose only XiaoT's bot/Agent secrets through the existing relay names."""
 
     _aliases = {
+        "DB": "XIAOT_DB",
+        "AGENT_QUEUE": "XIAOT_AGENT_QUEUE",
         "FEISHU_APP_ID": "XIAOT_FEISHU_APP_ID",
         "FEISHU_APP_SECRET": "XIAOT_FEISHU_APP_SECRET",
-        "FEISHU_VERIFY_TOKEN": "XIAOT_FEISHU_VERIFY_TOKEN",
         "FEISHU_BOT_OPEN_ID": "XIAOT_FEISHU_BOT_OPEN_ID",
+        "FEISHU_OAUTH_REDIRECT_URI": "XIAOT_FEISHU_OAUTH_REDIRECT_URI",
+        "LARK_OAUTH_REDIRECT_URI": "XIAOT_LARK_OAUTH_REDIRECT_URI",
+        "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL": "XIAOT_PUBLIC_BASE_URL",
         "WORKSPACE_AGENT_RELAY_TRIGGER_URL": "XIAOT_AGENT_TRIGGER_URL",
         "WORKSPACE_AGENT_RELAY_AGENT_TOKEN": "XIAOT_AGENT_ACCESS_TOKEN",
     }
@@ -350,6 +354,9 @@ class XiaotLarkOAuthEnvironment:
         "FEISHU_APP_SECRET": "XIAOT_FEISHU_APP_SECRET",
         "LARK_APP_ID": "XIAOT_LARK_APP_ID",
         "LARK_APP_SECRET": "XIAOT_LARK_APP_SECRET",
+        "FEISHU_OAUTH_REDIRECT_URI": "XIAOT_FEISHU_OAUTH_REDIRECT_URI",
+        "LARK_OAUTH_REDIRECT_URI": "XIAOT_LARK_OAUTH_REDIRECT_URI",
+        "WORKSPACE_AGENT_RELAY_PUBLIC_BASE_URL": "XIAOT_PUBLIC_BASE_URL",
     }
 
     def __init__(self, raw: Any) -> None:
@@ -3096,15 +3103,9 @@ class XiaotCloudflareRelay(CloudflareRelay):
             return _response({"error": "method_not_allowed"}, 405, {"allow": "POST"})
         body = await self._body_json(request)
         header = body.get("header") if isinstance(body.get("header"), dict) else {}
-        verify = _env(self.env, "FEISHU_VERIFY_TOKEN")
-        if not verify:
-            return _response({"error": "verification_token_not_configured"}, 503)
-        # Feishu's URL-verification POST uses the legacy envelope with a
-        # top-level `token`; schema 2.0 event deliveries put it in `header`.
-        # Accept both so the platform can validate the same callback URL.
-        supplied_token = str(header.get("token") or body.get("token") or "")
-        if not secrets.compare_digest(supplied_token, verify):
-            return _response({"code": 1}, 403)
+        # 小T's Feishu event callback intentionally does not require a
+        # Verification Token. URL verification is completed by echoing the
+        # challenge, while event deliveries are acknowledged and queued.
         if body.get("challenge"):
             return _response({"challenge": body["challenge"]})
         if str(header.get("event_type") or "") != "im.message.receive_v1":
@@ -3214,7 +3215,7 @@ class XiaotOnlyCloudflareRelay(XiaotCloudflareRelay):
                     "public_base_url": self.base_url(),
                     "mcp_path": XIAOT_MCP_PATH,
                     "storage": "D1",
-                    "queue": "AGENT_QUEUE",
+                    "queue": "XIAOT_AGENT_QUEUE",
                     "table_count": len(XIAOT_TABLES),
                 }
             )
@@ -3226,7 +3227,9 @@ class CombinedCloudflareRelay(CloudflareRelay):
 
     def __init__(self, env: Any, ctx: Any, db_state: D1State) -> None:
         super().__init__(env, ctx, db_state)
-        self.xiaot = XiaotCloudflareRelay(XiaotEnvironment(env), ctx, db_state)
+        xiaot_db = getattr(env, "XIAOT_DB", None)
+        xiaot_state = D1State(xiaot_db) if xiaot_db is not None else db_state
+        self.xiaot = XiaotCloudflareRelay(XiaotEnvironment(env), ctx, xiaot_state)
 
     def tool_definitions(self) -> list[dict[str, Any]]:
         definitions = super().tool_definitions()

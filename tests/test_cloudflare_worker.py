@@ -1063,8 +1063,16 @@ def test_worker_config_points_directly_to_python_entrypoint():
 
     assert config["main"] == "cloudflare_worker/src/entry.py"
     assert "python_workers" in config["compatibility_flags"]
-    assert {item["binding"] for item in config["d1_databases"]} == {"DB"}
-    assert config["queues"]["producers"][0]["binding"] == "AGENT_QUEUE"
+    assert {item["binding"] for item in config["d1_databases"]} == {"DB", "XIAOT_DB"}
+    assert {item["binding"] for item in config["queues"]["producers"]} == {
+        "AGENT_QUEUE",
+        "XIAOT_AGENT_QUEUE",
+    }
+    assert any(
+        item["queue"] == "feishu2agents-dev-agent-jobs"
+        for item in config["queues"]["consumers"]
+    )
+    assert config["vars"]["XIAOT_PUBLIC_BASE_URL"] == "https://bot.boooe.com"
     assert "r2_buckets" not in config
     assert "PYTHON_ORIGIN" not in (ROOT / "wrangler.jsonc").read_text()
 
