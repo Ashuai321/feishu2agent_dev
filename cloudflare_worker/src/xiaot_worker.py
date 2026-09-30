@@ -397,6 +397,7 @@ class XiaotBitableClient:
             if len(filter_formula) > 2000:
                 raise ValueError("filter_formula is too long")
             query["filter"] = filter_formula
+        query["user_id_type"] = "open_id"
         payload = await self.request(
             "GET",
             f"{self._table_path(table_key)}/records",
@@ -416,6 +417,7 @@ class XiaotBitableClient:
             f"{self._table_path(table_key)}/records/{quote(value, safe='')}",
             access_token=access_token,
             platform=platform,
+            params={"user_id_type": "open_id"},
         )
         record = (payload.get("data") or {}).get("record")
         if not isinstance(record, dict):
@@ -430,6 +432,7 @@ class XiaotBitableClient:
             f"{self._table_path(table_key)}/records",
             access_token=access_token,
             platform=platform,
+            params={"user_id_type": "open_id"},
             json={"fields": fields},
         )
         record = (payload.get("data") or {}).get("record")
@@ -452,6 +455,7 @@ class XiaotBitableClient:
             f"{self._table_path(table_key)}/records/{quote(record_id, safe='')}",
             access_token=access_token,
             platform=platform,
+            params={"user_id_type": "open_id"},
             json={"fields": fields},
         )
         record = (payload.get("data") or {}).get("record")
@@ -549,8 +553,14 @@ class XiaotAgentRelayWorkflow:
                     "on the initial request alone."
                 ),
                 (
-                    "Use changelog to preserve who changed what and when. If a reliable audit "
-                    "entry cannot be created, do not perform the requested mutation."
+                    "When a person field such as Owner or watcher should refer to the current "
+                    "requester, call get_requester_info and use its OAuth-app-specific open_id "
+                    "exactly as [{\"id\": \"open_id\"}]. Do not reuse a source bot event ID. "
+                    "Bitable write calls use user_id_type=open_id."
+                ),
+                (
+                    "Feishu Bitable creates its own operation audit entries. 小T must never write "
+                    "to the changelog table; treat changelog as read-only."
                 ),
                 (
                     "Goal/Project status meanings: Daily = routine/no concrete content; Later = "
@@ -600,9 +610,6 @@ class XiaotAgentRelayWorkflow:
                     "preserve this distinction when updating daily-analysis text."
                 ),
                 (
-                    "Every confirmed write also creates a changelog audit entry with the Feishu "
-                    "requester, action, target, and time. "
-                    "Include this side effect in the proposal. "
                     "Ask about ambiguity. Claim success only after tool verification, then call "
                     "record_result once to reply to the original Feishu message."
                 ),
@@ -1579,6 +1586,13 @@ class XiaotCloudflareRelay(CloudflareRelay):
         definitions = [
             item for item in super().tool_definitions() if item.get("name") in _RELAY_TOOLS
         ]
+        for item in definitions:
+            if item.get("name") == "get_requester_info":
+                item["description"] = (
+                    "Return the current 小T requester's platform and open_id in the matching "
+                    "Feishu/Lark OAuth app. Use this exact open_id in person fields as "
+                    "[{\"id\": \"open_id\"}]; do not use the bot-event open_id."
+                )
         string = {"type": "string"}
         definitions.extend(
             [
@@ -1705,6 +1719,74 @@ class XiaotCloudflareRelay(CloudflareRelay):
                     limit = 5
                 return self._tool_result(
                     await self._xiaot_run_context(conversation_key, limit)
+                )
+            if name == "get_requester_info":
+                conversation_key = str(args.get("conversation_key") or "")
+                if not conversation_key.startswith("xiaot:"):
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "wrong_agent_context",
+                                "message": "小 T requester info requires a 小 T conversation.",
+                            },
+                        },
+                        True,
+                    )
+                current = await _db_first(
+                    self.state.db,
+                    "SELECT request_id FROM relay_runs WHERE conversation_key = ? "
+                    "AND status IN ('queued','dispatching','triggered','running','needs_user') "
+                    "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    conversation_key,
+                )
+                if not current or not current.get("request_id"):
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "requester_not_found",
+                                "message": "no active 小 T request exists for this conversation",
+                            },
+                        },
+                        True,
+                    )
+                # `get_requester_info` is the identity source used to fill Bitable
+                # person fields. Do not fall back to the webhook event's sender ID:
+                # that ID belongs to the bot event namespace, not necessarily the
+                # Feishu/Lark OAuth app namespace required by Bitable.
+                await self._ensure_xiaot_oauth_schema()
+                identity = await _db_first(
+                    self.state.db,
+                    "SELECT platform, open_id FROM xiaot_run_requesters "
+                    "WHERE request_id = ? AND conversation_key = ?",
+                    str(current["request_id"]),
+                    conversation_key,
+                )
+                if not identity or not identity.get("open_id"):
+                    return self._tool_result(
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "requester_not_found",
+                                "message": (
+                                    "no verified OAuth requester for this 小 T request; "
+                                    "do not use the bot-event sender ID"
+                                ),
+                            },
+                        },
+                        True,
+                    )
+                return self._tool_result(
+                    {
+                        "success": True,
+                        "conversation_key": conversation_key,
+                        "requester": {
+                            "platform": str(identity.get("platform") or "feishu"),
+                            "open_id": identity["open_id"],
+                            "user_id_type": "open_id",
+                        },
+                    }
                 )
             if name in {
                 "record_plan",
@@ -1962,6 +2044,8 @@ class XiaotCloudflareRelay(CloudflareRelay):
             raise ValueError("operation must be create, update, or delete")
         table_key = str(args.get("table_key") or "").strip()
         table = self.xiaot_bitable.resolve_table(table_key)
+        if str(table.get("name") or "").strip().casefold() == "changelog":
+            raise ValueError("小T不会写入 Changelog；操作记录由飞书系统自动生成")
         fields = args.get("fields") if isinstance(args.get("fields"), dict) else {}
         record_id = str(args.get("record_id") or "").strip()
         before: dict[str, Any] = {}
@@ -2022,12 +2106,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
             "record_id": record_id or None,
             "before": before or None,
             "proposed_fields": fields or None,
-            "audit_entry": {
-                "table_key": "changelog",
-                "action": operation,
-                "requester_open_id": str(identity["open_id"]),
-                "note": "执行前创建‘执行中’记录，成功后更新结果；目标写入失败则标记失败。",
-            },
+            "audit_note": "操作记录由飞书系统自动生成；小T不会写入 Changelog。",
             "requires_explicit_user_confirmation": True,
             "expires_in_seconds": 900,
         }
@@ -2051,6 +2130,39 @@ class XiaotCloudflareRelay(CloudflareRelay):
             str(exc),
             re.IGNORECASE,
         ) is not None
+
+    @staticmethod
+    def _is_bitable_data_not_ready(exc: Exception) -> bool:
+        if isinstance(exc, XiaotBitableAPIError) and exc.api_code == 1254607:
+            return True
+        return re.search(r"\bData not ready\b|1254607", str(exc), re.IGNORECASE) is not None
+
+    async def _read_record_after_data_not_ready(
+        self,
+        table_key: str,
+        record_id: str,
+        *,
+        access_token: str,
+        platform: str,
+    ) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for delay in XIAOT_DELETE_VERIFY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                return await self.xiaot_bitable.record(
+                    table_key,
+                    record_id,
+                    access_token=access_token,
+                    platform=platform,
+                )
+            except Exception as exc:
+                if not self._is_bitable_data_not_ready(exc):
+                    raise
+                last_error = exc
+        raise RuntimeError(
+            "Bitable is still processing a previous write; could not safely recheck the target record"
+        ) from last_error
 
     async def _delete_record_and_verify(
         self,
@@ -2087,6 +2199,10 @@ class XiaotCloudflareRelay(CloudflareRelay):
 
         last_record: dict[str, Any] | None = None
         last_read_error: Exception | None = None
+        may_retry_delete = bool(
+            write_error and self._is_bitable_data_not_ready(write_error)
+        )
+        retried_delete = False
         for delay in XIAOT_DELETE_VERIFY_DELAYS:
             if delay:
                 await asyncio.sleep(delay)
@@ -2111,6 +2227,35 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 continue
             last_record = current
             last_read_error = None
+            if (
+                may_retry_delete
+                and not retried_delete
+                and current.get("fields") == expected_fields
+            ):
+                # Feishu documents Data not ready (1254607) as retryable. Only
+                # retry after a direct record read proves the exact target is
+                # still present and unchanged; never scan the table or delete
+                # a concurrently modified row.
+                retried_delete = True
+                try:
+                    retry_result = await self.xiaot_bitable.delete_record(
+                        table_key,
+                        record_id,
+                        access_token=access_token,
+                        platform=platform,
+                    )
+                    if (
+                        isinstance(retry_result, dict)
+                        and retry_result.get("deleted") is True
+                        and str(retry_result.get("record_id") or "") == record_id
+                    ):
+                        return retry_result
+                    write_error = RuntimeError(
+                        "Bitable delete retry response did not confirm the target record"
+                    )
+                except Exception as exc:
+                    write_error = exc
+                may_retry_delete = False
 
         if last_record is not None:
             if last_record.get("fields") != expected_fields:
@@ -2337,12 +2482,20 @@ class XiaotCloudflareRelay(CloudflareRelay):
         before = json.loads(str(proposal.get("before_json") or "{}"))
         fields = json.loads(str(proposal.get("fields_json") or "{}"))
         if operation in {"update", "delete"}:
-            latest = await self.xiaot_bitable.record(
-                table_key,
-                record_id,
-                access_token=access_token,
-                platform=identity["platform"],
-            )
+            if operation == "delete":
+                latest = await self._read_record_after_data_not_ready(
+                    table_key,
+                    record_id,
+                    access_token=access_token,
+                    platform=identity["platform"],
+                )
+            else:
+                latest = await self.xiaot_bitable.record(
+                    table_key,
+                    record_id,
+                    access_token=access_token,
+                    platform=identity["platform"],
+                )
             if latest.get("fields") != before.get("fields"):
                 await _db_run(
                     self.state.db,
@@ -2360,23 +2513,6 @@ class XiaotCloudflareRelay(CloudflareRelay):
         )
         if not claimed:
             raise ValueError("proposal was already claimed by another request")
-        try:
-            audit = await self._create_audit_entry(
-                operation=operation,
-                table_key=table_key,
-                record_id=record_id,
-                fields=fields,
-                requester_open_id=str(identity["open_id"]),
-                access_token=access_token,
-                requester_platform=identity["platform"],
-            )
-        except Exception:
-            await _db_run(
-                self.state.db,
-                "UPDATE xiaot_bitable_proposals SET status = 'audit_failed' WHERE proposal_id = ?",
-                proposal_id,
-            )
-            raise
         try:
             if operation == "create":
                 created = await self.xiaot_bitable.create_record(
@@ -2451,44 +2587,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
                 "WHERE proposal_id = ?",
                 proposal_id,
             )
-            with suppress(Exception):
-                await self.xiaot_bitable.update_record(
-                    "changelog",
-                    str(audit["record_id"]),
-                    {
-                        "修改日志": self._audit_note(
-                            operation=operation,
-                            table_key=table_key,
-                            record_id=record_id,
-                            fields=fields,
-                            before=before,
-                            status="结果待核实；请检查对应记录",
-                        )
-                    },
-                    access_token=access_token,
-                    platform=identity["platform"],
-                )
             raise
-        audit_warning = ""
-        try:
-            await self.xiaot_bitable.update_record(
-                "changelog",
-                str(audit["record_id"]),
-                {
-                    "修改日志": self._audit_note(
-                        operation=operation,
-                        table_key=table_key,
-                        record_id=record_id or str(record.get("record_id") or ""),
-                        fields=fields,
-                        before=before,
-                        status="已完成",
-                    )
-                },
-                access_token=access_token,
-                platform=identity["platform"],
-            )
-        except Exception:
-            audit_warning = "目标操作已完成，但日志结果更新失败；请核查 changelog 中的执行中记录。"
         return {
             "success": True,
             "verified": True,
@@ -2497,61 +2596,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
             "record_id": record_id or record.get("record_id"),
             "record": record if operation != "delete" else None,
             "deleted": operation == "delete",
-            "audit_record_id": str(audit["record_id"]),
-            "audit_warning": audit_warning or None,
         }
-
-    async def _create_audit_entry(
-        self,
-        *,
-        operation: str,
-        table_key: str,
-        record_id: str,
-        fields: dict[str, Any],
-        requester_open_id: str,
-        access_token: str,
-        requester_platform: str = "feishu",
-    ) -> dict[str, Any]:
-        return await self.xiaot_bitable.create_record(
-            "changelog",
-            {
-                "修改日志": self._audit_note(
-                    operation=operation,
-                    table_key=table_key,
-                    record_id=record_id,
-                    fields=fields,
-                    before={},
-                    status="执行中",
-                ),
-                "修改人": [{"id": requester_open_id}],
-                "日期": int(time.time() * 1000),
-            },
-            access_token=access_token,
-            platform=requester_platform,
-        )
-
-    @staticmethod
-    def _audit_note(
-        *,
-        operation: str,
-        table_key: str,
-        record_id: str,
-        fields: dict[str, Any],
-        before: dict[str, Any],
-        status: str,
-    ) -> str:
-        names = {"create": "新增", "update": "更新", "delete": "删除"}
-        return _json(
-            {
-                "状态": status,
-                "操作": names.get(operation, operation),
-                "表": table_key,
-                "记录 ID": record_id or None,
-                "变更字段": fields or None,
-                "变更前": (before.get("fields") if before else None),
-                "时间": int(time.time() * 1000),
-            }
-        )
 
     async def handle_xiaot_event(self, request: Any) -> Response:
         if str(request.method or "").upper() != "POST":

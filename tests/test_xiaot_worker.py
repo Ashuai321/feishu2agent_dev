@@ -86,6 +86,8 @@ def test_xiaot_dedicated_mcp_has_only_xiaot_tools_and_correct_identity(monkeypat
         "type": "boolean",
         "default": False,
     }
+    requester_info = next(tool for tool in tools if tool["name"] == "get_requester_info")
+    assert "matching Feishu/Lark OAuth app" in requester_info["description"]
 
     async def no_auth(self, _request, **_kwargs):
         return None
@@ -220,6 +222,137 @@ def test_writes_reject_unknown_or_computed_fields():
             raise AssertionError(f"unsafe or unknown fields were accepted: {invalid}")
 
     asyncio.run(check())
+
+
+def test_bitable_create_and_update_explicitly_use_open_id_for_person_fields():
+    worker = _load_xiaot_module()
+    client = worker.XiaotBitableClient(SimpleNamespace())
+    calls = []
+
+    async def response(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"code": 0, "data": {"record": {"record_id": "rec_target"}}}
+
+    client.request = response
+
+    async def scenario():
+        await client.create_record(
+            "task",
+            {"Owner": [{"id": "ou_oauth_user"}]},
+            access_token="user-token",
+            platform="feishu",
+        )
+        await client.update_record(
+            "task",
+            "rec_target",
+            {"Owner": [{"id": "ou_oauth_user"}]},
+            access_token="user-token",
+            platform="feishu",
+        )
+
+    asyncio.run(scenario())
+
+    assert [call[2]["params"] for call in calls] == [
+        {"user_id_type": "open_id"},
+        {"user_id_type": "open_id"},
+    ]
+    assert all(call[2]["json"]["fields"]["Owner"] == [{"id": "ou_oauth_user"}] for call in calls)
+
+
+def test_get_requester_info_returns_platform_oauth_open_id(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.state = SimpleNamespace(db=object())
+
+    async def current_run(_db, sql, *params):
+        if "FROM relay_runs" in sql:
+            (conversation_key,) = params
+            assert conversation_key == "xiaot:cli_xiaot:oc_group:current"
+            return {"request_id": "xiaot_req_current"}
+        assert "FROM xiaot_run_requesters" in sql
+        request_id, conversation_key = params
+        assert request_id == "xiaot_req_current"
+        assert conversation_key == "xiaot:cli_xiaot:oc_group:current"
+        return {"platform": "lark", "open_id": "ou_lark_oauth_app_id"}
+
+    monkeypatch.setattr(worker, "_db_first", current_run)
+    relay._ensure_xiaot_oauth_schema = lambda: asyncio.sleep(0)
+    result = asyncio.run(
+        relay.call_tool(
+            "get_requester_info",
+            {"conversation_key": "xiaot:cli_xiaot:oc_group:current"},
+        )
+    )
+
+    assert result["structuredContent"]["requester"] == {
+        "platform": "lark",
+        "open_id": "ou_lark_oauth_app_id",
+        "user_id_type": "open_id",
+    }
+
+
+def test_get_requester_info_never_falls_back_to_bot_event_identity(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.state = SimpleNamespace(db=object())
+    sql_calls = []
+
+    async def db_first(_db, sql, *_params):
+        sql_calls.append(sql)
+        if "FROM relay_runs" in sql:
+            return {"request_id": "xiaot_req_current"}
+        if "FROM xiaot_run_requesters" in sql:
+            return None
+        raise AssertionError("requester lookup must not fall back to webhook event identity")
+
+    monkeypatch.setattr(worker, "_db_first", db_first)
+    relay._ensure_xiaot_oauth_schema = lambda: asyncio.sleep(0)
+    result = asyncio.run(
+        relay.call_tool(
+            "get_requester_info",
+            {"conversation_key": "xiaot:cli_xiaot:oc_group:current"},
+        )
+    )
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["error"]["code"] == "requester_not_found"
+    assert len(sql_calls) == 2
+
+
+def test_xiaot_rejects_all_changelog_mutations(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.xiaot_bitable = worker.XiaotBitableClient(SimpleNamespace())
+
+    async def active_run(_args):
+        return {"request_id": "xiaot_req"}
+
+    async def requester(_request_id, _conversation_key):
+        return {"platform": "feishu", "open_id": "ou_current"}
+
+    async def user_token(_request_id, _conversation_key):
+        return "user-token"
+
+    relay._require_xiaot_run = active_run
+    relay._requester_for_run = requester
+    relay._user_access_token_for_run = user_token
+
+    async def scenario():
+        try:
+            await relay._prepare_mutation(
+                {
+                    "request_id": "xiaot_req",
+                    "conversation_key": "xiaot:cli_xiaot:oc_group:current",
+                    "operation": "create",
+                    "table_key": "changelog",
+                    "fields": {"修改日志": "manual entry"},
+                }
+            )
+        except ValueError as exc:
+            return str(exc)
+        raise AssertionError("XiaoT must not write to Changelog")
+
+    assert "不会写入 Changelog" in asyncio.run(scenario())
 
 
 def test_confirmation_accepts_common_affirmations_and_rejects_negations():
@@ -619,6 +752,8 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
             assert table_key == "task"
             assert access_token == "xiaot-user-token"
             assert platform == "feishu"
+            if record_id in self.deleted_records:
+                return {"deleted": True, "record_id": record_id}
             self.stale_fields[record_id] = self.row_fields.pop(record_id)
             self.deleted_records.add(record_id)
             self.stale_reads_remaining[record_id] = 2
@@ -887,20 +1022,21 @@ def test_bitable_mutation_is_proposal_only_until_same_sender_confirms():
     assert wrong_user["isError"] is True
     assert refused_update["isError"] is True
     assert confirmed["structuredContent"]["success"] is True
-    assert bitable.creates[0][0] == "changelog"
-    assert bitable.creates[1] == ("task", {"Task Name": "Xiaot test"})
-    assert bitable.updates[0][0] == "changelog"
+    assert bitable.creates == [("task", {"Task Name": "Xiaot test"})]
     assert update_proposal["requires_explicit_user_confirmation"] is True
+    assert "飞书系统自动生成" in update_proposal["audit_note"]
     assert update_confirmed["structuredContent"]["success"] is True
     assert update_confirmed["structuredContent"]["record_id"] == "rec_target"
-    assert ("task", "rec_target", {"Status": "In Progress"}) in bitable.updates
+    assert bitable.updates == [("task", "rec_target", {"Status": "In Progress"})]
     assert delete_confirmed["structuredContent"]["success"] is True
     assert delete_confirmed["structuredContent"]["deleted"] is True
-    assert bitable.deletes == [("task", "rec_target")]
+    assert bitable.deletes == [("task", "rec_target"), ("task", "rec_target")]
+    assert not any(call[0] == "changelog" for call in bitable.creates)
+    assert not any(call[0] == "changelog" for call in bitable.updates)
     assert "rec_target" not in bitable.row_fields
 
 
-def test_delete_that_returns_error_but_still_exists_is_not_success_or_retried(monkeypatch):
+def test_delete_that_returns_error_but_still_exists_is_not_success_after_one_retry(monkeypatch):
     worker = _load_xiaot_module()
     monkeypatch.setattr(worker, "XIAOT_DELETE_VERIFY_DELAYS", (0.0, 0.0, 0.0))
 
@@ -940,7 +1076,7 @@ def test_delete_that_returns_error_but_still_exists_is_not_success_or_retried(mo
 
     assert "record still exists" in message
     assert "Data not ready" in message
-    assert bitable.delete_calls == 1
+    assert bitable.delete_calls == 2
 
 
 def test_delete_success_response_confirms_exact_row_without_readback():
@@ -966,6 +1102,47 @@ def test_delete_success_response_confirms_exact_row_without_readback():
     )
 
     assert result == {"deleted": True, "record_id": "rec_target"}
+
+
+def test_delete_retries_data_not_ready_only_after_target_is_read_unchanged(monkeypatch):
+    worker = _load_xiaot_module()
+    monkeypatch.setattr(worker, "XIAOT_DELETE_VERIFY_DELAYS", (0.0,))
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+
+    class FakeBitable:
+        def __init__(self):
+            self.delete_calls = 0
+            self.read_calls = 0
+
+        async def delete_record(self, *_args, **_kwargs):
+            self.delete_calls += 1
+            if self.delete_calls == 1:
+                raise worker.XiaotBitableAPIError(
+                    status_code=400,
+                    api_code=1254607,
+                    message="Data not ready, please try again later",
+                )
+            return {"deleted": True, "record_id": "rec_target"}
+
+        async def record(self, *_args, **_kwargs):
+            self.read_calls += 1
+            return {"record_id": "rec_target", "fields": {"Status": "To-do"}}
+
+    bitable = FakeBitable()
+    relay.xiaot_bitable = bitable
+    result = asyncio.run(
+        relay._delete_record_and_verify(
+            "task",
+            "rec_target",
+            expected_fields={"Status": "To-do"},
+            access_token="user-token",
+            platform="feishu",
+        )
+    )
+
+    assert result == {"deleted": True, "record_id": "rec_target"}
+    assert bitable.read_calls == 1
+    assert bitable.delete_calls == 2
 
 
 def test_bitable_delete_requires_documented_success_response_fields():
@@ -1451,23 +1628,6 @@ def test_xiaot_agent_run_status_url_rejects_non_https_trigger():
         raise AssertionError("non-HTTPS status URL was accepted")
 
 
-def test_audit_note_records_operation_target_and_status():
-    worker = _load_xiaot_module()
-    note = worker.XiaotCloudflareRelay._audit_note(
-        operation="update",
-        table_key="task",
-        record_id="rec123abc",
-        fields={"Status": "Finished"},
-        before={"fields": {"Status": "To-do"}},
-        status="已完成",
-    )
-
-    assert '"操作":"更新"' in note
-    assert '"表":"task"' in note
-    assert '"记录 ID":"rec123abc"' in note
-    assert '"状态":"已完成"' in note
-
-
 def test_xiaot_instructions_have_bitable_workflow_and_no_calendar_routes():
     content = (ROOT / "xiaot-agent-instructions.md").read_text(encoding="utf-8")
 
@@ -1483,6 +1643,8 @@ def test_xiaot_instructions_have_bitable_workflow_and_no_calendar_routes():
         assert expected in content
     assert "Google Calendar" not in content
     assert "Perfect710" not in content
+    assert "仅可读取" in content
+    assert "get_requester_info" in content
 
 
 def test_lark_requester_is_resolved_in_lark_user_namespace():
