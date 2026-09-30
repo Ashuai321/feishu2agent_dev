@@ -378,6 +378,42 @@ def test_xiaot_mcp_oauth_accepts_chatgpt_cimd_client(monkeypatch):
     assert not app._is_chatgpt_cimd_client_id("https://attacker.example/oauth/client.json")
     assert not app._is_chatgpt_oauth_redirect("https://attacker.example/callback")
 
+    # Reproduce Agent Studio's actual DCR client shape after its old
+    # registration row is absent from the isolated XiaoT database.
+    stale_client_id = "mcp_client_97SzskZAw2LBMnijJRTgOpvneR7eBo9-"
+    stale_redirect_uri = "https://chatgpt.com/connector/oauth/L5ZmeE8U8y5D"
+
+    class StaleDcrRequest(Request):
+        async def text(self):
+            return urlencode(
+                {
+                    "login_token": "dev-login-token",
+                    "client_id": stale_client_id,
+                    "redirect_uri": stale_redirect_uri,
+                    "response_type": "code",
+                    "code_challenge_method": "S256",
+                    "code_challenge": challenge,
+                    "scope": "workspace-agent-relay",
+                    "resource": "https://bot.boooe.com/xiaot/mcp",
+                    "state": "state_stale_dcr",
+                }
+            )
+
+    stale_dcr_response = asyncio.run(
+        relay.oauth(
+            StaleDcrRequest(),
+            "/xiaot/oauth/authorize",
+            resource_path=app.XIAOT_MCP_PATH,
+            resource_name=app.XIAOT_MCP_NAME,
+            oauth_prefix="/xiaot",
+            issuer_path="/xiaot",
+            allow_cimd=True,
+        )
+    )
+    assert stale_dcr_response.status == 302
+    assert stale_dcr_response.headers["Location"].startswith(stale_redirect_uri + "?")
+    assert not app._is_chatgpt_registered_public_client_id("mcp_client_short")
+
 
 def test_unknown_tables_and_malformed_record_ids_are_rejected():
     worker = _load_xiaot_module()
