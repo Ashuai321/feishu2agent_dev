@@ -185,6 +185,228 @@ def test_xiaot_mcp_oauth_metadata_binds_its_own_resource(monkeypatch):
     assert "client_id_metadata_document_supported" not in shared_authorization.payload
 
 
+def test_xiaot_tenant_routing_selects_exact_feishu_and_lark_apps():
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.raw_xiaot_env = SimpleNamespace(
+        XIAOT_TENANT_APP_MAP=(
+            '{"10f3f702f9cb175e":"feishu","1b8240baa70e594f":"lark_w_fam"}'
+        ),
+        LARK_EXTERNAL_TENANT_KEYS="legacy-yw-tenant",
+    )
+
+    async def resolve(event):
+        return await relay._resolve_oauth_route(event)
+
+    assert asyncio.run(resolve({"sender_tenant_key": "10f3f702f9cb175e"})) == (
+        "feishu",
+        "feishu",
+        "10f3f702f9cb175e",
+    )
+    assert asyncio.run(resolve({"sender_tenant_key": "1b8240baa70e594f"})) == (
+        "lark",
+        "lark_w_fam",
+        "1b8240baa70e594f",
+    )
+    assert asyncio.run(resolve({"sender_tenant_key": "legacy-yw-tenant"})) == (
+        "lark",
+        "lark_yw",
+        "legacy-yw-tenant",
+    )
+
+
+def test_xiaot_tenant_routing_fails_closed_for_unknown_external_org():
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    relay.raw_xiaot_env = SimpleNamespace(
+        XIAOT_TENANT_APP_MAP=(
+            '{"10f3f702f9cb175e":"feishu","1b8240baa70e594f":"lark_w_fam"}'
+        )
+    )
+
+    async def resolve():
+        return await relay._resolve_oauth_route(
+            {"sender_tenant_key": "unknown-lark-tenant", "tenant_key": "10f3f702f9cb175e"}
+        )
+
+    try:
+        asyncio.run(resolve())
+    except RuntimeError as exc:
+        assert "未发起授权" in str(exc)
+    else:
+        raise AssertionError("unknown external tenant must not fall back to another Lark app")
+
+
+def test_xiaot_lark_oauth_environment_isolates_w_fam_credentials():
+    worker = _load_xiaot_module()
+    raw = SimpleNamespace(
+        XIAOT_LARK_APP_ID="legacy-yw-id",
+        XIAOT_LARK_APP_SECRET="legacy-yw-secret",
+        XIAOT_LARK_W_FAM_APP_ID="w-fam-id",
+        XIAOT_LARK_W_FAM_APP_SECRET="w-fam-secret",
+    )
+
+    yw = worker.XiaotLarkOAuthEnvironment(raw, "lark_yw")
+    w_fam = worker.XiaotLarkOAuthEnvironment(raw, "lark_w_fam")
+
+    assert yw.LARK_APP_ID == "legacy-yw-id"
+    assert yw.LARK_APP_SECRET == "legacy-yw-secret"
+    assert w_fam.LARK_APP_ID == "w-fam-id"
+    assert w_fam.LARK_APP_SECRET == "w-fam-secret"
+
+
+def test_xiaot_w_fam_token_lookup_never_uses_legacy_lark_token(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    reads = []
+    legacy_reads = []
+
+    class FakeState:
+        db = object()
+
+        async def user_token(self, platform, open_id):
+            legacy_reads.append((platform, open_id))
+            return {"access_token": "legacy-yw-token", "expires_at": 4_000_000_000}
+
+    async def no_schema():
+        return None
+
+    async def no_scoped_token(_db, sql, *params):
+        assert "xiaot_bitable_user_tokens" in sql
+        reads.append(params)
+        return None
+
+    monkeypatch.setattr(worker, "_db_first", no_scoped_token)
+    relay.state = FakeState()
+    relay._ensure_xiaot_oauth_schema = no_schema
+
+    result = asyncio.run(
+        relay._xiaot_user_token(
+            platform="lark", app_key="lark_w_fam", open_id="ou_w_fam_user"
+        )
+    )
+
+    assert result is None
+    assert reads == [("lark_w_fam", "ou_w_fam_user")]
+    assert legacy_reads == []
+
+
+def test_w_fam_oauth_callback_uses_its_app_and_saves_scoped_token(monkeypatch):
+    worker = _load_xiaot_module()
+    relay = object.__new__(worker.XiaotCloudflareRelay)
+    posted_data = []
+    used_app_ids = []
+    saved_sql = []
+
+    class CapturedResponse:
+        def __init__(self, body, *, status=200, headers=None):
+            self.body = body
+            self.status = status
+            self.headers = headers or {}
+
+    pending = {
+        "platform": "lark",
+        "app_key": "lark_w_fam",
+        "tenant_key": "1b8240baa70e594f",
+        "account_open_id": "ou_w_fam_user",
+        "source_open_id": "",
+        "source_union_id": "",
+        "source_user_id": "",
+        "source_platform": "lark",
+        "redirect_uri": "https://bot.boooe.com/lark/oauth/callback",
+        "expires_at": int(worker.time.time()) + 600,
+        "event_json": "{}",
+        "request_id": "xiaot_w_fam_request",
+        "conversation_key": "xiaot:app:chat:w-fam-thread",
+    }
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": {"access_token": "w-fam-user-token", "expires_in": 3600}}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, **kwargs):
+            posted_data.append(kwargs["data"])
+            return FakeResponse()
+
+    class FakeAPI:
+        async def user_info(self, access_token):
+            assert access_token == "w-fam-user-token"
+            return {"open_id": "ou_w_fam_user"}
+
+    class FakeRelay:
+        def __init__(self, env, _ctx, _state):
+            self.env = env
+            used_app_ids.append(env.LARK_APP_ID)
+
+        def api_for_conversation(self, _key):
+            return FakeAPI()
+
+    class FakeState:
+        db = object()
+
+        async def get_run(self, _request_id):
+            return {"status": "already_running"}
+
+        async def save_user_token(self, **_kwargs):
+            raise AssertionError("W Fam must not save into the unscoped legacy token table")
+
+    async def lookup(_db, _sql, *_params):
+        return pending
+
+    async def consume(_db, _sql, *_params):
+        return [{"state": "consumed"}]
+
+    async def capture_sql(_db, sql, *params):
+        saved_sql.append((sql, params))
+        return None
+
+    monkeypatch.setattr(worker, "CloudflareRelay", FakeRelay)
+    monkeypatch.setattr(worker, "_db_first", lookup)
+    monkeypatch.setattr(worker, "_db_all", consume)
+    monkeypatch.setattr(worker, "_db_run", capture_sql)
+    monkeypatch.setattr(worker.httpx, "AsyncClient", lambda timeout: FakeClient())
+    monkeypatch.setattr(worker, "Response", CapturedResponse)
+    monkeypatch.setattr(
+        worker,
+        "_response",
+        lambda payload, status=200, headers=None: {
+            "payload": payload,
+            "status": status,
+            "headers": headers or {},
+        },
+    )
+    relay.raw_xiaot_env = SimpleNamespace(
+        XIAOT_LARK_W_FAM_APP_ID="w-fam-app-id",
+        XIAOT_LARK_W_FAM_APP_SECRET="w-fam-app-secret",
+    )
+    relay.ctx = None
+    relay.state = FakeState()
+    relay._ensure_xiaot_oauth_schema = lambda: asyncio.sleep(0)
+    relay._replace_authorization_card_with_success = lambda _pending: asyncio.sleep(0)
+    request = SimpleNamespace(
+        method="GET",
+        url="https://bot.boooe.com/lark/oauth/callback?code=auth-code&state=xiaot_lark_w_fam",
+    )
+
+    result = asyncio.run(relay.handle_user_oauth_callback(request, "lark"))
+
+    assert result.status == 200
+    assert used_app_ids == ["w-fam-app-id"]
+    assert posted_data[0]["client_id"] == "w-fam-app-id"
+    assert posted_data[0]["client_secret"] == "w-fam-app-secret"
+    scoped_write = next(item for item in saved_sql if "xiaot_bitable_user_tokens" in item[0])
+    assert scoped_write[1][:3] == ("lark_w_fam", "lark", "ou_w_fam_user")
+
+
 def test_xiaot_mcp_oauth_accepts_chatgpt_cimd_client(monkeypatch):
     from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -918,7 +1140,12 @@ def test_xiaot_requester_identity_is_bound_to_detected_platform():
         relay._requester_for_run("xiaot_req_1", "xiaot:cli_xiaot:oc_group:abc123")
     )
 
-    assert identity == {"platform": "lark", "open_id": "ou_lark_user"}
+    assert identity == {
+        "platform": "lark",
+        "app_key": "lark_yw",
+        "tenant_key": "",
+        "open_id": "ou_lark_user",
+    }
     assert "FROM xiaot_run_requesters" in queries[0][1]
     assert queries[0][2] == ("xiaot_req_1", "xiaot:cli_xiaot:oc_group:abc123")
 
@@ -2337,7 +2564,12 @@ def test_lark_requester_is_resolved_in_lark_user_namespace():
         relay._resolve_account_identity({"open_id": "ou_external"})
     )
 
-    assert result == {"platform": "lark", "open_id": "ou_lark_canonical"}
+    assert result == {
+        "platform": "lark",
+        "app_key": "lark_yw",
+        "tenant_key": "",
+        "open_id": "ou_lark_canonical",
+    }
 
 
 def test_feishu_requester_is_resolved_in_oauth_app_namespace():
@@ -2368,7 +2600,12 @@ def test_feishu_requester_is_resolved_in_oauth_app_namespace():
         )
     )
 
-    assert result == {"platform": "feishu", "open_id": "ou_feishu_oauth_app_user"}
+    assert result == {
+        "platform": "feishu",
+        "app_key": "feishu",
+        "tenant_key": "",
+        "open_id": "ou_feishu_oauth_app_user",
+    }
 
 
 def test_xiaot_platform_detection_prefers_explicit_lark_brand_without_lookup():
@@ -2442,6 +2679,8 @@ def test_unresolvable_lark_requester_gets_oauth_identity_without_union_id(monkey
 
     assert result == {
         "platform": "lark",
+        "app_key": "lark_yw",
+        "tenant_key": "tenant_lark",
         "open_id": "pending_source:ou_external_event",
         "identity_pending": "true",
         "source_open_id": "ou_external_event",
@@ -2469,7 +2708,7 @@ def test_lark_requester_reuses_oauth_identity_link(monkeypatch):
 
     async def linked_identity(_db, sql, *params):
         if "xiaot_bitable_source_identity_links" in sql:
-            assert params == ("lark", "ou_external_event")
+            assert params == ("lark_yw", "ou_external_event")
             return {"account_open_id": "ou_lark_oauth_app"}
         raise AssertionError("the linked source identity should be used before union_id")
 
@@ -2487,7 +2726,12 @@ def test_lark_requester_reuses_oauth_identity_link(monkeypatch):
         )
     )
 
-    assert result == {"platform": "lark", "open_id": "ou_lark_oauth_app"}
+    assert result == {
+        "platform": "lark",
+        "app_key": "lark_yw",
+        "tenant_key": "tenant_lark",
+        "open_id": "ou_lark_oauth_app",
+    }
 
 
 def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch):
@@ -2551,6 +2795,8 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
             request_id="xiaot_req_1",
             account_identity={
                 "platform": "lark",
+                "app_key": "lark_yw",
+                "tenant_key": "tenant_lark",
                 "open_id": "ou_lark_canonical",
                 "identity_pending": "true",
             },
@@ -2567,13 +2813,15 @@ def test_lark_authorization_uses_lark_app_and_saves_original_request(monkeypatch
         "",
         "feishu",
     )
-    assert params[8:11] == (
+    assert params[8:12] == (
+        "lark_yw",
+        "tenant_lark",
         "xiaot_req_1",
         "xiaot:cli_xiaot:oc_group:abc",
-        "om_original",
     )
-    assert params[11] == "https://bot.boooe.com/lark/oauth/callback"
-    assert '"text":"查询我的 task"' in params[12]
+    assert params[12] == "om_original"
+    assert params[13] == "https://bot.boooe.com/lark/oauth/callback"
+    assert '"text":"查询我的 task"' in params[14]
     _, card_id_params = next(
         item for item in statements if "SET authorization_message_id = ?" in item[0]
     )
@@ -2877,9 +3125,9 @@ def test_lark_oauth_callback_verifies_account_and_resumes_original_request(monke
     )
     identity_link = next(
         item for item in statements
-        if "INSERT INTO xiaot_bitable_source_identity_links" in item[0]
+        if "INSERT INTO xiaot_bitable_source_identity_links_by_app" in item[0]
     )
-    assert identity_link[1][:3] == ("lark", "ou_external_event", "ou_lark_verified")
+    assert identity_link[1][:3] == ("lark_yw", "ou_external_event", "ou_lark_verified")
     assert resumed == [
         {
             "platform": "lark",

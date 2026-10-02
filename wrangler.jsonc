@@ -18,6 +18,7 @@
     "XIAOT_PUBLIC_BASE_URL": "https://bot.boooe.com",
     "XIAOT_FEISHU_OAUTH_REDIRECT_URI": "https://bot.boooe.com/feishu/oauth/callback",
     "XIAOT_LARK_OAUTH_REDIRECT_URI": "https://bot.boooe.com/lark/oauth/callback",
+    "XIAOT_TENANT_APP_MAP": "{\"10f3f702f9cb175e\":\"feishu\",\"1b8250daa681d948\":\"lark_yw\",\"1b8240baa70e594f\":\"lark_w_fam\"}",
     "XIAOT_AGENT_QUEUE_NAME": "feishu2agents-dev-agent-jobs"
   },
   "observability": {
