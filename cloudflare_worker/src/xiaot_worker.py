@@ -1116,7 +1116,7 @@ class XiaotCloudflareRelay(CloudflareRelay):
         card_heading, template = {
             "done": ("任务成功", "turquoise"),
             "failed": ("任务失败", "red"),
-            "blocked": ("任务被阻塞", "turquoise"),
+            "blocked": ("任务被阻塞", "red"),
             "cancelled": ("取消任务成功", "turquoise"),
             "cancel_failed": ("取消任务失败", "red"),
         }.get(status, ("任务失败", "red"))
