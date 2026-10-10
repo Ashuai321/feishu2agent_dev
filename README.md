@@ -9,7 +9,7 @@ Cloudflare 内完成。Worker 使用 D1 保存最小状态，Queue 处理后台�
 
 ```mermaid
 flowchart TD
-    U[Feishu/Lark 用户] -->|@机器人| F[对应平台群聊]
+    U[Feishu/Lark 用户] -->|群聊中提及机器人| F[对应平台群聊]
     F -->|平台 Webhook| W[Cloudflare Python Worker]
     W --> D1[(D1 最小状态)]
     W --> Q[Cloudflare Queue]
