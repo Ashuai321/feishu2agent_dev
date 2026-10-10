@@ -33,6 +33,49 @@ def _load_worker_module():
     return module
 
 
+def test_xiaoc_shared_oauth_route_enables_cimd(monkeypatch):
+    worker = _load_worker_module()
+    calls = []
+
+    class FakeState:
+        def __init__(self, db):
+            self.db = db
+
+    class FakeCombinedRelay:
+        def __init__(self, env, ctx, state):
+            assert state.db == "xiaoc-dev-db"
+
+        async def oauth(self, request, path, *, allow_cimd=False):
+            calls.append((request.url, path, allow_cimd))
+            return "xiaoc-oauth"
+
+    fake_xiaot_worker = types.ModuleType("xiaot_worker")
+    fake_xiaot_worker.CombinedCloudflareRelay = FakeCombinedRelay
+    fake_xiaot_worker.XiaotEnvironment = object
+    fake_xiaot_worker.XiaotOnlyCloudflareRelay = object
+    monkeypatch.setitem(sys.modules, "xiaot_worker", fake_xiaot_worker)
+    monkeypatch.setattr(worker, "D1State", FakeState)
+
+    entrypoint = object.__new__(worker.Default)
+    entrypoint.env = SimpleNamespace(DB="xiaoc-dev-db")
+    entrypoint.ctx = None
+    request = SimpleNamespace(
+        url="https://bot.boooe.com/.well-known/oauth-authorization-server",
+        method="GET",
+    )
+
+    result = asyncio.run(entrypoint.fetch(request))
+
+    assert result == "xiaoc-oauth"
+    assert calls == [
+        (
+            request.url,
+            "/.well-known/oauth-authorization-server",
+            True,
+        )
+    ]
+
+
 def _event(
     message_type: str,
     content: dict,
@@ -1063,10 +1106,16 @@ def test_worker_config_points_directly_to_python_entrypoint():
 
     assert config["main"] == "cloudflare_worker/src/entry.py"
     assert "python_workers" in config["compatibility_flags"]
-    assert {item["binding"] for item in config["d1_databases"]} == {"DB", "XIAOT_DB"}
-    assert {item["binding"] for item in config["queues"]["producers"]} == {
-        "AGENT_QUEUE",
-        "XIAOT_AGENT_QUEUE",
+    databases = {item["binding"]: item for item in config["d1_databases"]}
+    assert set(databases) == {"DB", "XIAOT_DB"}
+    assert databases["DB"]["database_name"] == "feishu2agents-state"
+    assert databases["DB"]["database_id"] == "45b634df-226e-42cb-9c1e-cc5311329ade"
+    assert all("prd" not in item["database_name"] for item in databases.values())
+
+    queues = {item["binding"]: item["queue"] for item in config["queues"]["producers"]}
+    assert queues == {
+        "AGENT_QUEUE": "feishu2agents-agent-jobs",
+        "XIAOT_AGENT_QUEUE": "feishu2agents-dev-agent-jobs",
     }
     assert any(
         item["queue"] == "feishu2agents-dev-agent-jobs"

@@ -344,6 +344,14 @@ class XiaotEnvironment:
             value = getattr(self.raw, alias, None)
             if value not in (None, ""):
                 return value
+            # XiaoT must never fall back to the shared Workspace Agent
+            # credentials. A missing XiaoT setting should fail closed instead
+            # of silently triggering another Agent.
+            if name in {
+                "WORKSPACE_AGENT_RELAY_TRIGGER_URL",
+                "WORKSPACE_AGENT_RELAY_AGENT_TOKEN",
+            }:
+                return None
         return getattr(self.raw, name, None)
 
 
@@ -2900,9 +2908,26 @@ class XiaotCloudflareRelay(CloudflareRelay):
     @staticmethod
     def _fields_match(record: dict[str, Any], expected: dict[str, Any]) -> bool:
         actual = record.get("fields") if isinstance(record.get("fields"), dict) else {}
+
+        def person_ids(value: Any) -> list[str] | None:
+            if not isinstance(value, list) or not value:
+                return None
+            ids: list[str] = []
+            for item in value:
+                person_id = item.get("id") if isinstance(item, dict) else item
+                if not isinstance(person_id, str) or not re.fullmatch(
+                    r"ou_[A-Za-z0-9_-]+", person_id.strip()
+                ):
+                    return None
+                ids.append(person_id.strip())
+            return sorted(ids)
+
         for key, expected_value in expected.items():
             actual_value = actual.get(key)
             if actual_value == expected_value:
+                continue
+            expected_person_ids = person_ids(expected_value)
+            if expected_person_ids is not None and person_ids(actual_value) == expected_person_ids:
                 continue
             if isinstance(expected_value, list) and all(
                 isinstance(item, str) and re.fullmatch(r"rec[A-Za-z0-9_-]{1,80}", item)
