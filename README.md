@@ -9,12 +9,12 @@ Cloudflare 内完成。Worker 使用 D1 保存最小状态，Queue 处理后台�
 
 ```mermaid
 flowchart TD
-    U[Feishu/Lark 用户] -->|"@机器人"| F[对应平台群聊]
+    U[Feishu/Lark 用户] -->|@机器人| F[对应平台群聊]
     F -->|平台 Webhook| W[Cloudflare Python Worker]
     W --> D1[(D1 最小状态)]
     W --> Q[Cloudflare Queue]
     Q --> A[Workspace Agent Trigger]
-    A -->|MCP dev 回调| W
+    A -->|MCP prd 回调| W
     W --> API[对应平台 API]
     W -.必要文件.-> R2[(R2)]
     API --> F
