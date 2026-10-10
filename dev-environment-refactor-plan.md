@@ -1,173 +1,173 @@
-# Development Environment and Architecture Refactor Plan
+# 开发环境与架构重构方案
 
-## Document status
+## 文档状态
 
-This document proposes a reviewable plan only. It does not authorize or perform implementation, Cloudflare changes, secret changes, production deployment, or a pull request. The repository owner should review the scope and unresolved decisions before implementation begins.
+本文档是供负责人审阅的方案，不构成实施授权。本轮翻译和上传不执行代码重构、Cloudflare 配置或资源变更、密钥变更、生产部署，也不自动创建 Pull Request。开始实施前，负责人应先审阅范围和待决事项并明确授权。
 
-## 1. Objective
+## 1. 目标
 
-Refactor the development environment and application structure of `feishu2agent_dev` in line with the applicable CardSpending project, coding, and agent-work standards, while retaining the existing Cloudflare Python Worker, D1, and Queue platform.
+在保留现有 Cloudflare Python Worker、D1 和 Queue 技术栈的前提下，参照 CardSpending 中适用的项目规范、代码规范和 Agent 协作规范，改进 `feishu2agent_dev` 的开发环境和应用结构。
 
-The intended result is a reproducible local development setup and an isolated remote development environment, with clearer application layers, deterministic checks, and a documented deployment and review workflow. The production environment, production data, public API contracts, and user-visible behavior are outside this plan's change scope.
+目标包括：建立可重复的本地开发环境和与生产隔离的远程 DEV 环境；逐步明确代码分层；建立可重复的自动检查；补齐部署、数据保留和回滚说明。生产环境、生产数据、公开 API 契约和用户可见行为不在本方案的改动范围内。
 
-## 2. Guideline mapping
+## 2. CardSpending 规范在本项目中的映射
 
-CardSpending's FastAPI, PostgreSQL, SQLAlchemy, and GCP deployment choices are specific to that project and should not be copied into this Cloudflare project. The transferable standards are:
+CardSpending 使用的 FastAPI、PostgreSQL、SQLAlchemy 和 GCP 部署方式是其自身的技术选择，不应直接搬到本 Cloudflare 项目。可复用的工程原则如下：
 
-- Keep request and event entry points thin. Put business rules in service modules and external-system access behind adapters or repositories.
-- Keep environment differences in explicit configuration, and run the same compatible application runtime across local, development, and production environments.
-- Use a single approved source for application secrets, apply least privilege, and never put secret values in source code, logs, or documentation.
-- Use explicit types at module boundaries, small focused changes, readable English engineering documentation, and deterministic automated checks.
-- Validate real external-system state instead of inferring it from resource names. Preserve owner review and approval boundaries; do not open a pull request or merge without the owner's explicit direction.
-- Keep changes scoped, review the complete diff, and document operational, migration, retention, and rollback considerations.
+- 入口层保持精简：请求和事件入口负责解析、校验与分发；业务规则放在服务模块；外部系统访问放在适配器或存储层。
+- 环境差异通过明确配置表达；本地、DEV 和生产使用兼容的应用运行时。
+- 应用密钥使用获批的唯一来源并遵循最小权限；不得把密钥值写入源码、日志或文档。
+- 模块边界使用明确类型；改动保持小而聚焦；工程文档清晰；自动化检查可重复执行。
+- 核实外部系统的实际状态，不凭资源名称推断；遵守负责人审阅和授权边界。负责人未明确要求时，不自动创建 PR 或合并。
+- 控制改动范围，审阅完整差异，并记录运维、迁移、数据保留和回滚事项。
 
-## 3. Observed repository baseline
+## 3. 已观察到的仓库基线
 
-The plan was prepared against branch `shuai_review` at commit `9eba5e681066dc1d861dac66a382f69f02d0289d`. The working tree used to prepare this document was clean. The branch contains a DEV deployment mirror commit above the observed `main` tip; implementation should re-check both branch tips before starting and preserve the review branch's intended base.
+本方案初稿基于 `shuai_review` 分支提交 `9eba5e681066dc1d861dac66a382f69f02d0289d`，当时工作区干净。该提交是一个 DEV 部署镜像提交，位于当时观察到的 `main` 分支基线之上。分支此后已有文档提交，因此正式实施前必须重新核对分支、提交和工作区状态，并确认重构分支的基线。
 
-The checked-in project uses a Cloudflare Python Worker with D1 and Queue bindings. The root Wrangler configuration currently describes a single Worker configuration rather than a clearly named `dev` environment. The application entry point imports the Worker class from `worker_app.py`. The main implementation files are large: `worker_app.py` (about 6,840 lines), `xiaot_worker.py` (about 2,405 lines), and `agent_config_mcp.py` (about 2,027 lines). There are 14 D1 migration files and existing pytest coverage for Worker routes, webhooks, OAuth, queue handling, MCP, and XiaoT flows. Ruff is configured. The repository declares Python 3.11 compatibility and has a `.python-version` file, but the checked-out branch does not contain a committed `uv.lock` or CI workflow under `.github/workflows`.
+该基线中的项目使用 Cloudflare Python Worker，并绑定 D1 和 Queue。根目录 Wrangler 配置描述的是单一 Worker 配置，没有明确命名的 `dev` 环境。应用入口从 `worker_app.py` 导入 Worker 类。主要实现文件较大：`worker_app.py` 约 6,840 行，`xiaot_worker.py` 约 2,405 行，`agent_config_mcp.py` 约 2,027 行。仓库有 14 个 D1 migration，并已有覆盖 Worker 路由、Webhook、OAuth、Queue、MCP 和 XiaoT 流程的 pytest。仓库已配置 Ruff，声明兼容 Python 3.11，并有 `.python-version`；在该检查基线中，没有提交 `uv.lock`，也没有 `.github/workflows` 下的 CI 工作流。
 
-Repository documentation describes local `pywrangler dev`, remote deployment, and DEV-specific flows. Names and checked-in configuration alone do not prove which resources are currently active in Cloudflare. Before implementation, verify actual Worker routes, D1 database IDs, Queue bindings, secrets, and deployment state using read-only account inspection.
+仓库文档介绍了本地 `pywrangler dev`、远程部署和 DEV 专用流程。但仅凭名称和已提交配置不能确认 Cloudflare 上当前实际使用的资源。实施前应只读核对实际 Worker、路由、D1 数据库 ID、Queue 绑定、密钥名称和部署状态。
 
-The value named `LARK_DOCUMENT_WIKI_TOKEN` appears in configuration and code fallback paths. Its classification as a credential or a non-secret identifier is unresolved. Do not copy, print, log, rotate, or alter it until its purpose and approved source have been confirmed. This plan intentionally omits its value.
+配置和代码回退路径中出现了 `LARK_DOCUMENT_WIKI_TOKEN`。目前尚未确认它是访问凭据还是非机密标识符。确认用途和获批来源前，不得复制、输出、记录、轮换或修改它。本方案不包含其值。
 
-## 4. Scope and invariants
+## 4. 范围与不变条件
 
-### Included
+### 纳入范围
 
-- A local development profile using the existing Python Worker toolchain and local/simulated D1 and Queue bindings.
-- A remote DEV Worker isolated from production, with dedicated D1, Queue, hostname, application credentials, and test identities.
-- Incremental separation of HTTP/queue entry points, business services, platform integrations, persistence, and queue orchestration.
-- Configuration validation, types, lint/format/test gates, dependency reproducibility, and English engineering documentation.
-- DEV-only deployment and smoke validation after the owner approves implementation and provisions any required resources.
+- 使用现有 Python Worker 工具链，并用本地模拟或本地绑定的 D1、Queue 建立本地开发环境。
+- 建立与生产隔离的远程 DEV Worker，并使用独立 D1、Queue、域名、应用凭据和测试身份。
+- 逐步拆分 HTTP/Queue 入口、业务服务、平台集成、持久化和队列协调逻辑。
+- 增加配置校验、类型定义、lint/格式/测试门禁、依赖可重复安装能力和英文工程文档。
+- 负责人批准并准备所需资源后，只部署和验证 DEV 环境。
 
-### Excluded
+### 排除范围
 
-- Replacing Cloudflare with FastAPI, PostgreSQL, SQLAlchemy, GCP, or another runtime/platform.
-- Production Worker, production routes, production secrets, production D1 data, and production deployment.
-- Changing externally visible routes, webhook payloads, OAuth behavior, queue message contracts, or user-facing behavior as part of the structural refactor.
-- Copying production data, OAuth tokens, or real user messages into DEV.
-- Enabling R2; retain the current disabled/unbound posture unless a separate approved need and cost review establish otherwise.
-- Automatic pull request creation or merging. The owner requests a PR explicitly and performs the merge.
+- 将 Cloudflare 替换为 FastAPI、PostgreSQL、SQLAlchemy、GCP 或其他平台和运行时。
+- 修改生产 Worker、生产路由、生产密钥、生产 D1 数据或进行生产部署。
+- 在结构重构过程中改变公开路由、Webhook 载荷、OAuth 行为、Queue 消息契约或用户可见行为。
+- 将生产数据、OAuth token 或真实用户消息复制到 DEV。
+- 启用 R2。除非另有明确需求并完成成本评估，否则保持未绑定或关闭状态。
+- 自动创建或合并 Pull Request。只有负责人明确要求后才创建 PR；由负责人审阅和合并。
 
-## 5. Proposed implementation sequence
+## 5. 建议实施顺序
 
-Each phase is a review checkpoint. Keep changes small enough to review and revert independently. Stop and return to the owner if a gate fails or scope must expand.
+每个阶段都是审阅检查点。改动应保持足够小，便于审阅和单独回退。检查门槛未通过或需要扩大范围时，暂停并交负责人确认。
 
-### Phase 0 — Protect the baseline and verify assumptions
+### 阶段 0：保护基线并核实前提
 
-1. Record the target branch, commit, tracked/untracked state, remote branch tips, and current configuration before editing. Do not discard, overwrite, or absorb unrelated work.
-2. Read repository instructions and current CardSpending standards again at implementation time; record any conflicts or project-specific exceptions.
-3. Inspect Cloudflare state read-only: Worker names/routes, D1 IDs, Queue names and bindings, deployment versions, secret names (never values), and relevant account/environment ownership. Compare identifiers to determine whether current DEV resources are actually isolated.
-4. Trace the use and source of `LARK_DOCUMENT_WIKI_TOKEN` without displaying its value. Classify it with the owner. If it is a credential, identify the approved secret source and rotation/consumption model; if it is an identifier, document that classification and any sensitivity controls.
-5. Record existing HTTP routes, webhook event shapes, OAuth state lifecycle, queue payloads/retry behavior, platform-specific prefixes, and representative current test outcomes as compatibility baselines.
+1. 编辑前记录目标分支、提交、已跟踪和未跟踪文件、远程分支位置及现有配置。不得丢弃、覆盖或顺带纳入无关改动。
+2. 实施时重新阅读仓库内的项目指引和 CardSpending 规范，并记录冲突或需要按本项目调整的条款。
+3. 只读检查 Cloudflare 状态：Worker 名称和路由、D1 ID、Queue 名称及绑定、部署版本、密钥名称（不读取密钥值）以及账号和环境归属。比较资源标识，判断 DEV 是否确实隔离。
+4. 在不显示 `LARK_DOCUMENT_WIKI_TOKEN` 值的前提下追踪其用途和来源，由负责人确认它是凭据还是标识符。若是凭据，确认获批来源、轮换方式和消费路径；若是标识符，记录其性质及必要的敏感信息控制。
+5. 记录现有 HTTP 路由、Webhook 事件结构、OAuth 状态生命周期、Queue 消息载荷和重试行为、平台隔离前缀，以及代表性测试结果，作为兼容基线。
 
-**Gate:** no resource or secret change begins until production/DEV separation and secret handling are understood. Any ambiguous binding or credential blocks the affected change, not the rest of the read-only inventory.
+**阶段门槛：** 生产与 DEV 的资源边界、密钥处理方式未弄清前，不修改资源或密钥。某项绑定或凭据仍有歧义时，暂停受影响的改动；其余只读盘点可以继续。
 
-### Phase 1 — Design isolated local and remote DEV configuration
+### 阶段 1：设计本地和远程 DEV 隔离配置
 
-1. Define environment-specific names and bindings for the DEV Worker, workers.dev/custom test hostname, D1 database, Queue, OAuth callback URLs, and Feishu/Lark/Workspace Agent test applications. Use dedicated synthetic/test identities.
-2. Choose a Wrangler named environment if it can express the required Python Worker configuration and binding isolation reliably; otherwise use a separate checked-in DEV configuration. Do not rely on undocumented defaults.
-3. Keep local `pywrangler dev` behavior reproducible with local/simulated D1 and Queue bindings. Document any local-only values as non-secret examples and load credentials through an approved developer workflow.
-4. Use a compatible Python Worker runtime and application artifact across environments; represent differences through bindings and configuration rather than divergent application code.
-5. Provision remote DEV resources only after the owner approves the inventory and cost/ownership implications. Never point DEV at production D1, Queue, routes, or credentials.
+1. 为 DEV Worker、`workers.dev` 或测试域名、D1、Queue、OAuth 回调地址以及 Feishu/Lark/Workspace Agent 测试应用定义独立名称和绑定，并使用专用测试身份。
+2. 先确认 Wrangler named environment 能否可靠表达 Python Worker 配置和绑定隔离；若不能，再使用单独的 DEV 配置文件。不得依赖未经确认的默认行为。
+3. 保持 `pywrangler dev` 的本地运行可重复，使用本地或模拟的 D1 和 Queue。开发者所需值中只能把非密钥示例写入文档，凭据须经获批的开发者访问流程读取。
+4. 本地、DEV 和生产使用兼容的 Python Worker 运行时和应用产物；环境差异通过绑定和配置表达，不维护彼此分叉的应用代码。
+5. 只有负责人批准资源清单、费用和归属后，才准备远程 DEV 资源。DEV 不得绑定生产 D1、Queue、路由或凭据。
 
-**Gate:** a configuration review and automated isolation check must demonstrate that DEV references only DEV resources before a remote deployment is attempted.
+**阶段门槛：** 配置审阅和自动隔离检查必须证明 DEV 只引用 DEV 资源，之后才可尝试远程部署。
 
-### Phase 2 — Establish configuration and secret safeguards
+### 阶段 2：建立配置和密钥保护机制
 
-1. Add centralized configuration parsing and validation for required bindings and environment-specific settings. Fail safely when a required value is absent or inconsistent.
-2. Add checks that compare DEV and production resource identifiers and reject accidental production bindings in DEV configuration. Keep expected identifiers in non-secret configuration where practical.
-3. Validate whether Cloudflare Workers can securely obtain the approved secret source using a narrowly scoped, short-lived/bootstrap identity. Prefer federation or short-lived authorization where technically supported.
-4. Do not place application credentials in source defaults, checked-in files, logs, or a second persistent copy in Cloudflare. If the approved secret integration cannot be demonstrated, pause remote secret migration and ask the owner to select an approved exception; do not silently fall back to hard-coded values.
-5. Document secret names, ownership, least-privilege access, local developer access, rotation, and incident handling without documenting secret values.
+1. 集中解析和校验必需绑定及环境配置。必要值缺失或组合不一致时，应安全失败。
+2. 增加检查，对比 DEV 与生产资源标识，阻止 DEV 配置误用生产资源；在可行时，将预期资源 ID 放在非密钥配置中。
+3. 验证 Cloudflare Worker 是否能通过权限受限、短期有效的 bootstrap identity 安全访问获批的密钥来源；技术上可行时优先采用联合身份或短期授权。
+4. 不将应用凭据放入源码默认值、已提交文件或日志，也不在 Cloudflare 长期保存第二份应用密钥。如果无法验证获批的密钥集成路径，应暂停远程密钥迁移并请负责人批准替代方案；不得静默回退到硬编码值。
+5. 记录密钥名称、责任人、最小权限、本地开发者访问、轮换和事件处理方式，不记录密钥值。
 
-**Gate:** secret source, identity scope, runtime retrieval, and failure behavior are proven before changing any existing credential path.
+**阶段门槛：** 变更任何现有凭据读取路径前，必须证明密钥来源、身份权限范围、运行时读取方式和失败处理行为。
 
-### Phase 3 — Refactor modules incrementally, preserving contracts
+### 阶段 3：分批拆分模块并保持既有契约
 
-Refactor one behavior area at a time and preserve existing imports temporarily where needed to limit risk.
+按功能逐组重构；必要时暂时保留兼容导入，降低风险。
 
-1. Keep `entry.py` and the HTTP/Queue Worker handlers focused on protocol parsing, authentication/validation, dispatch, and response construction.
-2. Extract application services for the existing behavior groups: Feishu/Lark webhook processing, OAuth flows, Agent configuration/MCP requests, Bitable operations, XiaoT workflows, and asynchronous job orchestration.
-3. Put Feishu, Lark, Workspace Agent, and other external API clients behind explicit integration adapters. Keep D1 reads/writes behind repository or storage modules and Queue publishing/consumption behind queue adapters.
-4. Define typed request, event, job, and result structures at module boundaries using dataclasses or Pydantic only where it fits current dependencies and runtime constraints. Add annotations to public functions without introducing a broad new abstraction layer.
-5. Preserve route names and aliases, webhook verification/challenge handling, OAuth callback and one-time state semantics, queue payload compatibility, idempotency, platform separation, same-sender confirmation rules, and existing user-visible responses.
-6. Replace broad fallback behavior and unsafe logs only when behavior is covered by tests. Logs must omit tokens, authorization headers, message bodies, and other sensitive values while retaining useful correlation identifiers.
-7. Avoid unrelated cleanup, speculative generic frameworks, and large one-shot file moves. Each extraction should have a clear boundary and a small diff.
+1. 让 `entry.py` 和 HTTP/Queue Worker handler 只处理协议解析、认证与校验、分发和响应构造。
+2. 按现有功能拆出应用服务：Feishu/Lark Webhook、OAuth、Agent 配置/MCP 请求、Bitable 操作、XiaoT 流程和异步任务协调。
+3. 将 Feishu、Lark、Workspace Agent 等外部 API 客户端放在明确的集成适配层；D1 读写放在 repository/storage 模块；Queue 发布和消费放在队列适配层。
+4. 在模块边界定义带类型的请求、事件、任务和结果结构。只有在现有依赖和运行时适用时才使用 dataclass 或 Pydantic；给公开函数补类型标注，但不引入大而泛化的抽象层。
+5. 保持路由名和别名、Webhook 校验与 challenge、OAuth 回调和一次性状态语义、Queue 载荷兼容、幂等性、平台隔离、同发送者确认规则及现有用户可见响应。
+6. 只有相应行为已有测试保护时，才替换宽泛的 fallback 或不安全日志。日志不得包含 token、授权头、消息正文或其他敏感值，同时保留必要的关联标识。
+7. 避免无关清理、推测性通用框架和一次性大规模搬文件。每次抽取都应有清楚边界和小型差异。
 
-**Gate:** targeted tests for the extracted behavior pass before the next behavior group is moved. No test or refactor should change a contract without a separately reviewed proposal.
+**阶段门槛：** 每组抽取完成后先通过相关定向测试，再开始下一组。未经单独审阅的提案，不得借重构改变契约。
 
-### Phase 4 — D1, Queue, and dependency reliability
+### 阶段 4：提高 D1、Queue 和依赖可靠性
 
-1. Inventory and document all 14 current D1 migrations, their ordering, and any migration assumptions. Apply schema changes additively and keep old and new Worker versions compatible during rollout.
-2. Exercise a fresh isolated DEV database and an upgrade from the current DEV schema. Do not use production data as a fixture.
-3. Verify queue at-least-once delivery, retries, duplicate delivery, idempotency, poison-message handling, and observability. Ensure a retry cannot repeat an externally visible action unexpectedly.
-4. Define D1 data retention and deletion rules for OAuth state, tokens, job records, and test data. Avoid logging or exporting personal data in test artifacts.
-5. Align `.python-version`, `requires-python`, Wrangler/Python Worker support, and dependency tooling. Select one authoritative Python lockfile and update it through the declared package manager; do not commit multiple competing lockfiles.
-6. Review dependency changes for runtime compatibility and cost/size impact. Keep R2 disabled.
+1. 盘点并记录现有 14 条 D1 migration 的顺序和假设。Schema 变更采用增量、向前兼容方式，部署期间保持新旧 Worker 版本兼容。
+2. 在隔离的 DEV 数据库验证空库初始化，以及从当前 DEV schema 升级。不得使用生产数据作为测试样本。
+3. 验证 Queue 的至少一次投递、重试、重复投递、幂等、无法处理的消息和可观测性。确保重试不会意外重复对外操作。
+4. 明确 OAuth 状态、token、任务记录和测试数据的保留及删除规则。测试产物不得记录或导出个人数据。
+5. 对齐 `.python-version`、`requires-python`、Wrangler/Python Worker 支持版本和依赖工具。选择一个权威 Python 锁文件，并通过声明的包管理工具维护，不提交多个相互竞争的锁文件。
+6. 审查依赖的运行时兼容性、体积和成本影响。继续保持 R2 关闭。
 
-**Gate:** migration and queue behavior are validated in isolated DEV, and rollback compatibility is documented before deployment.
+**阶段门槛：** 迁移和队列行为在隔离 DEV 中验证通过，并记录回滚兼容性后，才能部署。
 
-### Phase 5 — Deterministic quality gates and CI
+### 阶段 5：建立可重复的质量门禁和 CI
 
-1. Establish a repeatable local command set for Ruff lint, Ruff format check, and pytest, with test credentials/services replaced by fixtures or fakes.
-2. Add CI checks for lint, format, targeted pytest, dependency/lock consistency, and DEV configuration isolation. Add a packaging or Worker build check only if supported by the repository's actual Python Worker toolchain.
-3. Keep tests deterministic and independent of live Feishu/Lark/Cloudflare services by default. Remote smoke tests are a separate, explicit DEV-only job using dedicated test identities.
-4. Run the smallest relevant test selection after each change. Run the full agreed suite only at the owner-approved integration checkpoint; document results and failures without hiding skipped checks.
+1. 固定本地检查命令：Ruff lint、Ruff 格式检查和 pytest；测试凭据与服务使用 fixture 或 fake 替代。
+2. 在 CI 中加入 lint、格式、定向 pytest、依赖锁一致性和 DEV 配置隔离检查。只有仓库实际使用的 Python Worker 工具链支持时，才增加打包或 Worker 构建检查。
+3. 常规测试应可重复，默认不依赖实时 Feishu/Lark/Cloudflare 服务。远程 smoke test 是单独、明确的 DEV 测试任务，并使用专用测试身份。
+4. 每次改动后运行最小相关测试。只有负责人批准的集成检查阶段才运行完整约定测试套件；如有未运行或跳过项，须如实记录。
 
-**Gate:** required local and CI checks pass on the proposed DEV branch before remote DEV deployment.
+**阶段门槛：** 拟议 DEV 分支上的必需本地和 CI 检查通过，才允许远程 DEV 部署。
 
-### Phase 6 — Documentation, DEV deployment, and handoff
+### 阶段 6：补全文档、部署 DEV 并交负责人审阅
 
-1. Update or add English engineering documentation for local setup, environment variables, DEV resources, secret access, migration procedure, queue behavior, data retention, cost/ownership, and incident/rollback steps.
-2. Deploy manually to the isolated DEV Worker from the agreed branch only after configuration, secret, tests, and migration gates pass. Record the deployed commit and resource identifiers (not secret values).
-3. Run DEV smoke checks for health, representative Feishu/Lark webhooks, OAuth state/callback, queue retry/idempotency, MCP dispatch, and XiaoT confirmation using synthetic data and test accounts.
-4. Confirm that no production Worker, route, database, Queue, credential, or data was changed. If any isolation check fails, stop deployment and restore the prior DEV configuration.
-5. Present the final diff, check results, deployed DEV commit, unresolved items, and rollback steps to the owner for review. Create a PR only if explicitly requested. The owner reviews and merges.
+1. 更新或新增英文工程文档，说明本地设置、环境变量、DEV 资源、密钥访问、migration 流程、队列行为、数据保留、费用与归属、事件处理和回滚。本文档按负责人要求提供中文版；后续工程文档仍遵循 CardSpending 的英文约定。
+2. 只有配置、密钥、测试和 migration 门槛全部通过后，才从双方确认的分支手动部署到隔离 DEV Worker。记录部署提交和资源标识，不记录密钥值。
+3. 使用合成数据和测试账号运行 DEV smoke test，覆盖健康检查、代表性 Feishu/Lark Webhook、OAuth 状态和回调、Queue 重试与幂等、MCP 分发及 XiaoT 确认。
+4. 确认没有修改生产 Worker、路由、数据库、Queue、凭据或数据。任一隔离检查失败，就停止部署并恢复此前 DEV 配置。
+5. 将最终差异、检查结果、已部署 DEV 提交、未解决事项和回滚步骤交负责人审阅。只有负责人明确要求时才创建 PR；由负责人审阅和合并。
 
-**Gate:** DEV verification is evidence for a later production proposal only. Production changes require a separate explicit scope and approval.
+**阶段门槛：** DEV 验证只能作为未来单独提出生产方案的证据。生产变更必须另行明确范围和授权。
 
-## 6. Risk register and mitigation
+## 6. 风险清单及应对策略
 
-| Risk | Impact | Mitigation and response |
+| 风险 | 影响 | 应对与处置 |
 |---|---|---|
-| DEV accidentally binds production Worker routes, D1, Queue, or credentials | Production data exposure, duplicate actions, or outage | Verify actual Cloudflare state read-only first; use dedicated resource IDs and test identities; add automated config assertions; block deployment on any collision; never copy production data. |
-| Secret source cannot be reached securely from the Worker runtime | Credential exposure or service outage | Prove the approved short-lived/federated access path before migration; enforce least privilege and sanitized errors; if unsupported, pause and request an owner-approved exception. Do not hard-code or persist a second app-secret copy. |
-| `LARK_DOCUMENT_WIKI_TOKEN` is misclassified | Secret leakage or broken API calls | Trace references without printing the value; have the owner confirm whether it is a credential or identifier; do not change it before classification. |
-| Large module extraction changes behavior | Webhook, OAuth, MCP, or user workflow regressions | Extract by behavior group; retain compatibility wrappers while needed; codify current routes and payloads; run targeted deterministic tests at each checkpoint. |
-| D1 migration is incompatible with deployed Worker versions | Data loss or failed rollback | Use additive, forward-compatible migrations; test fresh and upgrade paths against isolated D1; document backup/export and stop conditions; keep the previous Worker version compatible. |
-| Queue retries repeat side effects | Duplicate messages or external actions | Test at-least-once and duplicate delivery; preserve idempotency keys and retry semantics; define poison-message handling and safe observability. |
-| Python Worker/Wrangler or dependency versions differ across environments | Local/remote behavior divergence or deployment failure | Declare supported Python/tool versions, use one authoritative lockfile, validate packaging in CI, and promote the same reviewed artifact/configuration approach across environments. |
-| Remote DEV resources add unexpected charges or expose a public endpoint | Cost or unwanted access | Estimate resources before provisioning; use minimal instance/retention settings, access controls, synthetic data, and a documented teardown/ownership plan; keep R2 disabled. |
-| Existing branch or workspace state changes during implementation | Lost work or accidental unrelated commit | Re-check branch and status before each phase; preserve owner changes; commit only scoped files; do not force-push; stop if the branch advances unexpectedly. |
-| Tests require real credentials or external services | Flaky CI and accidental real actions | Use fakes/fixtures for routine tests; isolate live smoke tests to DEV and dedicated test identities; prevent secrets and personal data from entering logs or artifacts. |
+| DEV 误绑定生产 Worker 路由、D1、Queue 或凭据 | 生产数据泄露、重复操作或服务中断 | 先只读核实 Cloudflare 实际状态；使用独立资源 ID 和测试身份；增加自动配置断言；发现冲突就阻止部署；不复制生产数据。 |
+| Worker 无法安全访问密钥来源 | 凭据泄露或服务不可用 | 迁移前证明获批的短期/联合身份访问路径；使用最小权限和脱敏错误；若不支持，暂停并请负责人批准例外。不得硬编码或长期保存第二份应用密钥。 |
+| 错误判断 `LARK_DOCUMENT_WIKI_TOKEN` 的性质 | 密钥泄露或 API 调用损坏 | 不输出其值，先追踪用途并由负责人确认它是凭据还是标识符；确认前不修改。 |
+| 大模块拆分引入行为变化 | Webhook、OAuth、MCP 或用户流程回归 | 按功能组抽取；必要时保留兼容封装；记录现有路由和载荷；每组运行定向、可重复的测试。 |
+| D1 migration 与已部署 Worker 不兼容 | 数据损失或无法回滚 | 使用增量、向前兼容 migration；在隔离 D1 上验证空库和升级；记录备份/导出及停止条件；保持旧 Worker 版本兼容。 |
+| Queue 重试重复产生副作用 | 重复消息或重复外部操作 | 测试至少一次投递和重复消息；保留幂等键及重试语义；定义无法处理消息的处置和安全观测方式。 |
+| 不同环境的 Python Worker、Wrangler 或依赖版本不一致 | 本地与远程行为不一致或部署失败 | 声明支持版本并使用单一权威锁文件；在 CI 验证打包；以经过审阅的相同应用产物和配置策略部署。 |
+| 远程 DEV 产生意外费用或暴露公开端点 | 超预算或未经授权访问 | 创建前估算费用；采用最小资源和保留时长、访问控制、合成数据及资源清理方案；R2 保持关闭。 |
+| 实施时分支或工作区状态变化 | 丢失已有工作或误提交无关改动 | 每阶段前重新检查分支和工作区；保留负责人改动；只提交本次范围文件；不强制推送；发现分支意外前进时暂停。 |
+| 测试依赖真实凭据或外部服务 | CI 不稳定或触发真实操作 | 常规测试使用 fake/fixture；线上 smoke test 限定在 DEV 和专用测试身份；防止密钥和个人数据进入日志或产物。 |
 
-## 7. Acceptance criteria
+## 7. 验收标准
 
-- Local development starts with documented commands and local/simulated D1 and Queue bindings.
-- Remote DEV uses a dedicated Worker/hostname, D1, Queue, OAuth/test applications, and credentials; automated checks reject production resource references.
-- Application entry points are thin, and extracted services/adapters have clear responsibilities and typed boundaries.
-- Existing route, webhook, OAuth, MCP, queue, idempotency, Feishu/Lark separation, and XiaoT behavior remain compatible, demonstrated by deterministic tests and DEV smoke checks.
-- All 14 existing migrations are inventoried; any schema change is additive and backward compatible, with an isolated fresh-install and upgrade validation.
-- Python/runtime declarations and the single authoritative lockfile agree; Ruff and pytest checks are documented and enforced in CI.
-- Secret source and access path are proven without exposing secret values; `LARK_DOCUMENT_WIKI_TOKEN` is not changed until classified.
-- English engineering documentation covers setup, resources, secrets, cost, retention, deployment, and rollback.
-- The final review shows no production resource, data, public contract, or user-visible behavior change. Any production deployment is handled separately.
+- 本地开发可按文档命令启动，并使用本地/模拟 D1 和 Queue 绑定。
+- 远程 DEV 使用独立 Worker/域名、D1、Queue、OAuth/测试应用和凭据；自动检查能拒绝生产资源引用。
+- 应用入口精简；抽出的服务和适配器职责清晰，模块边界有类型定义。
+- 既有路由、Webhook、OAuth、MCP、Queue、幂等、Feishu/Lark 隔离及 XiaoT 行为保持兼容，并由确定性测试和 DEV smoke test 验证。
+- 盘点全部 14 条现有 migration；任何 Schema 变更均向前兼容，并在隔离环境验证空库初始化和升级。
+- Python/运行时声明和单一权威锁文件一致；Ruff 和 pytest 检查有文档说明并在 CI 中执行。
+- 密钥来源和访问路径已经验证，且未暴露密钥值；`LARK_DOCUMENT_WIKI_TOKEN` 在性质确认前未被修改。
+- 英文工程文档覆盖设置、资源、密钥、费用、数据保留、部署和回滚。
+- 最终审阅确认未改生产资源、生产数据、公开契约或用户可见行为。任何生产部署均另行处理。
 
-## 8. Rollback and recovery
+## 8. 回滚与恢复
 
-- Revert a code-only extraction by restoring the preceding Worker version/commit after confirming the prior version remains compatible with current D1 schema and queued messages.
-- Keep schema changes additive. Do not rely on destructive reverse migrations; before any schema migration, define an isolated backup/export and recovery procedure appropriate to D1 and verify it before use.
-- If DEV isolation, secrets, or smoke checks fail, stop the DEV rollout, restore the prior DEV Worker/configuration, disable the affected test integration, and preserve sanitized diagnostics for review.
-- Never use a DEV rollback as authorization to modify production. Production recovery is a separately reviewed operational procedure.
+- 纯代码拆分可通过恢复到之前的 Worker 版本/提交回滚；回滚前确认旧版本仍兼容当前 D1 schema 和队列中的消息。
+- Schema 变更保持增量、向前兼容。不要依赖破坏性反向 migration；任何 migration 前都要定义适用于 D1 的隔离备份/导出及恢复流程，并先验证流程。
+- DEV 隔离、密钥或 smoke test 失败时，停止 DEV 发布，恢复此前 DEV Worker/配置，关闭受影响的测试集成，并保留脱敏诊断信息供审阅。
+- DEV 回滚不构成修改生产环境的授权。生产恢复须另行审阅并执行。
 
-## 9. Decisions required before implementation
+## 9. 实施前需确认的事项
 
-1. Confirm that the proposed DEV Worker, hostname, D1, Queue, and test applications are approved, isolated resources, and identify their owner and cost budget.
-2. Confirm the approved secret source and whether a short-lived/federated identity can be used by this Cloudflare Worker. If not, approve a documented alternative before changing credential handling.
-3. Classify `LARK_DOCUMENT_WIKI_TOKEN` as a secret or non-secret identifier and confirm its authoritative source.
-4. Confirm whether the existing DEV deployment mirror on `shuai_review` is the intended implementation base and how it should be reconciled with current `main` before implementation.
-5. Agree on the supported Wrangler/Python Worker versions, authoritative lockfile, and which full test suite/checks the owner expects at final review.
-6. Confirm D1 retention periods, DEV cleanup cadence, and who can access DEV webhook/OAuth logs.
-7. Approve the phase gates and explicitly authorize implementation. Pull request creation and production work require separate explicit direction.
+1. 确认拟建 DEV Worker、域名、D1、Queue 和测试应用是获批的隔离资源，并明确负责人和费用预算。
+2. 确认获批的密钥来源，以及 Cloudflare Worker 是否能使用短期/联合身份访问；若不行，先批准有记录的替代方案，再改凭据处理方式。
+3. 确认 `LARK_DOCUMENT_WIKI_TOKEN` 是密钥还是非密钥标识符，并确认其权威来源。
+4. 确认 `shuai_review` 上现有 DEV 部署镜像提交是否为实施基线，以及开始实施前如何与最新 `main` 协调。
+5. 确认支持的 Wrangler/Python Worker 版本、权威锁文件，以及负责人要求的最终全量测试和检查范围。
+6. 确认 D1 数据保留期限、DEV 清理频率，以及有权查看 DEV Webhook/OAuth 日志的人员。
+7. 批准各阶段检查门槛并明确授权实施。创建 PR 和生产相关工作需要另行明确指示。
